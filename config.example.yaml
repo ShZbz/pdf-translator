@@ -1,0 +1,46 @@
+# 新测试样张: arxiv 2308.13658 (IEEE 双栏 8页,10公式,22+文献)
+io:
+  input: "paper.pdf"                # 待翻译 PDF 路径
+  output_dir: "out"                 # 输出目录，生成 <文件名>-Zh.pdf
+  source_lang: en
+  target_lang: zh
+
+llm:
+  # ---- Provider 选择（详见 README Provider 配置表）----
+  provider: deepseek                # deepseek / zhipu / gemini / siliconflow / openai / ollama / lmstudio
+  api_key: ""                       # 留空则读环境变量 DEEPSEEK_API_KEY 等
+  base_url: ""                      # 留空用 preset 默认；自建 endpoint 填这里
+  model: "deepseek-chat"
+  fallback_model: ""                # 备用链，如 "glm-4.7-flash" 或 "m2, m3"
+
+  # ---- 翻译质量 ----
+  temperature: 0.0
+
+  # ---- 调用频率控制（免费档/限流严的模型按 README 备注调整）----
+  batch_size: 6                     # 每次调用打包段落数；限流严调小到 2-3
+  max_llm_calls: 40                 # 单文档调用上限
+  min_call_interval: 2              # 相邻调用最小间隔秒；限流严调大到 5-10
+  max_workers: 3                    # 并发数；免费档建议 1
+
+  # ---- 重试与退避 ----
+  timeout: 120.0                    # 单次请求超时秒（慢思考模型调大）
+  max_retries: 2                    # 单批最大尝试次数（1=不重试直接降级）
+  backoff_base: 8.0                 # 传输层失败退避基数秒
+  backoff_cap: 30.0                 # 退避上限秒
+  retry_delay_cap: 60.0             # 服务端建议等待的封顶秒
+
+features:
+  watermark_removal: true           # 三层水印移除
+  preserve_formatting: true         # 期刊排版（宋体正文/黑体标题）
+  glossary_lock: true               # 术语一致性校验
+  translation_cache: true           # SQLite 缓存，二次运行零调用
+  bilingual: false                  # true=双语对照模式
+
+glossary_file: ""                   # 术语表 YAML 路径（可选）
+
+fonts:
+  cjk: ""                           # 留空自动探测；或指定如 "C:/Windows/Fonts/simsun.ttc"
+
+ocr:
+  engine: paddle                    # 扫描件 OCR 引擎（需另装 paddleocr）
+  min_chars: 50                     # 文字层少于此字符数的页触发 OCR

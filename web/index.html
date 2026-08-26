@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF Translator</title>
+<style>
+:root {
+  --spring: cubic-bezier(0.35, 1.25, 0.35, 1.25);
+  --spring-slow: cubic-bezier(0.45, 0, 0.25, 1);
+  --accent: #4A90D9;
+  --red: #E74C3C;
+  --gray: #95A5A6;
+}
+[data-theme="dark"] {
+  --bg: #000;
+  --glass-bg: rgba(255,255,255,0.06);
+  --glass-border: rgba(255,255,255,0.15);
+  --glass-highlight: rgba(255,255,255,0.10);
+  --text: #f5f5f7;
+  --text-dim: rgba(245,245,247,0.55);
+  --shadow: 0 8px 40px rgba(0,0,0,0.6);
+}
+[data-theme="light"] {
+  --bg: #F5F5F7;
+  --glass-bg: rgba(255,255,255,0.55);
+  --glass-border: rgba(255,255,255,0.50);
+  --glass-highlight: rgba(255,255,255,0.35);
+  --text: #1d1d1f;
+  --text-dim: rgba(29,29,31,0.55);
+  --shadow: 0 8px 30px rgba(0,0,0,0.12);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html,body { height:100%; }
+body {
+  font-family: -apple-system, "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg); color: var(--text);
+  overflow:hidden; display:flex; align-items:center; justify-content:center;
+}
+
+/* ---- aurora 背景 ---- */
+.bg-wrap { position:fixed; inset:0; z-index:0; overflow:hidden; }
+.orb { position:absolute; border-radius:50%; filter:blur(110px); opacity:.8; transition: opacity 1s; }
+.orb.cyan { width:52vw; height:52vw; left:-10vw; top:-14vh; background:rgba(74,144,217,0.28); animation:breathe 16s ease-in-out infinite alternate; }
+.orb.purple { width:44vw; height:44vw; right:-8vw; bottom:-16vh; background:rgba(175,82,222,0.22); animation:breathe 20s ease-in-out infinite alternate-reverse; }
+.orb.teal { width:30vw; height:30vw; right:18vw; top:6vh; background:rgba(90,200,250,0.16); animation:breathe 24s ease-in-out infinite alternate; animation-delay:-8s; }
+@keyframes breathe {
+  0% { transform:translate(0,0) scale(1); }
+  50% { transform:translate(4vw,-5vh) scale(1.15); }
+  100% { transform:translate(-3vw,4vh) scale(.92); }
+}
+@media (prefers-reduced-motion: reduce) { .orb { animation:none !important; } }
+
+/* ---- 主卡片 ---- */
+.card {
+  position:relative; z-index:1; width:min(560px, calc(100vw - 40px));
+  background:var(--glass-bg);
+  backdrop-filter:blur(48px) saturate(1.5); -webkit-backdrop-filter:blur(48px) saturate(1.5);
+  border:0.8px solid var(--glass-border); border-radius:28px;
+  box-shadow:var(--shadow); padding:36px; overflow:hidden;
+  animation:cardIn .7s var(--spring) both;
+}
+@keyframes cardIn { from { opacity:0; transform:translateY(24px) scale(.97);} to { opacity:1; transform:none;} }
+.card::after {
+  content:''; position:absolute; inset:0; border-radius:inherit; pointer-events:none;
+  background:linear-gradient(180deg, var(--glass-highlight) 0%, transparent 50%);
+}
+h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
+.sub { font-size:13px; color:var(--text-dim); margin-bottom:26px; }
+
+.field { display:flex; gap:8px; margin-bottom:12px; align-items:center; }
+.field input[type=text] {
+  flex:1; padding:11px 14px; font-size:14px; color:var(--text);
+  background:rgba(127,127,127,0.12); border:0.8px solid var(--glass-border);
+  border-radius:12px; outline:none; transition:border .25s, background .25s;
+  min-width:0;
+}
+.field input:focus { border-color:var(--accent); background:rgba(127,127,127,0.18); }
+.icon-btn {
+  flex:none; width:42px; height:42px; border-radius:12px; cursor:pointer;
+  background:var(--glass-bg); backdrop-filter:blur(30px);
+  border:0.8px solid var(--glass-border);
+  display:flex; align-items:center; justify-content:center; font-size:17px;
+  color:var(--text); transition:all .3s var(--spring);
+}
+.icon-btn:hover { transform:scale(1.07); background:rgba(127,127,127,0.2); }
+
+.btn-translate {
+  width:100%; margin-top:10px; padding:14px; font-size:16px; font-weight:600;
+  color:#fff; background:linear-gradient(135deg,#4A90D9,#357ABD);
+  border:none; border-radius:14px; cursor:pointer;
+  transition:all .3s var(--spring); letter-spacing:1px;
+}
+.btn-translate:hover { transform:scale(1.02); box-shadow:0 6px 24px rgba(74,144,217,0.45); }
+.btn-translate:active { transform:scale(.98); }
+.btn-translate:disabled { opacity:.45; cursor:not-allowed; transform:none; box-shadow:none; }
+
+/* ---- 设置按钮（左下角固定）---- */
+.gear {
+  position:fixed; left:22px; bottom:22px; z-index:10;
+  width:48px; height:48px; border-radius:50%; cursor:pointer;
+  background:var(--glass-bg); backdrop-filter:blur(30px);
+  border:0.8px solid var(--glass-border);
+  box-shadow:var(--shadow), inset 0 1px 0 var(--glass-highlight);
+  display:flex; align-items:center; justify-content:center; font-size:19px;
+  transition:all .35s var(--spring);
+}
+.gear:hover { transform:scale(1.1) rotate(30deg); }
+.gear svg { width:20px; height:20px; fill:var(--text-dim); transition:fill .3s; }
+.gear:hover svg { fill:var(--text); }
+
+/* ---- 进度区（展开动画）---- */
+.progress-zone {
+  max-height:0; overflow:hidden; opacity:0;
+  transition:max-height .6s var(--spring-slow), opacity .5s, margin .5s;
+}
+.progress-zone.open { max-height:300px; opacity:1; margin-top:18px; }
+.status-line { font-size:13px; color:var(--text-dim); margin-bottom:10px; min-height:18px; }
+.bar-track {
+  height:9px; border-radius:99px; background:rgba(127,127,127,0.18);
+  overflow:hidden; position:relative;
+}
+.bar-fill {
+  height:100%; width:0%; border-radius:99px;
+  background:linear-gradient(90deg,#4A90D9,#67B8F0,#4A90D9);
+  background-size:200% 100%;
+  transition:width .45s var(--spring-slow);
+  animation:flow 2.2s linear infinite;
+}
+@keyframes flow { from{background-position:0% 0;} to{background-position:200% 0;} }
+.bar-fill.indeterminate { width:38% !important; animation:slide 1.4s ease-in-out infinite, flow 2s linear infinite; }
+@keyframes slide { 0%{margin-left:-40%;} 100%{margin-left:104%;} }
+
+.ctrl-row { display:flex; gap:10px; margin-top:14px; }
+.ctrl-row button {
+  flex:1; padding:9px; font-size:13px; cursor:pointer; color:var(--text);
+  background:rgba(127,127,127,0.12); border:0.8px solid var(--glass-border);
+  border-radius:10px; transition:all .25s var(--spring);
+}
+.ctrl-row button:hover { background:rgba(127,127,127,0.22); }
+.warn-list {
+  margin-top:12px; max-height:96px; overflow-y:auto; font-size:11.5px;
+  color:#e8a33d; line-height:1.65; word-break:break-all;
+}
+.done-row { display:none; margin-top:14px; text-align:center; }
+.done-row.show { display:block; animation:pop .5s var(--spring) both; }
+.done-row a { color:var(--accent); font-size:13.5px; text-decoration:none; }
+.done-row a:hover { text-decoration:underline; }
+@keyframes pop { from{opacity:0; transform:scale(.9);} to{opacity:1; transform:scale(1);} }
+
+/* ---- 模态层 ---- */
+.modal-backdrop {
+  position:fixed; inset:0; z-index:100; background:rgba(0,0,0,0.32);
+  opacity:0; pointer-events:none; transition:opacity .3s;
+}
+.modal-backdrop.show { opacity:1; pointer-events:auto; }
+.modal {
+  position:fixed; z-index:101; top:50%; left:50%;
+  transform:translate(-50%,-46%) scale(.94); opacity:0; pointer-events:none;
+  width:min(520px, calc(100vw - 36px)); max-height:min(78vh, 720px);
+  display:flex; flex-direction:column;
+  background:var(--glass-bg); backdrop-filter:blur(56px) saturate(1.6);
+  -webkit-backdrop-filter:blur(56px) saturate(1.6);
+  border:0.8px solid var(--glass-border); border-radius:24px;
+  box-shadow:var(--shadow); transition:all .38s var(--spring);
+}
+.modal.show { transform:translate(-50%,-50%) scale(1); opacity:1; pointer-events:auto; }
+.modal-head { display:flex; align-items:center; justify-content:space-between; padding:20px 24px 0; }
+.modal-head h2 { font-size:17px; font-weight:600; }
+.modal-close { cursor:pointer; font-size:15px; color:var(--text-dim); background:none; border:none; padding:6px 10px; border-radius:8px; }
+.modal-close:hover { background:rgba(127,127,127,.15); color:var(--text); }
+.modal-body { padding:18px 24px 24px; overflow-y:auto; flex:1; }
+
+/* ---- 设置分类 ---- */
+.tab-bar { display:flex; gap:6px; margin-bottom:18px; }
+.tab-bar button {
+  flex:1; padding:8px 4px; font-size:12.5px; cursor:pointer; border-radius:9px;
+  background:transparent; border:0.8px solid transparent; color:var(--text-dim);
+  transition:all .25s;
+}
+.tab-bar button.active { background:rgba(127,127,127,0.16); border-color:var(--glass-border); color:var(--text); }
+.pane { display:none; }
+.pane.active { display:block; animation:paneIn .3s var(--spring) both; }
+@keyframes paneIn { from{opacity:0; transform:translateX(10px);} to{opacity:1; transform:none;} }
+.set-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:13px; }
+.set-row label { font-size:13.5px; flex:none; }
+.set-row .hint { font-size:11px; color:var(--text-dim); display:block; margin-top:2px; }
+.set-row input[type=text], .set-row input[type=password], .set-row select {
+  width:210px; padding:8px 11px; font-size:13px; color:var(--text);
+  background:rgba(127,127,127,0.12); border:0.8px solid var(--glass-border);
+  border-radius:9px; outline:none;
+}
+.set-row input:focus, .set-row select:focus { border-color:var(--accent); }
+.switch { position:relative; width:44px; height:26px; flex:none; }
+.switch input { opacity:0; width:0; height:0; }
+.slider {
+  position:absolute; inset:0; cursor:pointer; border-radius:99px;
+  background:rgba(127,127,127,0.3); transition:.3s;
+}
+.slider::before {
+  content:''; position:absolute; height:20px; width:20px; left:3px; top:3px;
+  border-radius:50%; background:#fff; transition:.3s var(--spring);
+}
+.switch input:checked + .slider { background:var(--accent); }
+.switch input:checked + .slider::before { transform:translateX(18px); }
+.btn-test {
+  width:100%; margin-top:6px; padding:10px; font-size:13px; cursor:pointer;
+  background:rgba(74,144,217,0.18); color:var(--accent);
+  border:0.8px solid rgba(74,144,217,0.4); border-radius:10px; transition:all .25s;
+}
+.btn-test:hover { background:rgba(74,144,217,0.3); }
+.test-result { font-size:12px; margin-top:8px; min-height:16px; line-height:1.5; word-break:break-all; }
+.save-float {
+  position:sticky; bottom:0; padding-top:12px; text-align:right;
+}
+.save-float button {
+  padding:9px 22px; font-size:13.5px; font-weight:600; cursor:pointer; color:#fff;
+  background:linear-gradient(135deg,#4A90D9,#357ABD); border:none; border-radius:10px;
+  transition:transform .25s var(--spring), opacity .3s;
+}
+.save-float button:hover { transform:scale(1.04); }
+.save-float button.saved { background:var(--gray); pointer-events:none; }
+
+/* ---- 文件浏览器模态 ---- */
+.browse-path {
+  display:flex; gap:8px; margin-bottom:12px; align-items:center;
+}
+.browse-path input {
+  flex:1; padding:8px 11px; font-size:12.5px; font-family:ui-monospace,monospace;
+  color:var(--text); background:rgba(127,127,127,0.12);
+  border:0.8px solid var(--glass-border); border-radius:9px; outline:none;
+}
+.file-list { border:0.8px solid var(--glass-border); border-radius:12px; overflow-y:auto; max-height:320px; min-height:200px; background:rgba(0,0,0,0.08); }
+[data-theme="light"] .file-list { background:rgba(0,0,0,0.03); }
+.file-item {
+  display:flex; align-items:center; gap:8px; padding:8px 14px; font-size:13px;
+  cursor:pointer; transition:background .15s; user-select:none;
+}
+.file-item:hover { background:rgba(127,127,127,0.14); }
+.file-item.selected { background:rgba(74,144,217,0.28); }
+.file-item .ic { flex:none; width:16px; text-align:center; }
+.browse-actions { display:flex; gap:10px; margin-top:14px; justify-content:flex-end; }
+.browse-actions button {
+  padding:8px 18px; font-size:13px; cursor:pointer; border-radius:10px;
+  border:0.8px solid var(--glass-border); background:rgba(127,127,127,0.12); color:var(--text);
+  transition:all .25s;
+}
+.browse-actions .primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+.browse-actions button:hover { filter:brightness(1.15); }
+
+/* toast */
+.toast {
+  position:fixed; top:26px; left:50%; transform:translate(-50%,-70px); z-index:200;
+  padding:10px 22px; font-size:13.5px; border-radius:99px;
+  background:var(--glass-bg); backdrop-filter:blur(30px);
+  border:0.8px solid var(--glass-border); box-shadow:var(--shadow);
+  transition:transform .4s var(--spring); pointer-events:none;
+}
+.toast.show { transform:translate(-50%,0); }
+.toast.err { border-color:rgba(231,76,60,0.5); color:#ff9a8b; }
+
+/* 拖放高亮 */
+body.dragging::after {
+  content:'松开以载入 PDF'; position:fixed; inset:12px; z-index:300;
+  border:2.5px dashed var(--accent); border-radius:22px;
+  display:flex; align-items:center; justify-content:center;
+  font-size:20px; color:var(--accent); background:rgba(0,0,0,0.35);
+  pointer-events:none;
+}
+</style>
+</head>
+<body>
+
+<div class="bg-wrap">
+  <div class="orb cyan"></div>
+  <div class="orb purple"></div>
+  <div class="orb teal"></div>
+</div>
+
+<!-- 主卡片 -->
+<div class="card">
+  <h1>PDF 翻译器</h1>
+  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴</div>
+
+  <div class="field">
+    <input type="text" id="inputPath" placeholder="翻译原文件路径 (.pdf)" spellcheck="false">
+    <button class="icon-btn" id="browseInput" title="浏览文件">📂</button>
+  </div>
+  <div class="field">
+    <input type="text" id="outputDir" placeholder="输出目录（默认与源文件同目录）" spellcheck="false">
+    <button class="icon-btn" id="browseOutput" title="浏览目录">📂</button>
+  </div>
+
+  <button class="btn-translate" id="btnTranslate">翻 译</button>
+
+  <!-- 进度区 -->
+  <div class="progress-zone" id="progressZone">
+    <div class="status-line" id="statusLine">准备中…</div>
+    <div class="bar-track"><div class="bar-fill indeterminate" id="barFill"></div></div>
+    <div class="ctrl-row">
+      <button id="btnPause">⏸ 暂停</button>
+      <button id="btnCancel">✕ 取消</button>
+    </div>
+    <div class="warn-list" id="warnList"></div>
+    <div class="done-row" id="doneRow">
+      ✅ 完成 · <a id="doneLink" href="#">打开输出 PDF</a>
+      <span id="doneStats" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+  </div>
+</div>
+
+<!-- 左下角设置 -->
+<button class="gear" id="btnSettings" title="设置">
+  <svg viewBox="0 0 24 24"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>
+</button>
+
+<!-- 设置模态 -->
+<div class="modal-backdrop" id="settingsBackdrop"></div>
+<div class="modal" id="settingsModal">
+  <div class="modal-head">
+    <h2>设置</h2>
+    <button class="modal-close" id="closeSettings">关闭 ✕</button>
+  </div>
+  <div class="modal-body">
+    <div class="tab-bar">
+      <button data-tab="model" class="active">模型</button>
+      <button data-tab="trans">翻译</button>
+      <button data-tab="perf">性能</button>
+      <button data-tab="adv">高级</button>
+    </div>
+
+    <!-- 模型 -->
+    <div class="pane active" id="pane-model">
+      <div class="set-row"><label>Provider</label>
+        <select id="cfg-provider"></select></div>
+      <div class="set-row"><label>模型名
+        <span class="hint">如 deepseek-chat / glm-4.7-flash</span></label>
+        <input type="text" id="cfg-model"></div>
+      <div class="set-row"><label>API Key
+        <span class="hint">仅存本地 ui_config.yaml，不出本机</span></label>
+        <input type="password" id="cfg-key" placeholder="••••••••"></div>
+      <div class="set-row"><label>备用模型链
+        <span class="hint">主模型日配额耗尽自动切换，逗号分隔</span></label>
+        <input type="text" id="cfg-fallback" placeholder="可选"></div>
+      <div class="set-row"><label>自定义 Base URL
+        <span class="hint">留空用 provider 默认；自建 endpoint 填这里</span></label>
+        <input type="text" id="cfg-baseurl" placeholder="可选"></div>
+      <button class="btn-test" id="btnTestKey">测试连通性</button>
+      <div class="test-result" id="testResult"></div>
+    </div>
+
+    <!-- 翻译 -->
+    <div class="pane" id="pane-trans">
+      <div class="set-row"><label>目标语言</label>
+        <select id="cfg-tgtlang"><option value="zh">中文</option><option value="en">英文</option></select></div>
+      <div class="set-row"><label>术语表 (YAML)
+        <span class="hint">锁定专业术语一致性</span></label>
+        <input type="text" id="cfg-glossary" placeholder="路径，可空"></div>
+      <div class="set-row"><label>期刊排版
+        <span class="hint">宋体正文/黑体标题</span></label>
+        <label class="switch"><input type="checkbox" id="cfg-formatting" checked><span class="slider"></span></label></div>
+      <div class="set-row"><label>水印移除</label>
+        <label class="switch"><input type="checkbox" id="cfg-watermark" checked><span class="slider"></span></label></div>
+      <div class="set-row"><label>双语对照模式</label>
+        <label class="switch"><input type="checkbox" id="cfg-bilingual"><span class="slider"></span></label></div>
+    </div>
+
+    <!-- 性能 -->
+    <div class="pane" id="pane-perf">
+      <div class="set-row"><label>并发数
+        <span class="hint">免费档建议 1</span></label>
+        <input type="text" id="cfg-workers" value="3"></div>
+      <div class="set-row"><label>批大小
+        <span class="hint">每次调用打包段落数</span></label>
+        <input type="text" id="cfg-batchsize" value="6"></div>
+      <div class="set-row"><label>调用间隔 (秒)
+        <span class="hint">限流严调大</span></label>
+        <input type="text" id="cfg-interval" value="2"></div>
+      <div class="set-row"><label>调用上限
+        <span class="hint">单文档防跑飞</span></label>
+        <input type="text" id="cfg-maxcalls" value="40"></div>
+      <div class="set-row"><label>重试次数</label>
+        <input type="text" id="cfg-retries" value="2"></div>
+    </div>
+
+    <!-- 高级 -->
+    <div class="pane" id="pane-adv">
+      <div class="set-row"><label>翻译缓存
+        <span class="hint">二次运行零调用</span></label>
+        <label class="switch"><input type="checkbox" id="cfg-cache" checked><span class="slider"></span></label></div>
+      <div class="set-row"><label>术语锁定校验</label>
+        <label class="switch"><input type="checkbox" id="cfg-glosslock" checked><span class="slider"></span></label></div>
+      <div class="save-float"><button id="btnSaveCfg">保存设置</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- 文件浏览器模态 -->
+<div class="modal-backdrop" id="browseBackdrop"></div>
+<div class="modal" id="browseModal" style="width:min(480px,calc(100vw - 36px))">
+  <div class="modal-head"><h2>选择文件 / 目录</h2><button class="modal-close" id="closeBrowse">关闭 ✕</button></div>
+  <div class="modal-body">
+    <div class="browse-path">
+      <input type="text" id="browseCur" spellcheck="false">
+      <button class="icon-btn" id="browseUp" title="上一级" style="width:36px;height:36px;font-size:15px;">⬆️</button>
+    </div>
+    <div class="file-list" id="fileList"></div>
+    <div class="browse-actions">
+      <button id="browseCancelBtn">取消</button>
+      <button class="primary" id="browseSelect">选定</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = async (url, opts) => {
+  const r = await fetch(url, opts ? {headers:{'Content-Type':'application/json'}, ...opts} : undefined);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+  return r.json();
+};
+let toastTimer = null;
+function toast(msg, isErr=false) {
+  const t = $('toast'); t.textContent = msg;
+  t.className = 'toast show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+/* ---------- 设置 ---------- */
+const PROVIDERS = ['deepseek','zhipu','gemini','siliconflow','openai','ollama','lmstudio'];
+let CFG = {};
+
+async function loadConfig() {
+  try {
+    const d = await api('/api/config');
+    CFG = d.config || {};
+    const llm = CFG.llm || {};
+    $('cfg-provider').value = llm.provider || 'deepseek';
+    $('cfg-model').value = llm.model || '';
+    $('cfg-key').placeholder = llm.has_key ? `已保存 (${llm.api_key_masked})` : '未设置';
+    $('cfg-fallback').value = llm.fallback_model || '';
+    $('cfg-baseurl').value = llm.base_url || '';
+    $('cfg-tgtlang').value = (CFG.io||{}).target_lang || 'zh';
+    $('cfg-glossary').value = CFG.glossary_file || '';
+    $('cfg-formatting').checked = (CFG.features||{}).preserve_formatting !== false;
+    $('cfg-watermark').checked = (CFG.features||{}).watermark_removal !== false;
+    $('cfg-bilingual').checked = !!(CFG.features||{}).bilingual;
+    $('cfg-cache').checked = (CFG.features||{}).translation_cache !== false;
+    $('cfg-glosslock').checked = (CFG.features||{}).glossary_lock !== false;
+    $('cfg-workers').value = llm.max_workers ?? 3;
+    $('cfg-batchsize').value = llm.batch_size ?? 6;
+    $('cfg-interval').value = llm.min_call_interval ?? 2;
+    $('cfg-maxcalls').value = llm.max_llm_calls ?? 40;
+    $('cfg-retries').value = llm.max_retries ?? 2;
+  } catch(e) { console.warn('loadConfig', e); }
+}
+
+function collectConfig() {
+  const num = (v, d) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
+  return {
+    io: { input:'', output_dir:'', source_lang:'en', target_lang:$('cfg-tgtlang').value },
+    llm: {
+      provider: $('cfg-provider').value,
+      model: $('cfg-model').value.trim(),
+      api_key: $('cfg-key').value.trim(),   // 打码或空时服务端保留旧值
+      base_url: $('cfg-baseurl').value.trim(),
+      fallback_model: $('cfg-fallback').value.trim(),
+      temperature: 0,
+      batch_size: num($('cfg-batchsize').value, 6),
+      max_llm_calls: num($('cfg-maxcalls').value, 40),
+      min_call_interval: num($('cfg-interval').value, 2),
+      max_workers: num($('cfg-workers').value, 3),
+      timeout: 120.0, max_retries: num($('cfg-retries').value, 2),
+      backoff_base: 8.0, backoff_cap: 30.0, retry_delay_cap: 60.0,
+    },
+    features: {
+      watermark_removal: $('cfg-watermark').checked,
+      preserve_formatting: $('cfg-formatting').checked,
+      glossary_lock: $('cfg-glosslock').checked,
+      translation_cache: $('cfg-cache').checked,
+      bilingual: $('cfg-bilingual').checked,
+    },
+    glossary_file: $('cfg-glossary').value.trim(),
+    fonts: { cjk: '' },
+    ocr: { engine: 'paddle', min_chars: 50 },
+  };
+}
+
+(function initProviders() {
+  const sel = $('cfg-provider');
+  PROVIDERS.forEach(p => {
+    const o = document.createElement('option');
+    o.value = p; o.textContent = p;
+    sel.appendChild(o);
+  });
+})();
+
+async function saveConfig() {
+  CFG = collectConfig();
+  await api('/api/config', {method:'PUT', body: JSON.stringify({config: CFG})});
+  const b = $('btnSaveCfg');
+  b.textContent = '已保存 ✓'; b.classList.add('saved');
+  setTimeout(() => { b.textContent = '保存设置'; b.classList.remove('saved'); }, 1800);
+  // 刷新 key placeholder
+  loadConfig();
+}
+$('btnSaveCfg').onclick = saveConfig;
+
+$('btnTestKey').onclick = async () => {
+  const el = $('testResult');
+  el.textContent = '测试中…'; el.style.color = '';
+  const cfgNow = collectConfig().llm;
+  try {
+    const r = await api('/api/validate-key', {method:'POST', body: JSON.stringify({
+      provider: cfgNow.provider, model: cfgNow.model || 'deepseek-chat',
+      api_key: cfgNow.api_key, base_url: cfgNow.base_url,
+    })});
+    if (r.ok) {
+      el.style.color = '#7ed88f';
+      el.textContent = `✓ 连通正常 (${r.latency}s)：${r.sample}`;
+    } else {
+      el.style.color = '#ff9a8b';
+      el.textContent = `✗ ${r.error}`;
+    }
+  } catch(e) { el.style.color = '#ff9a8b'; el.textContent = `✗ ${e.message}`; }
+};
+
+/* ---------- 设置模态开关 ---------- */
+function openModal(m, b) { m.classList.add('show'); b.classList.add('show'); }
+function closeModal(m, b) { m.classList.remove('show'); b.classList.remove('show'); }
+$('btnSettings').onclick = () => openModal($('settingsModal'), $('settingsBackdrop'));
+$('closeSettings').onclick = () => closeModal($('settingsModal'), $('settingsBackdrop'));
+$('settingsBackdrop').onclick = () => closeModal($('settingsModal'), $('settingsBackdrop'));
+
+document.querySelectorAll('.tab-bar button').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    $('pane-' + btn.dataset.tab).classList.add('active');
+  };
+});
+
+/* ---------- 文件浏览器 ---------- */
+let browseTarget = null;   // 'input' | 'output'
+let browseSel = null;
+function openBrowse(target) {
+  browseTarget = target; browseSel = null;
+  $('browseSelect').textContent = target === 'output' ? '选定此目录' : '选定此文件';
+  openModal($('browseModal'), $('browseBackdrop'));
+  browseTo($('inputPath').value && target==='input' ? parentOf($('inputPath').value)
+          : $('outputDir').value && target==='output' ? $('outputDir').value : '');
+}
+function parentOf(p) { const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')); return i > 0 ? p.slice(0, i) : ''; }
+$('browseInput').onclick = () => openBrowse('input');
+$('browseOutput').onclick = () => openBrowse('output');
+$('closeBrowse').onclick = () => closeModal($('browseModal'), $('browseBackdrop'));
+$('browseBackdrop').onclick = () => closeModal($('browseModal'), $('browseBackdrop'));
+$('browseCancelBtn').onclick = () => closeModal($('browseModal'), $('browseBackdrop'));
+
+async function browseTo(path) {
+  try {
+    const d = await api('/api/browse?path=' + encodeURIComponent(path));
+    $('browseCur').value = d.path;
+    const list = $('fileList'); list.innerHTML = '';
+    if (d.parent) {
+      const up = document.createElement('div');
+      up.className = 'file-item';
+      up.innerHTML = '<span class="ic">⬆️</span><span>..</span>';
+      up.onclick = () => browseTo(d.parent);
+      list.appendChild(up);
+    }
+    d.entries.forEach(e => {
+      const it = document.createElement('div');
+      it.className = 'item file-item';
+      it.innerHTML = `<span class="ic">${e.dir ? '📁' : '📄'}</span><span>${e.name}</span>`;
+      if (!e.dir && !e.name.toLowerCase().endsWith('.pdf')) {
+        it.style.opacity = '.4';   // 非PDF淡化但可选目录进入
+      }
+      it.onclick = () => {
+        list.querySelectorAll('.file-item').forEach(x => x.classList.remove('selected'));
+        it.classList.add('selected');
+        if (e.dir) browseSel = {dir:true, path: d.path + '/' + e.name};
+        else browseSel = {dir:false, path: d.path + '/' + e.name};
+      };
+      it.ondblclick = () => { if (e.dir) browseTo(d.path + '/' + e.name); };
+      list.appendChild(it);
+    });
+  } catch(err) { toast(err.message, true); }
+}
+$('browseUp').onclick = () => browseTo(parentOf($('browseCur').value));
+$('browseSelect').onclick = () => {
+  if (!browseSel) { toast('先选中一项', true); return; }
+  if (browseTarget === 'input') {
+    if (browseSel.dir) { browseTo(browseSel.path); browseSel = null; return; }
+    $('inputPath').value = browseSel.path;
+  } else {
+    $('outputDir').value = browseSel.dir ? browseSel.path : parentOf(browseSel.path);
+  }
+  closeModal($('browseModal'), $('browseBackdrop'));
+};
+
+/* ---------- 翻译流程 ---------- */
+let pollTimer = null;
+
+async function refreshJob() {
+  try {
+    const j = await api('/api/jobs/current');
+    updateProgressUI(j);
+    return j;
+  } catch(e) { return null; }
+}
+
+function setBar(pct, indet=false) {
+  const bar = $('barFill');
+  bar.classList.toggle('indeterminate', indet);
+  bar.style.width = pct + '%';
+}
+
+function updateProgressUI(j) {
+  const zone = $('progressZone');
+  const btn = $('btnTranslate');
+  if (j.status === 'idle' && !pollActive) { /* nothing */ }
+  if (['queued','running','paused'].includes(j.status)) {
+    zone.classList.add('open');
+    btn.disabled = true; btn.textContent = j.status === 'paused' ? '已暂停 ⏸' : '翻译中…';
+    $('btnPause').textContent = j.status === 'paused' ? '▶ 继续' : '⏸ 暂停';
+  } else {
+    zone.classList.remove('open');
+    btn.disabled = false; btn.textContent = '翻 译';
+  }
+  if (j.output_path) {
+    $('doneRow').classList.add('show');
+    $('doneLink').href = 'file://' + encodeURI(j.output_path).replace(/#/g,'%23');
+    // done stats 由 exit 事件携带
+  }
+  if (j.status === 'error') { $('statusLine').textContent = '❌ ' + (j.error || '失败'); }
+  if (j.status === 'cancelled') { $('statusLine').textContent = '已取消'; }
+}
+
+let pollActive = false;
+function startPolling() {
+  if (pollTimer) return;
+  const tick = async () => {
+    const j = await refreshJob();
+    const busy = ['queued','running','paused'].includes(j?.status || 'idle');
+    // 忙时 1.2s 快轮询；空闲 15s 慢轮询（动态换 interval）
+    const want = busy ? 1200 : 15000;
+    if (want !== curInterval) {
+      curInterval = want;
+      clearInterval(pollTimer);
+      pollTimer = setInterval(tick, want);
+    }
+  };
+  let curInterval = 1200;
+  pollTimer = setInterval(tick, curInterval);
+}
+
+$('btnTranslate').onclick = async () => {
+  const input = $('inputPath').value.trim();
+  if (!input) { toast('先填输入 PDF 路径', true); return; }
+  try {
+    await saveConfigSilent();
+    await api('/api/translate', {method:'POST', body: JSON.stringify({
+      input, output_dir: $('outputDir').value.trim(), config: CFG,
+    })});
+    $('warnList').textContent = ''; $('doneRow').classList.remove('show');
+    $('statusLine').textContent = '启动中…'; setBar(0, true);
+    startPolling();
+  } catch(e) { toast(e.message, true); }
+};
+async function saveConfigSilent() {
+  CFG = collectConfig();
+  await api('/api/config', {method:'PUT', body: JSON.stringify({config: CFG})});
+}
+
+$('btnPause').onclick = async () => {
+  const j = await refreshJob(); if (!j?.id) return;
+  const action = j.status === 'paused' ? 'resume' : 'pause';
+  await api(`/api/jobs/${j.id}/${action}`, {method:'POST'});
+  refreshJob();
+};
+$('btnCancel').onclick = async () => {
+  const j = await refreshJob(); if (!j?.id) return;
+  await api(`/api/jobs/${j.id}/cancel`, {method:'POST'});
+  toast('取消中…（当前批次完成后停止）');
+};
+
+/* ---------- 拖放 ---------- */
+['dragenter','dragover'].forEach(ev =>
+  document.addEventListener(ev, e => { e.preventDefault(); document.body.classList.add('dragging'); }));
+['dragleave','drop'].forEach(ev =>
+  document.addEventListener(ev, e => {
+    e.preventDefault();
+    if (ev === 'dragleave' && e.relatedTarget) return;
+    document.body.classList.remove('dragging');
+    if (ev === 'drop' && e.dataTransfer.files.length) {
+      $('inputPath').value = e.dataTransfer.files[0].name;   // 浏览器只给文件名
+      toast('浏览器安全限制只能拿到文件名，请用 📂 选完整路径', true);
+    }
+  }));
+
+/* ---------- init ---------- */
+loadConfig();
+startPolling();
+
+// 进度条事件驱动增强：从 job events 快照拉取（简化：轮询 snapshot 即够）
+</script>
+</body>
+</html>

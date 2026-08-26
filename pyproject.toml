@@ -1,0 +1,20 @@
+[project]
+name = "pdf-translator"
+version = "0.4.0"
+description = "学术 PDF 整册翻译工具：保留原始版面的 EN→ZH 翻译，附 Liquid Glass Web UI"
+requires-python = ">=3.11"
+dependencies = [
+    "pymupdf>=1.24",
+    "openai>=1.0",
+    "pyyaml>=6.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
