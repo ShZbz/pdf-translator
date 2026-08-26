@@ -1,5 +1,9 @@
 # pdf-translator
 
+<div align="center">
+  <img src="assets/ui-main.png" alt="pdf-translator Web UI" width="720"/>
+</div>
+
 学术 PDF 整册翻译工具：保留原始版面（图片/表格/公式/双栏）的 EN→ZH 翻译。
 
 **Version** v0.4.0 · **Stack** Python 3.11+ · OpenAI 兼容协议（DeepSeek/智谱/Gemini/SiliconFlow/Ollama/LM Studio）· FastAPI + 单文件 Web UI · PyMuPDF
