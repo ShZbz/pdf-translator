@@ -1,0 +1,236 @@
+# 物理学 / 量子材料 / 拓扑物态 术语表示例
+# ============================================================
+# 用法: 复制此文件,按需增删条目,然后在配置中指定:
+#   glossary_file: "glossary-physics-example.yaml"
+# 或在 Web UI: 设置 → 翻译 → 术语表 路径框填入本文件路径
+#
+# 格式: 平面 YAML 映射 {英文术语: 中文译名}
+#   - 键为文献中的英文原词(大小写敏感,建议与论文一致)
+#   - 值为目标语言译名
+#   - 翻译时整表注入提示词 + 译后逐段校验残留
+#
+# 领域覆盖: 量子霍尔效应族 / 拓扑绝缘体与半金属 / 贝里几何 /
+#          超导 / 二维材料 / 输运与磁性 / 表征技术
+# ============================================================
+
+# ---------- 霍尔效应族 ----------
+Hall effect: 霍尔效应
+Hall conductivity: 霍尔电导率
+Hall resistivity: 霍尔电阻率
+Hall coefficient: 霍尔系数
+Hall angle: 霍尔角
+quantum Hall effect: 量子霍尔效应
+fractional quantum Hall effect: 分数量子霍尔效应
+integer quantum Hall effect: 整数量子霍尔效应
+quantum anomalous Hall effect: 量子反常霍尔效应
+anomalous Hall effect: 反常霍尔效应
+spin Hall effect: 自旋霍尔效应
+quantum spin Hall effect: 量子自旋霍尔效应
+planar Hall effect: 平面霍尔效应
+topological Hall effect: 拓扑霍尔效应
+extrinsic Hall effect: 外禀霍尔效应
+intrinsic Hall effect: 内禀霍尔效应
+skew scattering: 歪斜散射
+side jump: 侧跳
+Berry curvature dipole: 贝里曲率偶极子
+nonlinear Hall effect: 非线性霍尔效应
+thermal Hall effect: 热霍尔效应
+valley Hall effect: 谷霍尔效应
+odd-parity Hall effect: 奇宇称霍尔效应
+
+# ---------- 拓扑物态与拓扑不变量 ----------
+topological insulator: 拓扑绝缘体
+topological semimetal: 拓扑半金属
+topological superconductor: 拓扑超导体
+topological phase transition: 拓扑相变
+topological invariant: 拓扑不变量
+topological protection: 拓扑保护
+topological edge state: 拓扑边缘态
+topological surface state: 拓扑表面态
+Z2 invariant: Z2 不变量
+Chern number: 陈数
+first Chern number: 第一陈数
+winding number: 绕数
+bulk-boundary correspondence: 体边对应
+band inversion: 能带反转
+parity inversion: 宇称反转
+
+# ---------- 外尔 / 狄拉克半金属 ----------
+Weyl semimetal: 外尔半金属
+Dirac semimetal: 狄拉克半金属
+Weyl point: 外尔点
+Weyl node: 外尔节点
+Dirac point: 狄拉克点
+Weyl fermion: 外尔费米子
+chiral anomaly: 手性反常
+Fermi arc: 费米弧
+node-line semimetal: 节线半金属
+nodal line: 节线
+type-I Weyl node: I 型外尔节点
+type-II Weyl node: II 型外尔节点
+
+# ---------- 贝里几何与动量空间 ----------
+Berry curvature: 贝里曲率
+Berry phase: 贝里相位
+Berry connection: 贝里联络
+Chern-Simons term: 陈-西蒙斯项
+momentum space: 动量空间
+k-space: k 空间
+Brillouin zone: 布里渊区
+Dirac cone: 狄拉克锥
+band crossing: 能带交叉
+band gap: 带隙
+nodal point: 节点
+van Hove singularity: 范霍夫奇点
+
+# ---------- 二维材料与莫尔体系 ----------
+graphene: 石墨烯
+bilayer graphene: 双层石墨烯
+twisted bilayer graphene: 转角双层石墨烯
+magic angle: 魔角
+moire superlattice: 莫尔超晶格
+moire band: 莫尔能带
+hexagonal boron nitride: 六方氮化硼
+transition metal dichalcogenide: 过渡金属硫族化合物
+kagome lattice: 笼目晶格
+honeycomb lattice: 蜂窝晶格
+Kagome metal: 笼目金属
+charge density wave: 电荷密度波
+flat band: 平带
+
+# ---------- 磁性与交换 ----------
+magnetic anisotropy: 磁各向异性
+exchange interaction: 交换相互作用
+RKKY interaction: RKKY 相互作用
+Dzyaloshinskii-Moriya interaction: Dzyaloshinskii-Moriya 相互作用
+skyrmion: 斯格明子
+magnetic skyrmion: 磁斯格明子
+spin texture: 自旋织构
+antiferromagnetism: 反铁磁性
+ferromagnetism: 铁磁性
+ferrimagnetism: 亚铁磁性
+canted antiferromagnet: 倾角反铁磁体
+noncoplanar spin structure: 非共面自旋结构
+scalar spin chirality: 标量自旋手性
+spin chirality: 自旋手性
+frustrated magnetism: 阻挫磁性
+geometric frustration: 几何阻挫
+effective magnetic field: 有效磁场
+emergent field: 涌现场
+magnetic hysteresis loop: 磁滞回线
+coercivity: 矫顽力
+saturation magnetization: 饱和磁化强度
+
+# ---------- 超导 ----------
+superconductivity: 超导电性
+superconducting gap: 超导能隙
+Cooper pair: 库珀对
+Meissner effect: 迈斯纳效应
+type-II superconductor: II 类超导体
+upper critical field: 上临界场
+unconventional superconductor: 非常规超导体
+Majorana zero mode: 马约拉纳零模
+Andreev reflection: 安德烈耶夫反射
+proximity effect: 近邻效应
+
+# ---------- 输运现象 ----------
+longitudinal resistivity: 纵向电阻率
+longitudinal conductivity: 纵向电导率
+Shubnikov-de Haas oscillation: Shubnikov-de Haas 振荡
+de Haas-van Alphen effect: de Haas-van Alphen 效应
+weak localization: 弱局域化
+weak anti-localization: 弱反局域化
+universal conductance fluctuations: 普适电导涨落
+Aharonov-Bohm effect: Aharonov-Bohm 效应
+Coulomb blockade: 库仑阻塞
+metal-insulator transition: 金属-绝缘体转变
+Mott transition: 莫特转变
+percolation threshold: 渗流阈值
+mean free path: 平均自由程
+mobility: 迁移率
+carrier density: 载流子浓度
+Fermi level: 费米能级
+Fermi surface: 费米面
+Landau level: 朗道能级
+filling factor: 填充因子
+cyclotron mass: 回旋质量
+quantum mobility: 量子迁移率
+
+# ---------- 电子结构与多体 ----------
+density of states: 态密度
+band structure: 能带结构
+energy dispersion: 能量色散
+spin-orbit coupling: 自旋轨道耦合
+Rashba effect: Rashba 效应
+Rashba splitting: Rashba 劈裂
+electron correlation: 电子关联
+many-body interaction: 多体相互作用
+Mott insulator: 莫特绝缘体
+Hubbard model: Hubbard 模型
+strongly correlated system: 强关联体系
+quasiparticle: 准粒子
+self-energy: 自能
+spectral function: 谱函数
+exchange splitting: 交换劈裂
+crystal field splitting: 晶体场劈裂
+Jahn-Teller distortion: Jahn-Teller 畸变
+Kondo effect: 近藤效应
+heavy fermion: 重费米子
+
+# ---------- 对称性与群论 ----------
+time-reversal symmetry: 时间反演对称性
+inversion symmetry: 空间反演对称性
+mirror symmetry: 镜面对称性
+rotational symmetry: 旋转对称性
+translational symmetry: 平移对称性
+gauge symmetry: 规范对称性
+symmetry breaking: 对称性破缺
+spontaneous symmetry breaking: 自发对称性破缺
+crystalline symmetry: 晶体对称性
+space group: 空间群
+point group: 点群
+unit cell: 单胞
+primitive cell: 原胞
+
+# ---------- 表征技术 ----------
+angle-resolved photoemission spectroscopy: 角分辨光电子能谱
+ARPES: ARPES（角分辨光电子能谱）
+scanning tunneling microscopy: 扫描隧道显微镜
+scanning tunneling spectroscopy: 扫描隧道谱
+X-ray diffraction: X 射线衍射
+neutron diffraction: 中子衍射
+X-ray absorption spectroscopy: X 射线吸收谱
+X-ray magnetic circular dichroism: X 射线磁圆二色
+muon spin rotation: 缪子自旋转动
+Raman spectroscopy: 拉曼光谱
+magnetic torque: 磁扭矩
+torque magnetometry: 扭矩磁强计
+electrical transport measurement: 电输运测量
+hall bar: 霍尔条
+four-probe method: 四探针法
+dilution refrigerator: 稀释制冷机
+physical property measurement system: 物性测量系统
+
+# ---------- 其他高频词 ----------
+emergent phenomenon: 涌现现象
+ground state: 基态
+excited state: 激发态
+phase diagram: 相图
+order parameter: 序参量
+critical temperature: 临界温度
+Neel temperature: Neel 温度
+Curie temperature: 居里温度
+hysteresis: 磁滞
+anisotropic magnetoresistance: 各向异性磁电阻
+colossal magnetoresistance: 庞磁电阻
+negative magnetoresistance: 负磁电阻
+spin polarization: 自旋极化
+spin current: 自旋流
+edge current: 边缘电流
+chiral edge state: 手性边缘态
+helical edge state: 螺旋边缘态
+dissipationless: 无耗散
+quantization: 量子化
+plateau: 平台
+precision measurement: 精密测量
+resistance standard: 电阻标准

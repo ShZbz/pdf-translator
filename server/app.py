@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from .glossary_io import collect_yaml_files, dump_merged, validate_and_merge, validate_text
 from .jobs import JobManager
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -181,6 +182,60 @@ def validate_key(req: ValidateReq):
     except Exception as e:
         return JSONResponse(status_code=200,
                             content={"ok": False, "error": str(e)[:300]})
+
+
+# ---------- 术语表批量导入 ----------
+class GlossaryCollectReq(BaseModel):
+    path: str
+    recursive: bool = True
+    depth: int = 2
+
+
+class GlossaryPreviewReq(BaseModel):
+    paths: list[str]
+
+
+class GlossarySaveReq(BaseModel):
+    text: str
+
+
+GLOSSARY_MERGED_PATH = PROJECT_ROOT / ".ui_glossary_merged.yaml"
+
+
+@app.post("/api/glossary/collect")
+def glossary_collect(req: GlossaryCollectReq) -> dict:
+    """目录（递归 depth 层）或单个文件 → 候选 YAML 清单。"""
+    files = collect_yaml_files(req.path, recursive=req.recursive,
+                               depth=req.depth)
+    if not files:
+        raise HTTPException(404, "该位置没有找到 .yaml/.yml/.json 文件")
+    return {"files": files}
+
+
+@app.post("/api/glossary/preview")
+def glossary_preview(req: GlossaryPreviewReq) -> dict:
+    """合并+校验，返回 (ok, merged_text, issues)。error 存在时 ok=false。"""
+    merged, issues = validate_and_merge(req.paths)
+    errors = [i for i in issues if i["kind"] == "error"]
+    return {"ok": not errors, "merged_text": dump_merged(merged),
+            "issues": issues, "term_count": len(merged)}
+
+
+@app.post("/api/glossary/save")
+def glossary_save(req: GlossarySaveReq):
+    """保存合并文本到本地临时术语表，路径供配置引用。
+
+    若仍有 error（用户手改大框引入的）则拒绝保存并回传 issues。
+    """
+    merged, issues = validate_text(req.text)
+    errors = [i for i in issues if i["kind"] == "error"]
+    if merged is None or errors:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "issues": errors or issues})
+    GLOSSARY_MERGED_PATH.write_text(
+        dump_merged(merged), encoding="utf-8")
+    return {"ok": True, "path": str(GLOSSARY_MERGED_PATH),
+            "term_count": len(merged)}
 
 
 # ---------- 目录浏览 ----------

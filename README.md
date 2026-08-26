@@ -1,14 +1,6 @@
 # pdf-translator
 
-<div align="center">
-  <img src="assets/ui-main.png" alt="pdf-translator Web UI" width="720"/>
-</div>
-
 学术 PDF 整册翻译工具：保留原始版面（图片/表格/公式/双栏）的 EN→ZH 翻译。
-
-**Version** v0.4.0 · **Stack** Python 3.11+ · OpenAI 兼容协议（DeepSeek/智谱/Gemini/SiliconFlow/Ollama/LM Studio）· FastAPI + 单文件 Web UI · PyMuPDF
-
-**License** MIT
 
 ## 功能特性
 
@@ -23,6 +15,10 @@
 - **SQLite 缓存**：key = MD5(engine|model|lang|text)，二次运行零 LLM 调用
 - **失败降级**：LLM 失败/触顶段落保留原文重灌，版面完整不塌陷
 - **多 provider 支持**：OpenAI 兼容协议，内置 DeepSeek/智谱/Gemini/SiliconFlow/Ollama/LM Studio preset
+- **双语对照模式**（可选开关）：译文在上、灰色原文在下同框对照，标题/公式区不重复排版；输出文件名带 `-bilingual` 后缀
+- **术语表锁定**：外部 YAML 术语表注入翻译提示词 + 译后逐段校验，专业术语全篇一致；违例段落以 `glossary violation` 警告提示。仓库附物理/拓扑材料示例表 `glossary-physics-example.yaml`
+- **版面元素识别**：页眉/页脚自动剔除（顶部 8% / 底部 6% 阈值判定，不译不干扰正文）；Fig./Table 开头的图注表注智能豁免误保护
+- **零成本试跑**：CLI `--dry-run` 跳过 LLM 翻译跑完整布局/水印/渲染管线，验证配置是否正确不花一个 token
 
 ## 环境要求
 
@@ -146,8 +142,11 @@ llm:
 ## 命令行
 
 ```bash
-python -m translator.cli -c myconfig.yaml [-v]
+python -m translator.cli -c myconfig.yaml [-v] [--dry-run]
 ```
+
+`--dry-run`：跳过 LLM 翻译，完整跑布局/水印/渲染管线（全部段落保留原文）。
+用来验证配置文件是否正确、预览版面识别效果，零 token 消耗。
 
 日志输出每页布局统计（段落数/公式数/单元格数），结束打印总调用数与 warning 列表。
 warning 类型：
@@ -155,6 +154,26 @@ warning 类型：
 - `batch failed after retry, keep source: [...]` — 这些批次翻译失败已降级为原文，可重跑（有缓存，成功的批次不会重复调用）
 - `cellN: narrow box ... < text width` — 表格窄格文字略超格宽，仅提示不影响内容
 - `glossary violation` — 术语表校验违例（启用 `glossary_lock` 时）
+
+## 术语表
+
+专业文献术语一致性靠外部 YAML 术语表（可选）。格式为平面映射：
+
+```yaml
+# glossary.yaml
+Chern number: 陈数
+Berry curvature: 贝里曲率
+quantum anomalous Hall effect: 量子反常霍尔效应
+Weyl semimetal: 外尔半金属
+```
+
+工作方式（两道工序）：
+1. **翻译前**：术语表全文注入 system prompt，LLM 按表翻译
+2. **翻译后**：逐段校验英文原词是否残留，违例记 `glossary violation` 警告
+
+启用：配置里填 `glossary_file: "glossary.yaml"`，或 UI 设置 → 翻译 → 术语表路径。
+仓库附带的 **`glossary-physics-example.yaml`** 是物理/量子材料领域示例
+（量子霍尔效应族、拓扑材料、贝里几何等约 120 条），可直接用也可当模板改。
 
 ## 测试
 
@@ -191,6 +210,7 @@ web/
 run_ui.py        # 一键启动（uvicorn + 自动开浏览器）
 tests/           # 单元测试
 config.example.yaml  # 配置模板
+glossary-physics-example.yaml  # 物理/量子材料术语表示例
 ```
 
 ## 已知限制
@@ -198,5 +218,6 @@ config.example.yaml  # 配置模板
 - 手写体/艺术字扫描件依赖 OCR 质量（默认 PaddleOCR，需另装）
 - 竖排文本、旋转页面不支持翻译（原样保留）
 - 极复杂嵌套表格可能切分不准，单元格译文以警告提示
+- 水印移除仅处理**文字层水印**（出版社/preprint 声明类）；扫描件中烤在图像像素里的水印无法移除
 - UI 暂停为**批间暂停**：正在飞行中的那次 LLM 请求会跑完才停（几秒内生效）；
   取消同理，且不产出半成品 PDF

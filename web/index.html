@@ -221,6 +221,29 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
 .save-float button:hover { transform:scale(1.04); }
 .save-float button.saved { background:var(--gray); pointer-events:none; }
 
+/* 术语表管理 */
+.chip-row { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 6px; }
+.chip { display:inline-flex; align-items:center; gap:6px; padding:3px 10px;
+  border-radius:12px; background:rgba(74,144,217,.1); border:0.8px solid var(--glass-border);
+  font-size:12.5px; max-width:100%; }
+.chip b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500; }
+.chip .x { cursor:pointer; opacity:.55; font-size:13px; padding:0 1px; }
+.chip .x:hover { opacity:1; }
+#glossaryBox { width:100%; min-height:160px; resize:vertical; font:12.5px/1.55 Consolas,Menlo,monospace;
+  background:rgba(255,255,255,.045); color:var(--fg); border:0.8px solid var(--glass-border);
+  border-radius:10px; padding:10px 12px; outline:none; margin-top:4px; }
+.issue-row { font-size:12.5px; padding:5px 10px; border-radius:8px; margin-top:6px;
+  display:flex; gap:8px; align-items:baseline; cursor:pointer; }
+.issue-row.err { background:rgba(231,76,60,.12); color:#f0a49a; }
+.issue-row.warn { background:rgba(240,173,78,.12); color:#e8c07a; }
+.issue-row .ln { font-family:Consolas,monospace; opacity:.7; min-width:52px; flex:none; }
+.issue-row .msg { flex:1; }
+.issue-row:hover { filter:brightness(1.12); }
+.glz-meta { font-size:12px; opacity:.65; margin:6px 2px; }
+.rec-row { display:flex; align-items:center; gap:8px; font-size:12.5px; margin:8px 0; opacity:.9; }
+.rec-row input[type=number] { width:56px; padding:3px 6px; border-radius:7px;
+  background:rgba(255,255,255,.05); border:0.8px solid var(--glass-border); color:var(--fg); }
+
 /* ---- 文件浏览器模态 ---- */
 .browse-path {
   display:flex; gap:8px; margin-bottom:12px; align-items:center;
@@ -353,13 +376,21 @@ body.dragging::after {
     <div class="pane" id="pane-trans">
       <div class="set-row"><label>目标语言</label>
         <select id="cfg-tgtlang"><option value="zh">中文</option><option value="en">英文</option></select></div>
-      <div class="set-row"><label>术语表 (YAML)
+      <div class="set-row" style="align-items:flex-start;"><label>术语表 (YAML)
         <span class="hint">锁定专业术语一致性</span></label>
-        <input type="text" id="cfg-glossary" placeholder="路径，可空"></div>
+        <div style="display:flex;flex-direction:column;gap:4px;max-width:60%;">
+          <input type="text" id="cfg-glossary" placeholder="路径，可空">
+          <button type="button" id="btnGlossaryManage" style="align-self:flex-end;
+            padding:3px 10px;font-size:12px;border-radius:8px;cursor:pointer;
+            background:rgba(74,144,217,.12);border:0.8px solid var(--glass-border);color:var(--fg);">
+            批量导入/管理 ⚙
+          </button>
+        </div></div>
       <div class="set-row"><label>期刊排版
         <span class="hint">宋体正文/黑体标题</span></label>
         <label class="switch"><input type="checkbox" id="cfg-formatting" checked><span class="slider"></span></label></div>
-      <div class="set-row"><label>水印移除</label>
+      <div class="set-row"><label>水印移除
+        <span class="hint">仅文字层水印（出版社声明类）；扫描图片型水印无法移除</span></label>
         <label class="switch"><input type="checkbox" id="cfg-watermark" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>双语对照模式</label>
         <label class="switch"><input type="checkbox" id="cfg-bilingual"><span class="slider"></span></label></div>
@@ -390,6 +421,22 @@ body.dragging::after {
         <label class="switch"><input type="checkbox" id="cfg-cache" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>术语锁定校验</label>
         <label class="switch"><input type="checkbox" id="cfg-glosslock" checked><span class="slider"></span></label></div>
+      <hr style="border:none;border-top:0.8px solid var(--glass-border);margin:14px 0 16px;">
+      <div class="set-row"><label>Temperature
+        <span class="hint">默认 0 · 建议 0–0.5 固定风格</span></label>
+        <input type="text" id="cfg-temperature" value="0" inputmode="decimal"></div>
+      <div class="set-row"><label>请求超时 (秒)
+        <span class="hint">默认 120 · 慢模型调大至 180–300</span></label>
+        <input type="text" id="cfg-timeout" value="120" inputmode="decimal"></div>
+      <div class="set-row"><label>传输重试退避起点 (秒)
+        <span class="hint">默认 8 · 建议 5–15</span></label>
+        <input type="text" id="cfg-backoffbase" value="8" inputmode="decimal"></div>
+      <div class="set-row"><label>退避上限 (秒)
+        <span class="hint">默认 30 · 建议 20–60</span></label>
+        <input type="text" id="cfg-backoffcap" value="30" inputmode="decimal"></div>
+      <div class="set-row"><label>限流等待封顶 (秒)
+        <span class="hint">默认 60 · 建议 30–120</span></label>
+        <input type="text" id="cfg-retrycaps" value="60" inputmode="decimal"></div>
       <div class="save-float"><button id="btnSaveCfg">保存设置</button></div>
     </div>
   </div>
@@ -413,6 +460,28 @@ body.dragging::after {
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- 术语表批量管理模态 -->
+<div class="modal-backdrop" id="glossaryBackdrop"></div>
+<div class="modal" id="glossaryModal" style="width:min(620px,calc(100vw - 36px))">
+  <div class="modal-head"><h2>术语表批量导入 / 管理</h2><button class="modal-close" id="closeGlossary">关闭 ✕</button></div>
+  <div class="modal-body">
+    <div class="chip-row" id="glzChips" style="max-height:110px;overflow-y:auto;"></div>
+    <div class="rec-row">
+      <button class="icon-btn" id="btnGlzAdd" title="选择文件/目录" style="width:auto;padding:4px 12px;font-size:13px;">＋ 添加文件/目录</button>
+      <span style="opacity:.75;">递归深度</span>
+      <input type="number" id="glzDepth" value="2" min="0" max="9">
+      <button class="icon-btn" id="btnGlzPreview" title="合并预览" style="width:auto;padding:4px 12px;font-size:13px;">⇅ 合并预览</button>
+      <span class="glz-meta" id="glzMeta" style="margin:0 0 0 auto;"></span>
+    </div>
+    <textarea id="glossaryBox" spellcheck="false" placeholder="合并预览 / 手动编辑后的最终术语表…"></textarea>
+    <div id="glzIssues"></div>
+    <div class="browse-actions">
+      <button id="glzCancelBtn">取消</button>
+      <button class="primary" id="glzSaveBtn">保存为当前术语表</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -455,6 +524,11 @@ async function loadConfig() {
     $('cfg-interval').value = llm.min_call_interval ?? 2;
     $('cfg-maxcalls').value = llm.max_llm_calls ?? 40;
     $('cfg-retries').value = llm.max_retries ?? 2;
+    $('cfg-temperature').value = llm.temperature ?? 0;
+    $('cfg-timeout').value = llm.timeout ?? 120;
+    $('cfg-backoffbase').value = llm.backoff_base ?? 8;
+    $('cfg-backoffcap').value = llm.backoff_cap ?? 30;
+    $('cfg-retrycaps').value = llm.retry_delay_cap ?? 60;
   } catch(e) { console.warn('loadConfig', e); }
 }
 
@@ -468,13 +542,14 @@ function collectConfig() {
       api_key: $('cfg-key').value.trim(),   // 打码或空时服务端保留旧值
       base_url: $('cfg-baseurl').value.trim(),
       fallback_model: $('cfg-fallback').value.trim(),
-      temperature: 0,
+      temperature: num($('cfg-temperature').value, 0),
       batch_size: num($('cfg-batchsize').value, 6),
       max_llm_calls: num($('cfg-maxcalls').value, 40),
       min_call_interval: num($('cfg-interval').value, 2),
       max_workers: num($('cfg-workers').value, 3),
-      timeout: 120.0, max_retries: num($('cfg-retries').value, 2),
-      backoff_base: 8.0, backoff_cap: 30.0, retry_delay_cap: 60.0,
+      timeout: num($('cfg-timeout').value, 120), max_retries: num($('cfg-retries').value, 2),
+      backoff_base: num($('cfg-backoffbase').value, 8), backoff_cap: num($('cfg-backoffcap').value, 30),
+      retry_delay_cap: num($('cfg-retrycaps').value, 60),
     },
     features: {
       watermark_removal: $('cfg-watermark').checked,
@@ -545,11 +620,13 @@ document.querySelectorAll('.tab-bar button').forEach(btn => {
 });
 
 /* ---------- 文件浏览器 ---------- */
-let browseTarget = null;   // 'input' | 'output'
+let browseTarget = null;   // 'input' | 'output' | 'glossary'
 let browseSel = null;
+let browseChecked = new Set();   // glossary 模式多选
 function openBrowse(target) {
-  browseTarget = target; browseSel = null;
-  $('browseSelect').textContent = target === 'output' ? '选定此目录' : '选定此文件';
+  browseTarget = target; browseSel = null; browseChecked.clear();
+  $('browseSelect').textContent = target === 'output' ? '选定此目录'
+    : target === 'glossary' ? '加入术语表（勾选项）' : '选定此文件';
   openModal($('browseModal'), $('browseBackdrop'));
   browseTo($('inputPath').value && target==='input' ? parentOf($('inputPath').value)
           : $('outputDir').value && target==='output' ? $('outputDir').value : '');
@@ -576,11 +653,21 @@ async function browseTo(path) {
     d.entries.forEach(e => {
       const it = document.createElement('div');
       it.className = 'item file-item';
-      it.innerHTML = `<span class="ic">${e.dir ? '📁' : '📄'}</span><span>${e.name}</span>`;
-      if (!e.dir && !e.name.toLowerCase().endsWith('.pdf')) {
+      const isGlz = browseTarget === 'glossary';
+      const chk = e.dir || isGlz
+        ? '' : `<span class="chk${browseChecked.has(d.path + '/' + e.name) ? ' on' : ''}">${browseChecked.has(d.path + '/' + e.name) ? '✓' : ''}</span>`;
+      it.innerHTML = `${chk}<span class="ic">${e.dir ? '📁' : '📄'}</span><span>${e.name}</span>`;
+      if (!e.dir && !e.name.toLowerCase().endsWith('.pdf') && !isGlz) {
         it.style.opacity = '.4';   // 非PDF淡化但可选目录进入
       }
       it.onclick = () => {
+        if (isGlz && !e.dir) {
+          const p = d.path + '/' + e.name;
+          if (browseChecked.has(p)) { browseChecked.delete(p); it.classList.remove('selected'); }
+          else { browseChecked.add(p); it.classList.add('selected'); }
+          $('browseSelect').textContent = `加入术语表（${browseChecked.size} 项）`;
+          return;
+        }
         list.querySelectorAll('.file-item').forEach(x => x.classList.remove('selected'));
         it.classList.add('selected');
         if (e.dir) browseSel = {dir:true, path: d.path + '/' + e.name};
@@ -593,6 +680,14 @@ async function browseTo(path) {
 }
 $('browseUp').onclick = () => browseTo(parentOf($('browseCur').value));
 $('browseSelect').onclick = () => {
+  if (browseTarget === 'glossary') {
+    if (!browseChecked.size) { toast('先勾选术语表文件', true); return; }
+    browseChecked.forEach(p => { if (!glzPaths.includes(p)) glzPaths.push(p); });
+    renderGlzChips();
+    closeModal($('browseModal'), $('browseBackdrop'));
+    glzPreview();
+    return;
+  }
   if (!browseSel) { toast('先选中一项', true); return; }
   if (browseTarget === 'input') {
     if (browseSel.dir) { browseTo(browseSel.path); browseSel = null; return; }
@@ -602,6 +697,94 @@ $('browseSelect').onclick = () => {
   }
   closeModal($('browseModal'), $('browseBackdrop'));
 };
+
+/* ---------- 术语表批量管理 ---------- */
+let glzPaths = [];     // 已选术语表文件路径（合并顺序=数组顺序，后者覆盖）
+let glzContent = '';
+
+function renderGlzChips() {
+  const host = $('glzChips'); host.innerHTML = '';
+  glzPaths.forEach((p, i) => {
+    const c = document.createElement('span');
+    c.className = 'chip';
+    c.innerHTML = `<b>${p.split(/[\\/]/).pop()}</b><span class="x" title="移除">✕</span>`;
+    c.querySelector('.x').onclick = () => { glzPaths.splice(i, 1); renderGlzChips(); };
+    c.title = p;
+    host.appendChild(c);
+  });
+  $('glzMeta').textContent = glzPaths.length ? `${glzPaths.length} 个文件` : '';
+}
+
+async function openGlossaryManager() {
+  const existing = $('cfg-glossary').value.trim();
+  glzPaths = existing ? [existing] : [];
+  glzContent = '';
+  $('glossaryBox').value = '';
+  $('glzIssues').innerHTML = '';
+  renderGlzChips();
+  openModal($('glossaryModal'), $('glossaryBackdrop'));
+  if (glzPaths.length) await glzPreview();
+}
+
+async function glzPreview() {
+  if (!glzPaths.length) { toast('先添加术语表文件', true); return; }
+  try {
+    const d = await api('/api/glossary/preview', { method:'POST', body: JSON.stringify({ paths: glzPaths }) });
+    glzContent = d.merged_text || '';
+    $('glossaryBox').value = glzContent;
+    const host = $('glzIssues'); host.innerHTML = '';
+    (d.issues || []).forEach(iss => {
+      const row = document.createElement('div');
+      row.className = 'issue-row ' + iss.kind;
+      row.innerHTML = `<span class="ln">${iss.file}${iss.line > 0 ? ':' + iss.line : ''}</span><span class="msg">${iss.msg}</span>`;
+      host.appendChild(row);
+    });
+    if (d.ok) {
+      toast(`合并预览 OK：${d.term_count} 条术语`);
+      $('glzMeta').textContent = `${d.term_count} 条`;
+    } else {
+      toast('存在错误：请修正后再保存', true);
+      $('glzMeta').textContent = `${d.term_count || 0} 条（含错误）`;
+    }
+  } catch(e) { toast(e.message, true); }
+}
+
+async function glzSave() {
+  const text = $('glossaryBox').value;
+  if (!text.trim()) { toast('术语表为空', true); return; }
+  let d;
+  try {
+    const r = await fetch('/api/glossary/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    d = await r.json().catch(() => ({}));
+  } catch(e) { toast('保存请求失败: ' + e.message, true); return; }
+  if (d.ok) {
+    $('cfg-glossary').value = d.path;
+    toast(`已保存：${d.term_count} 条术语`);
+    closeModal($('glossaryModal'), $('glossaryBackdrop'));
+  } else if (d.issues) {
+    const host = $('glzIssues'); host.innerHTML = '';
+    d.issues.forEach(iss => {
+      const row = document.createElement('div');
+      row.className = 'issue-row ' + iss.kind;
+      row.innerHTML = `<span class="ln">${iss.line > 0 ? 'L' + iss.line : ''}</span><span class="msg">${iss.msg}</span>`;
+      host.appendChild(row);
+    });
+    toast(`校验未通过：${d.issues.filter(i => i.kind === 'error').length} 个错误`, true);
+  } else {
+    toast(d.detail || '保存失败', true);
+  }
+}
+
+$('btnGlossaryManage').onclick = openGlossaryManager;
+$('closeGlossary').onclick = () => closeModal($('glossaryModal'), $('glossaryBackdrop'));
+$('glossaryBackdrop').onclick = () => closeModal($('glossaryModal'), $('glossaryBackdrop'));
+$('glzCancelBtn').onclick = () => closeModal($('glossaryModal'), $('glossaryBackdrop'));
+$('btnGlzAdd').onclick = () => { closeModal($('glossaryModal'), $('glossaryBackdrop')); openBrowse('glossary'); };
+$('btnGlzPreview').onclick = glzPreview;
+$('glzSaveBtn').onclick = glzSave;
 
 /* ---------- 翻译流程 ---------- */
 let pollTimer = null;
