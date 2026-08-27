@@ -1,5 +1,9 @@
 # pdf-translator
 
+<div align="center">
+  <img src="assets/ui-main.png" alt="pdf-translator Web UI" width="720"/>
+</div>
+
 学术 PDF 整册翻译工具：保留原始版面（图片/表格/公式/双栏），12 种国际常用语言互译。
 
 ## 功能特性
