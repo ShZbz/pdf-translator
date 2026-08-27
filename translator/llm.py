@@ -24,6 +24,7 @@ class TranslationClient:
     def __init__(self, client, model: str, temperature: float = 0.0,
                  glossary_prompt: str = "", src_lang: str = "en",
                  tgt_lang: str = "zh", batch_size: int = 6,
+                 batch_char_budget: int = 3000,
                  max_llm_calls: int = 10,
                  min_call_interval: float = 0.0,
                  max_workers: int = 3,
@@ -41,7 +42,9 @@ class TranslationClient:
         self.glossary_prompt = glossary_prompt
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
-        self.batch_size = batch_size
+        self.batch_size = max(1, int(batch_size))
+        # v0.4.3: 批字符预算（按字符量组批，长短段不混批；0=纯段数模式）
+        self.batch_char_budget = max(0, int(batch_char_budget))
         self.max_llm_calls = max_llm_calls
         self.min_call_interval = min_call_interval
         self.max_workers = max(1, int(max_workers))
@@ -308,6 +311,34 @@ class TranslationClient:
         out = {j: got[str(j + 1)] for j in batch_idx}
         return batch_idx, out
 
+    def _pack_batches(self, miss: list[int],
+                      paras: list[str]) -> list[list[int]]:
+        """v0.4.3 组批策略：字符预算优先、段数为上限。
+
+        旧版按固定段数切片（batch_size=6），长短段混批导致单批 token
+        失衡——长批易超时失败、短批浪费调用。现按 batch_char_budget
+        （默认 3000 字符）贪心装填：
+        - 批内累计字符超预算 → 开新批
+        - 段数达 batch_size 上限 → 开新批（保留旧参数语义为每批段数上限）
+        - 单段自身超预算 → 独占一批（段落是原子翻译单元，不拆）
+        - budget=0 → 纯段数模式（v0.4.2 行为）
+        """
+        budget = self.batch_char_budget
+        batches: list[list[int]] = []
+        cur: list[int] = []
+        cur_chars = 0
+        for i in miss:
+            n = len(paras[i])
+            if cur and (len(cur) >= self.batch_size
+                        or (budget > 0 and cur_chars + n > budget)):
+                batches.append(cur)
+                cur, cur_chars = [], 0
+            cur.append(i)
+            cur_chars += n
+        if cur:
+            batches.append(cur)
+        return batches
+
     # ---- 批量入口（并发版）----
     def translate_paragraphs(self, paras: list[str],
                              cache=None) -> tuple[list[str], int]:
@@ -333,9 +364,8 @@ class TranslationClient:
         if not miss:
             return [r if r is not None else t for r, t in zip(results, paras)], 0
 
-        # 2) 分批 + 并发执行
-        batches = [miss[i:i + self.batch_size]
-                   for i in range(0, len(miss), self.batch_size)]
+        # 2) 分批 + 并发执行（v0.4.3: 字符预算组批）
+        batches = self._pack_batches(miss, paras)
         with self._lock:
             self._batches_total = len(batches)
         if self.sink is not None:

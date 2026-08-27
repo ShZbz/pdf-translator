@@ -16,10 +16,13 @@ out/
 # 开发工作区与归档
 v022_work/
 _archive/
+_mock_llm.py
 
 # 系统
 .DS_Store
 
 # UI 运行时（含 key，不入库）
 ui_config.yaml
-.ui_run_config.yaml
+.ui_run_config*
+.ui_ctl_*
+.ui_glossary_merged.yaml

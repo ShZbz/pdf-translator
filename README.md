@@ -1,13 +1,15 @@
 # pdf-translator
 
-<div align="center">
-  <img src="assets/ui-main.png" alt="pdf-translator Web UI" width="720"/>
-</div>
-
 学术 PDF 整册翻译工具：保留原始版面（图片/表格/公式/双栏），12 种国际常用语言互译。
 
 ## 功能特性
 
+- **批字符预算组批（v0.4.3）**：LLM 组批按 ~3000 字符/批贪心装填（`batch_char_budget`），长短段不再混批——旧版按固定段数打包，长批 token 失衡易超时失败；失败率与平均延迟双降，`batch_size` 降级为每批段数上限
+- **布局阶段多进程并行（v0.4.3）**：逐页版面分析互相独立，`ProcessPoolExecutor` 并行（`performance.layout_workers`，0=自动 min(4,CPU)）；水印清理后的文档落临时文件供 worker 读取，任何并行故障自动回退串行
+- **扫描页惰性 OCR（v0.4.3）**：文字层 < 50 字符的页检出为扫描页，paddleocr 可用时 OCR 提取文字 → 翻译 → 译文以附录页插在扫描页之后（原扫描页不动，零排版风险）；未安装则明确警告并保留原样（不再静默跳过）
+- **任务队列（v0.4.3）**：UI/API 忙时提交自动入队（最多 5 个）接力执行，任务终态归档 history（`GET /api/jobs` 可查）；不再「已有翻译任务在运行」直接拒绝
+- **翻译缓存容量上限（v0.4.3）**：`performance.cache_max_entries`（默认 5 万条）超出淘汰最旧，防 DB 无限膨胀
+- **UI 对比度修复（v0.4.3）**：暗色主题下原生下拉弹出列表白底浅字几乎不可见 → `color-scheme: dark` + option 显式配色；术语表文本域引用未定义 `--fg` 变量导致黑底黑字一并修复
 - **多语言翻译（v0.4.2）**：源/目标语言扩展为 12 种——中文、英语、日语、韩语、德语、法语、西班牙语、意大利语、葡萄牙语、俄语、土耳其语、越南语；输出排版按目标语言自动选字体（中文宋体/黑体、日韩相应字体、西文 Times 系），输出文件名带语言标记（`-Zh`/`-Ja`/`-De`…）
 - **跨平台字体自动探测（v0.4.2）**：Windows 原生 / WSL / Linux / macOS 全支持（旧版仅 WSL 路径，原生 Windows 直接崩溃）；字形覆盖率自动校验，缺字形语言会预警
 - **图形界面（v0.4.0+）**：Liquid Glass 风格本地 Web UI——路径选择/拖放、设置面板（模型/翻译/性能/高级四类）、实时进度条（阶段+页/批粒度）、批间暂停/恢复/取消、连通性测试、服务端目录浏览、完成后浏览器内联预览输出 PDF
@@ -19,7 +21,7 @@
 - **双栏重切**：跨栏块自动按中线拆分，左栏译文不侵入右栏
 - **批量翻译**：全文档段落统一排队，batch JSON 协议，摊薄 LLM 调用次数
 - **SQLite 缓存**：key = MD5(engine|model|lang|text)，二次运行零 LLM 调用
-- **失败降级**：LLM 失败/触顶段落保留原文重灌，版面完整不塌陷
+- **失败降级**：LLM 失败/触顶段落保留原文重灌，版面完整不塌陷；表格单元格译文缺失时同样回灌原文（v0.4.3 修复 dry-run 表格被清空的缺陷）
 - **多 provider 支持**：OpenAI 兼容协议，内置 DeepSeek/智谱/Gemini/SiliconFlow/Ollama/LM Studio preset
 - **双语对照模式**（可选开关）：译文在上、灰色原文在下同框对照，标题/公式区不重复排版；输出文件名带 `-bilingual` 后缀
 - **术语表锁定**：外部 YAML 术语表注入翻译提示词 + 译后逐段校验，专业术语全篇一致；违例段落以 `glossary violation` 警告提示。仓库附物理/拓扑材料示例表 `glossary-physics-example.yaml`
@@ -133,7 +135,9 @@ key 解析优先级：**config 的 `api_key` > provider 专属环境变量 > `OP
 
 ```yaml
 llm:
-  batch_size: 6            # 每次 LLM 调用打包的段落数。限流严的模型调小到 2-3
+  batch_size: 6            # 每批段落数上限。限流严的模型调小到 2-3
+  batch_char_budget: 3000  # v0.4.3 每批字符预算：长短段不混批，降低长批
+                           # 超时失败率。0=仅按段数（v0.4.2 行为）
   max_llm_calls: 40        # 单文档调用上限（防跑飞）
   min_call_interval: 2     # 相邻调用最小间隔秒。限流严的调大到 5-10
   max_workers: 3           # 并发线程数。免费档建议 1
@@ -143,6 +147,10 @@ llm:
   backoff_cap: 30.0        # 退避上限秒
   retry_delay_cap: 60.0    # 服务端 RetryInfo 建议等待的封顶秒
   fallback_model: ""       # 逗号分隔备用链 "m2, m3"，主模型日配额耗尽自动切换
+
+performance:               # v0.4.3 本地性能
+  layout_workers: 0        # 版面分析进程并行数；0=自动 min(4,CPU)，1=串行
+  cache_max_entries: 50000 # 翻译缓存条目上限（0=不限制），超出淘汰最旧
 ```
 
 ### 免费档使用备注（实测 2026-08）
@@ -181,6 +189,9 @@ warning 类型：
 - `batch failed after retry, keep source: [...]` — 这些批次翻译失败已降级为原文，可重跑（有缓存，成功的批次不会重复调用）
 - `cellN: narrow box ... < text width` — 表格窄格文字略超格宽，仅提示不影响内容
 - `glossary violation` — 术语表校验违例（启用 `glossary_lock` 时）
+- `scanned pages ... not installed (pip install paddleocr)` — 检出扫描页但未装
+  OCR 引擎（v0.4.3），该页保留原样
+- `OCR page N: no text recognized` — OCR 未识别出文字，该页保留原样
 
 ## 术语表
 
@@ -208,7 +219,9 @@ Weyl semimetal: 外尔半金属
 python -m pytest tests/ -q
 ```
 
-62 个单测覆盖：provider 参数透传、跨页断句拆分、公式编号剥离、Algorithm 框判定、
+80 个单测覆盖：批字符预算组批、缓存容量淘汰、单元格原文回灌（dry-run 回归）、
+扫描页 OCR 警告/附录页（mock 注入）、布局并行与串行结果一致性、任务队列与
+history 归档、provider 参数透传、跨页断句拆分、公式编号剥离、Algorithm 框判定、
 三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行
 （欧洲/西里尔词边界）、服务端目录浏览与输出预览端点等核心逻辑。
 测试不需要网络和 API key。
@@ -218,14 +231,15 @@ python -m pytest tests/ -q
 ```
 translator/
   cli.py         # 命令行入口
-  pipeline.py    # 主流程编排（布局→裁图→排队→翻译→回灌）
-  extract.py     # 文本块提取（文字层/OCR 降级）
+  pipeline.py    # 主流程编排（布局→裁图→排队→翻译→回灌；v0.4.3 并行布局/OCR）
+  extract.py     # 文本块提取（扫描页检测 page_has_text_layer）
   layout.py      # 版面分析（双栏/公式区/三线表/图注/页眉脚/Algorithm框）
   refsplit.py    # 参考文献条目重切
-  llm.py         # LLM 客户端（批量协议/重试退避/fallback链/限流）
+  llm.py         # LLM 客户端（批字符预算组批/重试退避/fallback链/限流）
   langs.py       # v0.4.2 多语言注册表 + 跨平台字体解析
-  cache.py       # SQLite 翻译缓存
+  cache.py       # SQLite 翻译缓存（v0.4.3 容量上限淘汰）
   glossary.py    # 术语表锁定
+  ocr.py         # v0.4.3 扫描页惰性 OCR（paddleocr 可选依赖）
   render.py      # 渲染回灌（redaction/重排/公式回贴）
   typography.py  # 期刊级排版（按目标语言选字体族）
   wrap_mixed.py  # CJK/拉丁/西里尔混排断行
@@ -233,8 +247,11 @@ translator/
   control.py     # v0.4.0 暂停/恢复/取消（批间协作式检查点）
   events.py      # v0.4.0 进度事件流
 server/
-  app.py         # FastAPI：静态 UI + REST API（翻译提交/进度轮询/配置读写/目录浏览/key连通性测试/输出预览）
-  jobs.py        # 任务管理器（子进程隔离，JSONL 事件流 + stdin 控制管道）
+  app.py         # FastAPI：静态 UI + REST API（翻译提交/排队/进度轮询/
+                 #   配置读写/目录浏览/key连通性测试/输出预览/任务历史）
+  jobs.py        # 任务管理器（子进程隔离，JSONL 事件流 + stdin 控制管道；
+                 #   v0.4.3 忙时入队接力 + history 归档）
+  glossary_io.py # 术语表批量导入（合并/校验/行号级报错）
 web/
   index.html     # Liquid Glass 单文件前端
 run_ui.py        # 一键启动（uvicorn + 自动开浏览器）
@@ -245,12 +262,25 @@ glossary-physics-example.yaml  # 物理/量子材料术语表示例
 
 ## 已知限制
 
-- 手写体/艺术字扫描件依赖 OCR 质量（默认 PaddleOCR，需另装，且当前版本
-  尚未接入 OCR 调用链——扫描件暂只保留原样）
+- 扫描件翻译为**附录页方案**（v0.4.3）：扫描页 OCR 文字翻译后插入
+  附加译文页（`[OCR · p.N]` 标头），原扫描页不动。需要另装
+  `paddleocr`（`pip install paddleocr`），未安装时该页保留原样并给出
+  警告；OCR 识别质量决定译文质量，单页译文超一页时截断告警
 - 竖排文本、旋转页面不支持翻译（原样保留）
 - RTL 语言（阿拉伯语/希伯来语）与天城文暂不支持（双向/复杂整形超出
   当前逐字排印渲染器能力）
 - 极复杂嵌套表格可能切分不准，单元格译文以警告提示
 - 水印移除仅处理**文字层水印**（出版社/preprint 声明类）；扫描件中烤在图像像素里的水印无法移除
 - UI 暂停为**批间暂停**：正在飞行中的那次 LLM 请求会跑完才停（几秒内生效）；
-  取消同理，且不产出半成品 PDF
+  取消同理，且不产出半成品 PDF；并行布局阶段的取消在页粒度生效
+
+## 路线图（v0.5 候选）
+
+- **渲染器换代**：TextWriter 逐字排印 → pymupdf `Story`/`insert_htmlbox`
+  （HTML+CSS 排版，自带 shaping/bidi）——可一并解锁阿拉伯语/印地语和
+  更好的两端对齐；双语层/公式防压/单元格回灌逻辑需要重写，是 v0.5 主线
+- **版面识别升级**：接入 [pymupdf-layout](https://pypi.org/project/pymupdf-layout/)
+  （CPU-only GNN 版面检测，pymupdf 1.27 运行时也会提示该包）或轻量
+  布局模型提升复杂版面（多栏嵌套/跨页表格）的段落切分精度
+- **任务持久化**：jobs 队列/历史目前为内存态，服务重启即清空；
+  可落 SQLite 支持断点续跑与历史查询

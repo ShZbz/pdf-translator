@@ -13,6 +13,10 @@
   --gray: #95A5A6;
 }
 [data-theme="dark"] {
+  /* v0.4.3: color-scheme 让浏览器用暗色绘制原生控件（select 弹出列表、
+     滚动条、数字输入 spinner）——旧版弹出列表是白底+继承的浅灰字，
+     白底浅字几乎不可见（用户实测反馈的对比度问题） */
+  color-scheme: dark;
   --bg: #000;
   --glass-bg: rgba(255,255,255,0.06);
   --glass-border: rgba(255,255,255,0.15);
@@ -22,6 +26,7 @@
   --shadow: 0 8px 40px rgba(0,0,0,0.6);
 }
 [data-theme="light"] {
+  color-scheme: light;
   --bg: #F5F5F7;
   --glass-bg: rgba(255,255,255,0.55);
   --glass-border: rgba(255,255,255,0.50);
@@ -190,6 +195,10 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
   background:rgba(127,127,127,0.12); border:0.8px solid var(--glass-border);
   border-radius:9px; outline:none;
 }
+/* v0.4.3: 下拉弹出选项显式配色——部分浏览器不给 option 继承
+   color-scheme，白底弹出列表 + 浅色文字仍然看不清；双保险 */
+.set-row select option { background:#2b2b30; color:#f5f5f7; }
+[data-theme="light"] .set-row select option { background:#fff; color:#1d1d1f; }
 .set-row input:focus, .set-row select:focus { border-color:var(--accent); }
 .switch { position:relative; width:44px; height:26px; flex:none; }
 .switch input { opacity:0; width:0; height:0; }
@@ -230,7 +239,7 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
 .chip .x { cursor:pointer; opacity:.55; font-size:13px; padding:0 1px; }
 .chip .x:hover { opacity:1; }
 #glossaryBox { width:100%; min-height:160px; resize:vertical; font:12.5px/1.55 Consolas,Menlo,monospace;
-  background:rgba(255,255,255,.045); color:var(--fg); border:0.8px solid var(--glass-border);
+  background:rgba(255,255,255,.045); color:var(--text); border:0.8px solid var(--glass-border);
   border-radius:10px; padding:10px 12px; outline:none; margin-top:4px; }
 .issue-row { font-size:12.5px; padding:5px 10px; border-radius:8px; margin-top:6px;
   display:flex; gap:8px; align-items:baseline; cursor:pointer; }
@@ -242,7 +251,7 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
 .glz-meta { font-size:12px; opacity:.65; margin:6px 2px; }
 .rec-row { display:flex; align-items:center; gap:8px; font-size:12.5px; margin:8px 0; opacity:.9; }
 .rec-row input[type=number] { width:56px; padding:3px 6px; border-radius:7px;
-  background:rgba(255,255,255,.05); border:0.8px solid var(--glass-border); color:var(--fg); }
+  background:rgba(255,255,255,.05); border:0.8px solid var(--glass-border); color:var(--text); }
 
 /* ---- 文件浏览器模态 ---- */
 .browse-path {
@@ -303,7 +312,7 @@ body.dragging::after {
 <!-- 主卡片 -->
 <div class="card">
   <h1>PDF 翻译器</h1>
-  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴</div>
+  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.4.3</div>
 
   <div class="field">
     <input type="text" id="inputPath" placeholder="翻译原文件路径 (.pdf)" spellcheck="false">
@@ -385,7 +394,7 @@ body.dragging::after {
           <input type="text" id="cfg-glossary" placeholder="路径，可空">
           <button type="button" id="btnGlossaryManage" style="align-self:flex-end;
             padding:3px 10px;font-size:12px;border-radius:8px;cursor:pointer;
-            background:rgba(74,144,217,.12);border:0.8px solid var(--glass-border);color:var(--fg);">
+            background:rgba(74,144,217,.12);border:0.8px solid var(--glass-border);color:var(--text);">
             批量导入/管理 ⚙
           </button>
         </div></div>
@@ -405,8 +414,14 @@ body.dragging::after {
         <span class="hint">免费档建议 1</span></label>
         <input type="text" id="cfg-workers" value="3"></div>
       <div class="set-row"><label>批大小
-        <span class="hint">每次调用打包段落数</span></label>
+        <span class="hint">每批段落数上限（v0.4.3 起另有字符预算）</span></label>
         <input type="text" id="cfg-batchsize" value="6"></div>
+      <div class="set-row"><label>批字符预算
+        <span class="hint">~3000 字符/批，长短段不混批；0=仅按段数</span></label>
+        <input type="text" id="cfg-batchchars" value="3000"></div>
+      <div class="set-row"><label>布局并行数
+        <span class="hint">版面分析进程数；0=自动，1=串行</span></label>
+        <input type="text" id="cfg-layoutworkers" value="0"></div>
       <div class="set-row"><label>调用间隔 (秒)
         <span class="hint">限流严调大</span></label>
         <input type="text" id="cfg-interval" value="2"></div>
@@ -543,6 +558,9 @@ async function loadConfig() {
     $('cfg-glosslock').checked = (CFG.features||{}).glossary_lock !== false;
     $('cfg-workers').value = llm.max_workers ?? 3;
     $('cfg-batchsize').value = llm.batch_size ?? 6;
+    $('cfg-batchchars').value = llm.batch_char_budget ?? 3000;
+    const perf = CFG.performance || {};
+    $('cfg-layoutworkers').value = perf.layout_workers ?? 0;
     $('cfg-interval').value = llm.min_call_interval ?? 2;
     $('cfg-maxcalls').value = llm.max_llm_calls ?? 40;
     $('cfg-retries').value = llm.max_retries ?? 2;
@@ -568,6 +586,7 @@ function collectConfig() {
       fallback_model: $('cfg-fallback').value.trim(),
       temperature: num($('cfg-temperature').value, 0),
       batch_size: num($('cfg-batchsize').value, 6),
+      batch_char_budget: num($('cfg-batchchars').value, 3000),
       max_llm_calls: num($('cfg-maxcalls').value, 40),
       min_call_interval: num($('cfg-interval').value, 2),
       max_workers: num($('cfg-workers').value, 3),
@@ -583,6 +602,10 @@ function collectConfig() {
       bilingual: $('cfg-bilingual').checked,
     },
     glossary_file: $('cfg-glossary').value.trim(),
+    performance: {
+      layout_workers: num($('cfg-layoutworkers').value, 0),
+      cache_max_entries: (CFG.performance || {}).cache_max_entries ?? 50000,
+    },
     fonts: { cjk: '' },
     ocr: { engine: 'paddle', min_chars: 50 },
   };
@@ -835,7 +858,7 @@ function updateProgressUI(j) {
   const zone = $('progressZone');
   const btn = $('btnTranslate');
   const busy = ['queued','running','paused'].includes(j.status);
-  // v0.4.2 修复：终态（完成/出错/取消）保持进度区展开展示结果——
+  // v0.4.3 修复：终态（完成/出错/取消）保持进度区展开展示结果——
   // 旧版一进 else 就收起 zone，「✅完成·打开输出PDF」与错误信息永远不可见；
   // 仅 idle（无任务）时收起
   if (busy || TERMINAL.includes(j.status)) {
@@ -843,12 +866,13 @@ function updateProgressUI(j) {
   } else {
     zone.classList.remove('open');
   }
+  // v0.4.3: 按钮不再禁用——忙时提交进入任务队列（服务端 MAX_QUEUE 兜底）；
+  // 提交请求在飞时由 submitting 标志防连点
   if (busy) {
-    btn.disabled = true;
     btn.textContent = j.status === 'paused' ? '已暂停 ⏸' : '翻译中…';
     $('btnPause').textContent = j.status === 'paused' ? '▶ 继续' : '⏸ 暂停';
   } else {
-    btn.disabled = false; btn.textContent = '翻 译';
+    btn.textContent = '翻 译';
   }
   $('btnPause').style.visibility = busy ? 'visible' : 'hidden';
   $('btnCancel').style.visibility = busy ? 'visible' : 'hidden';
@@ -862,6 +886,7 @@ function updateProgressUI(j) {
         + (p.unit === 'batch' && p.calls ? ` · ${p.calls} 次调用` : '');
     }
     if (j.status === 'paused') s = `⏸ 已暂停（${s}）`;
+    if (j.queue_len > 0) s += ` · 队列中还有 ${j.queue_len} 个任务`;
     $('statusLine').textContent = s;
     if (p && p.total > 0) setBar(Math.round(100 * p.done / p.total));
     else setBar(0, true);
@@ -901,18 +926,26 @@ function startPolling() {
   pollTimer = setInterval(tick, curInterval);
 }
 
+let submitting = false;
 $('btnTranslate').onclick = async () => {
   const input = $('inputPath').value.trim();
   if (!input) { toast('先填输入 PDF 路径', true); return; }
+  if (submitting) return;   // v0.4.3: 请求在飞时防连点
+  submitting = true;
   try {
     await saveConfigSilent();
-    await api('/api/translate', {method:'POST', body: JSON.stringify({
+    const r = await api('/api/translate', {method:'POST', body: JSON.stringify({
       input, output_dir: $('outputDir').value.trim(), config: CFG,
     })});
     $('warnList').textContent = ''; $('doneRow').classList.remove('show');
-    $('statusLine').textContent = '启动中…'; setBar(0, true);
+    if (r.queued) {
+      toast(`已加入队列（当前任务完成后自动开始）`);
+    } else {
+      $('statusLine').textContent = '启动中…'; setBar(0, true);
+    }
     startPolling();
   } catch(e) { toast(e.message, true); }
+  finally { submitting = false; }
 };
 async function saveConfigSilent() {
   CFG = collectConfig();

@@ -3,7 +3,9 @@
 端点：
 - GET  /                     → web/index.html
 - POST /api/translate        → 提交翻译任务 {input, output_dir, llm?, features?}
+                                （忙时入队，v0.4.3；队列满才 409）
 - GET  /api/jobs/current     → 当前任务状态+事件快照
+- GET  /api/jobs             → 当前任务 + 排队任务 + 历史归档（v0.4.3）
 - POST /api/jobs/{id}/pause|resume|cancel
 - GET  /api/config           → 读 UI 配置（key 打码）
 - PUT  /api/config           → 写 UI 配置
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from pathlib import Path
 
 import yaml
@@ -54,13 +57,15 @@ def translate(req: TranslateReq) -> dict:
         raise HTTPException(400, "只支持 PDF")
 
     # 由 UI 配置合成临时运行配置
+    # v0.4.3: 文件名带任务 id——旧版固定 .ui_run_config.yaml，忙时入队的
+    # 第二个任务会被下一次提交覆盖配置（排队任务跑错输入文件）
     cfg_data = req.config or {}
     cfg_data.setdefault("io", {})
     cfg_data["io"]["input"] = str(src)
     out_dir = req.output_dir or cfg_data["io"].get("output_dir") or str(src.parent)
     cfg_data["io"]["output_dir"] = out_dir
 
-    run_cfg = PROJECT_ROOT / ".ui_run_config.yaml"
+    run_cfg = PROJECT_ROOT / f".ui_run_config_{uuid.uuid4().hex[:8]}.yaml"
     run_cfg.write_text(yaml.safe_dump(cfg_data, allow_unicode=True),
                        encoding="utf-8")
 
@@ -74,8 +79,21 @@ def translate(req: TranslateReq) -> dict:
 def current_job() -> dict:
     job = manager.current()
     if not job:
-        return {"status": "idle"}
-    return job.snapshot()
+        return {"status": "idle", "queue_len": len(manager.queue)}
+    snap = job.snapshot()
+    snap["queue_len"] = len(manager.queue)
+    return snap
+
+
+@app.get("/api/jobs")
+def all_jobs() -> dict:
+    """v0.4.3: 当前任务 + 排队任务 + 历史归档。"""
+    cur = manager.current()
+    return {
+        "current": cur.snapshot() if cur else None,
+        "queued": [j.snapshot() for j in manager.queue],
+        "history": manager.history[-20:],
+    }
 
 
 class JobAction(BaseModel):
@@ -84,13 +102,13 @@ class JobAction(BaseModel):
 
 @app.post("/api/jobs/{job_id}/{action}")
 def job_action(job_id: str, action: str) -> dict:
+    # v0.4.3: 动作白名单——旧版 getattr(job, action) 任意方法可调
+    if action not in ("pause", "resume", "cancel"):
+        raise HTTPException(400, f"未知操作: {action}")
     job = manager.current()
     if not job or job.id != job_id:
         raise HTTPException(404, "任务不存在或已结束")
-    fn = getattr(job, action, None)
-    if not callable(fn):
-        raise HTTPException(400, f"未知操作: {action}")
-    fn()
+    getattr(job, action)()
     return job.snapshot()
 
 

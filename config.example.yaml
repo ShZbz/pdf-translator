@@ -21,7 +21,9 @@ llm:
   temperature: 0.0
 
   # ---- 调用频率控制（免费档/限流严的模型按 README 备注调整）----
-  batch_size: 6                     # 每次调用打包段落数；限流严调小到 2-3
+  batch_size: 6                     # 每批段落数上限；限流严调小到 2-3
+  batch_char_budget: 3000           # v0.4.3 每批字符预算：长短段不混批，
+                                    # 降低长批超时失败率；0=仅按段数
   max_llm_calls: 40                 # 单文档调用上限
   min_call_interval: 2              # 相邻调用最小间隔秒；限流严调大到 5-10
   max_workers: 3                    # 并发数；免费档建议 1
@@ -32,6 +34,11 @@ llm:
   backoff_base: 8.0                 # 传输层失败退避基数秒
   backoff_cap: 30.0                 # 退避上限秒
   retry_delay_cap: 60.0             # 服务端建议等待的封顶秒
+
+# ---- 本地性能（v0.4.3）----
+performance:
+  layout_workers: 0                 # 版面分析进程并行数；0=自动(min(4,CPU))，1=串行
+  cache_max_entries: 50000          # 翻译缓存条目上限（0=不限制），超出淘汰最旧
 
 features:
   watermark_removal: true           # 三层水印移除
@@ -49,5 +56,6 @@ fonts:
   # heading: ""                     # 目标语言标题字体
 
 ocr:
-  engine: paddle                    # 扫描件 OCR 引擎（需另装 paddleocr）
-  min_chars: 50                     # 文字层少于此字符数的页触发 OCR
+  engine: paddle                    # 扫描件 OCR（v0.4.3 起真实接入；需另装
+                                    # paddleocr，未装则警告并保留原样；none=关闭）
+  min_chars: 50                     # 文字层少于此字符数的页视为扫描页

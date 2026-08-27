@@ -33,6 +33,9 @@ class LLMConfig:
     model: str = ""
     temperature: float = 0.0
     batch_size: int = 6
+    # v0.4.3: 批字符预算——组批按字符量而非纯段数，长短段混批导致单批
+    # token 失衡（长批易超时失败）。0=关闭（退回纯段数模式）
+    batch_char_budget: int = 3000
     max_llm_calls: int = 10
     min_call_interval: float = 0.0   # 两次 LLM 请求最小间隔秒（免费档 RPM 保护）
     max_workers: int = 3             # 并发批翻译线程数（1=串行;免费档建议 ≤4）
@@ -81,10 +84,23 @@ class OCRConfig:
 
 
 @dataclass
+class PerformanceConfig:
+    """v0.4.3 性能段：本地管线并行度与缓存容量。"""
+    layout_workers: int = 0      # 布局阶段进程并行数（0=自动：min(4, cpu)；1=串行）
+    cache_max_entries: int = 50000   # 翻译缓存容量上限（0=不限制），超出淘汰最旧
+
+
+def _filtered(dc, raw: dict):
+    """dataclass 构造过滤：忽略 YAML 里的未知键（拼错键不炸，向后兼容）。"""
+    return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
+
+
+@dataclass
 class Config:
     io: IOConfig
     llm: LLMConfig = field(default_factory=LLMConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     glossary_file: str = ""
     fonts: dict = field(default_factory=lambda: {"cjk": ""})
     ocr: OCRConfig = field(default_factory=OCRConfig)
@@ -92,12 +108,14 @@ class Config:
 
 def load_config(path: str | Path) -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    io_ = IOConfig(**raw.get("io", {}))
+    io_ = IOConfig(**{k: v for k, v in raw.get("io", {}).items()
+                      if k in IOConfig.__dataclass_fields__})
     llm_raw = raw.get("llm", {})
     llm = LLMConfig(**{k: v for k, v in llm_raw.items() if k in LLMConfig.__dataclass_fields__})
-    feat = FeatureConfig(**raw.get("features", {}))
-    ocr = OCRConfig(**raw.get("ocr", {}))
-    cfg = Config(io=io_, llm=llm, features=feat, ocr=ocr,
+    feat = _filtered(FeatureConfig, raw.get("features", {}))
+    perf = _filtered(PerformanceConfig, raw.get("performance", {}))
+    ocr = _filtered(OCRConfig, raw.get("ocr", {}))
+    cfg = Config(io=io_, llm=llm, features=feat, performance=perf, ocr=ocr,
                  glossary_file=raw.get("glossary_file", ""),
                  fonts=raw.get("fonts") or {"cjk": ""})
     # 硬校验：输入输出路径必填

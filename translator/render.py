@@ -267,7 +267,12 @@ def render_page(page, layout: dict, translated: list[dict],
     cell_map = cell_texts or {}
     for ci, cell in enumerate(cells):
         dst = cell_map.get(ci)
-        if not dst or not dst.strip():
+        # v0.4.3 修复：译文缺失（dry-run client=None / cell_texts 未覆盖）时
+        # 回灌原文——旧版直接 continue，但上方已对该格 add_redact_annot，
+        # 扫描/干跑输出里表格单元格文字被静默删除（实测 dry-run 表格全空）
+        if dst is None:
+            dst = cell.get("text") or ""
+        if not dst.strip():
             continue
         crect = pymupdf.Rect(cell["bbox"])
         # v0.2.4: 最小宽度 15→8——纯数字单元格（'0.3'）宽仅 10pt 被旧
