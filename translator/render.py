@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import re
+from pathlib import Path
 
 import pymupdf
 
@@ -205,7 +206,8 @@ def render_page(page, layout: dict, translated: list[dict],
                 bilingual: bool = False,
                 warnings: list[str] | None = None,
                 typography=None,
-                cell_texts: dict[int, str | None] | None = None) -> None:
+                cell_texts: dict[int, str | None] | None = None,
+                renderer: str = "writer") -> None:
     """原地改造一页：redact 全部正文块 → 中文回灌 → display 公式位图回贴。
 
     layout:    layout_page() 输出
@@ -217,6 +219,9 @@ def render_page(page, layout: dict, translated: list[dict],
     typography: Typography 实例（v0.2.2 期刊级排版）；None 时退回单字体旧行为。
     cell_texts: v0.2.3 {cell_index: 译文}——表格单元格译文原位回灌；
                 None 值的单元格保留原文。
+    renderer:  v0.5.0 "writer"=TextWriter 逐字排印（默认）；
+               "htmlbox"=insert_htmlbox HTML+CSS 排版引擎（实验性，
+               自带 shaping/bidi/两端对齐；单元格仍走 writer 窄格路径）。
     """
     paras = layout["paragraphs"]
     tmap = {t["index"]: t["text"] for t in translated}
@@ -282,6 +287,18 @@ def render_page(page, layout: dict, translated: list[dict],
         c_fs = min(dominant_size({"spans": cell.get("spans", [])}) or 8.0, 8.0)
         _draw_para(tw, crect, _clean_zh_text(dst), font, c_fs, 0,
                    warn_local, f"cell{ci}", lh_factor=1.25)
+    if renderer == "htmlbox":
+        _render_paras_htmlbox(page, paras, tmap, cells, cell_map, font_path,
+                              typography, bilingual, formula_rects,
+                              warn_local)
+        # ---- 3. D6 display 公式位图回贴（原 bbox 原位浮回）----
+        if formula_pixmaps:
+            for fi, png in formula_pixmaps.items():
+                if fi >= len(layout["formulas"]):
+                    continue
+                r = pymupdf.Rect(layout["formulas"][fi]["bbox"])
+                page.insert_image(r, stream=png)
+        return
     for i, p in enumerate(paras):
         if p.get("is_verbatim"):
             continue   # 原文像素保留
@@ -399,3 +416,138 @@ def crop_formula_pixmaps(doc, page_no: int, formulas: list[dict]) -> dict[int, b
         pix = page.get_pixmap(clip=f["bbox"], dpi=300)
         out[fi] = pix.tobytes("png")
     return out
+
+
+# ---- v0.5.0: insert_htmlbox 渲染路径（渲染器换代种子，实验性）----
+
+def _html_escape(text: str) -> str:
+    import html as _html
+    return _html.escape(text, quote=False)
+
+
+def _build_font_archive(font_path: str, heading_path: str | None) \
+        -> tuple["pymupdf.Archive | None", str]:
+    """把正文字体（+可选标题字体）装进 Archive，返回 (archive, css @font-face 段)。
+
+    字体文件缺失（西文内置兜底）返回 (None, "")，CSS 落 serif 家族链。
+    """
+    if not font_path:
+        return None, ""
+    arch = pymupdf.Archive()
+    faces = []
+    name = "ptbody" + Path(font_path).suffix.lower()
+    arch.add(font_path, name)
+    faces.append(f"@font-face {{font-family: ptbody; src: url({name});}}")
+    if heading_path and heading_path != font_path:
+        hname = "pthead" + Path(heading_path).suffix.lower()
+        arch.add(heading_path, hname)
+        faces.append(f"@font-face {{font-family: pthead; src: url({hname});}}")
+    return arch, "\n".join(faces)
+
+
+def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
+                          cells: list[dict], cell_map: dict,
+                          font_path: str, typography, bilingual: bool,
+                          formula_rects: list["pymupdf.Rect"],
+                          warnings: list[str]) -> None:
+    """段落回灌的 HTML+CSS 排版引擎路径（v0.5.0 实验性）。
+
+    与 writer 路径的差异：
+    - 断行/避头尾/试排降字号全部交给 Story 引擎（justify + shaping + bidi），
+      scale_low 允许引擎整体缩字号装盒（等价旧试排降字号）
+    - 双语原文层用 opacity 半透明呈现（writer 路径是灰色）
+    - typography 样式映射保留：标题用标题字体加粗、caption/ref 小字号、
+      CJK 正文首行缩进 2em
+    单元格窄格仍由调用方的 writer 路径处理（htmlbox 对 <8pt 窄格无优势）。
+    """
+    from .typography import line_height_factor
+
+    heading_path = typography.heading_path if typography else None
+    arch, font_css = _build_font_archive(font_path, heading_path)
+    body_family = "ptbody, serif" if font_path else "serif"
+    head_family = "pthead, ptbody, serif" \
+        if heading_path and heading_path != font_path else body_family
+
+    # 正文众数字号（样式基准，与 writer 路径同算法）
+    from collections import Counter
+    _sz: Counter = Counter()
+    for p in paras:
+        _sz[round(p.get("size") or dominant_size(p), 1)] += max(len(p["text"]), 1)
+    body_size = _sz.most_common(1)[0][0] if _sz else None
+
+    for i, p in enumerate(paras):
+        if p.get("is_verbatim"):
+            continue
+        raw = tmap.get(i) or p["text"]
+        txt = _clean_zh_text(raw)
+        if not txt.strip():
+            continue
+        rect = pymupdf.Rect(p["bbox"])
+        rect.x0 -= 0.5; rect.y0 -= 0.5; rect.x1 += 0.5; rect.y1 += 0.5
+        base = p.get("size") or dominant_size(p) or 10.0
+        if typography is not None:
+            style = typography.resolve(p, body_size)
+            family = head_family if style.bold else body_family
+            base = max(style.size, MIN_FONT)
+            align = "center" if style.center else "justify"
+            indent = f"text-indent:{style.indent}em;" if style.indent else ""
+            lh = line_height_factor(style.kind)
+            tag_extra = style.kind
+        else:
+            family = body_family
+            indent = "text-indent:2em;" if (_has_cjk(txt) and len(txt) >= 40
+                                            and not p.get("is_heading")
+                                            and not p.get("is_caption")
+                                            and not p.get("is_ref")) else ""
+            align = "justify"
+            lh = 1.32
+            tag_extra = ""
+        css = (font_css +
+               f" p {{font-family:{family}; font-size:{base:.2f}pt;"
+               f" line-height:{lh}; margin:0; text-align:{align};{indent}}}")
+        # 双语：上部 60% 译文；底部原文层半透明（与公式区重叠则放弃）
+        if bilingual and raw != p["text"] and not p.get("is_heading"):
+            split_y = rect.y0 + rect.height * 0.6
+            zh_rect = pymupdf.Rect(rect.x0, rect.y0, rect.x1,
+                                   max(split_y, rect.y0 + MIN_FONT * 2))
+            en_rect = pymupdf.Rect(rect.x0, split_y + 1.0, rect.x1, rect.y1)
+            _insert_one_htmlbox(page, zh_rect, txt, css,
+                                f"render p{i}[{tag_extra}]/zh", warnings,
+                                archive=arch)
+            if en_rect.height >= MIN_FONT * 1.5 and en_rect.width >= 20 \
+                    and not any(en_rect.intersects(fr) for fr in formula_rects):
+                en_css = (font_css +
+                          f" p {{font-family:serif; font-size:{max(MIN_FONT, base * 0.75):.2f}pt;"
+                          f" line-height:1.2; margin:0;}}")
+                _insert_one_htmlbox(page, en_rect, _html_escape(p["text"]),
+                                    en_css, f"render p{i}/en", warnings,
+                                    opacity=0.6, archive=arch)
+            continue
+        _insert_one_htmlbox(page, rect, txt, css,
+                            f"render p{i}{('[' + tag_extra + ']') if tag_extra else ''}",
+                            warnings, archive=arch)
+
+
+def _insert_one_htmlbox(page, rect: "pymupdf.Rect", text: str, css: str,
+                        tag: str, warnings: list[str],
+                        opacity: float = 1.0,
+                        archive: "pymupdf.Archive | None" = None) -> None:
+    """单段 insert_htmlbox + 溢出告警（spare_height < 0 = 缩到 scale_low 仍装不下）。
+
+    archive 必须随 @font-face 一起传入（v0.5.0 大测试实测教训：漏传时
+    MuPDF 报 cannot locate font，引擎静默回退内置字体——中文能出但字体
+    不受 typography 控制）。
+    """
+    if not text.strip():
+        return
+    try:
+        spare, scale = page.insert_htmlbox(
+            rect, f"<p>{text}</p>", css=css, scale_low=0.5,
+            opacity=opacity, overlay=True, archive=archive)
+    except Exception as e:
+        warnings.append(f"{tag}: htmlbox failed ({e})")
+        return
+    if spare < -0.5:
+        warnings.append(
+            f"{tag}: overflow {abs(spare):.0f}pt (htmlbox scale={scale:.2f})"
+            f" — text may clip")

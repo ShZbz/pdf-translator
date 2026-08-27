@@ -2,6 +2,15 @@
 
 进度日志走 stderr（stdout 留给验收脚本断言）。
 
+v0.5.0:
+- 渲染器可选 htmlbox（features.renderer）：insert_htmlbox HTML+CSS 排版
+  引擎接管段落回灌（自带 shaping/bidi/两端对齐），writer 仍是默认
+- 版面引擎可选 pymupdf-layout（performance.layout_engine）：GNN 版面
+  检测产出图/表/公式结构化区域，未装包自动回退启发式
+- OCR 原位回贴（ocr.mode=inplace）：OCR 行 bbox 聚合成块 → 白块覆盖
+  + 译文原位回灌；与图形重叠的块自动跳过（appendix 仍是默认）
+- LLM 配额自适应（llm.rpm_limit/tpm_limit）：自动换算调用间隔与批预算
+
 v0.4.3:
 - 布局阶段多进程并行（逐页布局互相独立，ProcessPoolExecutor；
   水印清理后的文档先落临时文件供 worker 读取，任何并行故障自动
@@ -28,21 +37,23 @@ from .glossary import Glossary
 from .layout import layout_page
 from .langs import output_tag
 from .llm import TranslationClient
-from .render import _clean_zh_text, _wrap_cjk, crop_formula_pixmaps, find_cjk_font, render_page
+from .render import _clean_zh_text, _draw_para, _wrap_cjk, crop_formula_pixmaps, find_cjk_font, render_page
 
 _VERBOSE_TS = False
 
 # ---- 布局并行 worker（模块级函数：Windows spawn 要求可 pickle 引用）----
 _LAYOUT_DOC: "pymupdf.Document | None" = None
+_LAYOUT_ENGINE = "heuristic"
 
 
-def _layout_worker_init(pdf_path: str) -> None:
-    global _LAYOUT_DOC
+def _layout_worker_init(pdf_path: str, engine: str = "heuristic") -> None:
+    global _LAYOUT_DOC, _LAYOUT_ENGINE
     _LAYOUT_DOC = pymupdf.open(pdf_path)
+    _LAYOUT_ENGINE = engine
 
 
 def _layout_worker_task(pno: int) -> tuple[dict, dict[int, bytes]]:
-    lay = layout_page(_LAYOUT_DOC[pno])
+    lay = layout_page(_LAYOUT_DOC[pno], engine=_LAYOUT_ENGINE)
     pixmaps = crop_formula_pixmaps(_LAYOUT_DOC, pno, lay["formulas"]) \
         if lay["formulas"] else {}
     return lay, pixmaps
@@ -67,7 +78,8 @@ def _resolve_layout_workers(cfg: Config, n_pages: int) -> int:
 
 
 def _layout_parallel(doc, tmp_path: Path, workers: int, sink: EventSink,
-                     control: "JobControl | None", n_pages: int):
+                     control: "JobControl | None", n_pages: int,
+                     engine: str = "heuristic"):
     """并行布局。返回 (layouts, pixmaps)；任何故障返回 None（调用方回退串行）。
 
     必须落临时文件而不是传原始路径：水印清理发生在内存 doc 上，
@@ -88,7 +100,7 @@ def _layout_parallel(doc, tmp_path: Path, workers: int, sink: EventSink,
         with ProcessPoolExecutor(
                 max_workers=workers,
                 initializer=_layout_worker_init,
-                initargs=(str(tmp_path),)) as pool:
+                initargs=(str(tmp_path), engine)) as pool:
             futs = {pool.submit(_layout_worker_task, p): p for p in range(n_pages)}
             for fut in as_completed(futs):
                 if control is not None:
@@ -177,6 +189,104 @@ def _append_ocr_pages(doc, ocr_units: list[tuple[int, str]],
     return added
 
 
+# ---- v0.5.0: OCR 原位回贴（ocr.mode=inplace）----
+
+def _group_ocr_lines(lines: list[tuple["pymupdf.Rect", str]]) \
+        -> list[tuple["pymupdf.Rect", str]]:
+    """OCR 行聚合成块：纵向间距 < 1.8×行高且横向重叠 > 0.35 的相邻行并块。
+
+    块是原位回贴的翻译/覆盖单元——按行翻译会被断句毁掉质量，
+    按整页翻译又无法原位对齐，行聚类块是两者的折中。
+    """
+    if not lines:
+        return []
+    items = sorted(lines, key=lambda it: (it[0].y0, it[0].x0))
+    heights = sorted(r.height for r, _ in items)
+    med_h = heights[len(heights) // 2] or 10.0
+    blocks: list[dict] = []
+    for r, t in items:
+        placed = False
+        for b in blocks:
+            br = b["bbox"]
+            x_ov = (min(br.x1, r.x1) - max(br.x0, r.x0)) \
+                / max(min(br.width, r.width), 1.0)
+            v_gap = r.y0 - br.y1
+            if x_ov > 0.35 and -med_h <= v_gap < 1.8 * med_h:
+                b["bbox"] |= r
+                b["texts"].append(t)
+                placed = True
+                break
+        if not placed:
+            blocks.append({"bbox": pymupdf.Rect(r), "texts": [t]})
+    return [(b["bbox"], "\n".join(b["texts"])) for b in blocks]
+
+
+def _page_graphics_rects(page) -> list["pymupdf.Rect"]:
+    """页面上可能被白块误伤的图形元素（矢量绘图 + 小尺寸插图）。
+
+    扫描页背景图（占页面大比例）不算——白块画在扫描底图上是原位回贴
+    的预期行为；只有页内小插图（真插图/装饰图，<50% 页面）才需要避让。
+    """
+    pr = page.rect
+    page_area = pr.get_area() or 1.0
+    out: list[pymupdf.Rect] = []
+    try:
+        for d in page.get_drawings():
+            r = d["rect"]
+            if r.width > 0.5 and r.height > 0.5 and r.get_area() < 0.9 * page_area:
+                out.append(pymupdf.Rect(r))
+    except Exception:
+        pass
+    try:
+        for info in page.get_image_info():
+            r = pymupdf.Rect(info["bbox"])
+            if r.get_area() < 0.5 * page_area:   # 小图=插图要避让；大图=扫描背景
+                out.append(r)
+    except Exception:
+        pass
+    return out
+
+
+def _apply_ocr_inplace(doc, pno: int, blocks: list[tuple["pymupdf.Rect", str]],
+                       translations: list[str], font_path: str,
+                       warnings: list[str]) -> int:
+    """白块覆盖 + 译文原位回灌（PDFMathTranslate 式，任务 2-4）。
+
+    每块：与页内图形（子图/矢量线）重叠超 30% 面积 → 跳过保留原像素
+    （白块会误伤插图）；否则白矩形盖掉原文、译文按块 bbox 试排回灌。
+    返回成功回贴的块数。
+    """
+    page = doc[pno]
+    font = pymupdf.Font(fontfile=font_path)
+    graphics = _page_graphics_rects(page)
+    applied = 0
+    heights = sorted(r.height for r, _ in blocks)
+    med_h = heights[len(heights) // 2] if heights else 10.0
+    for (bbox, src), dst in zip(blocks, translations):
+        rect = pymupdf.Rect(bbox)
+        g_inter = 0.0
+        for g in graphics:
+            if rect.intersects(g):
+                ir = pymupdf.Rect(rect)
+                ir.intersect(g)
+                g_inter = max(g_inter, ir.get_area())
+        if g_inter > 0.30 * max(rect.get_area(), 1e-6):
+            warnings.append(
+                f"OCR inplace p.{pno + 1}: block overlaps graphics, kept original")
+            continue
+        text = _clean_zh_text(dst if dst and dst.strip() else src)
+        if not text.strip():
+            continue
+        page.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
+        tw = pymupdf.TextWriter(page.rect)
+        base = max(6.5, min(12.0, med_h * 0.85))
+        _draw_para(tw, rect, text, font, base, 0, warnings,
+                   f"ocr-inplace p{pno + 1}", lh_factor=1.3)
+        tw.write_text(page)
+        applied += 1
+    return applied
+
+
 def translate_document(cfg: Config, client=None, verbose: bool = False,
                        sink: "EventSink | None" = None,
                        control: "JobControl | None" = None) -> dict:
@@ -245,6 +355,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             typo = None
 
     # ---- v0.4.3: 布局 + 裁公式（多进程并行，故障自动回退串行）----
+    layout_engine = (getattr(cfg.performance, "layout_engine", "heuristic")
+                     or "heuristic").strip()
     workers = _resolve_layout_workers(cfg, n_pages)
     page_layouts: list[dict] = []
     page_pixmaps: list[dict[int, bytes]] = []
@@ -252,11 +364,11 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         fd, layout_tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
         os.close(fd)
         layout_tmp = Path(layout_tmp_name)
-        _log(f"layout: {workers} workers (parallel)")
+        _log(f"layout: {workers} workers (parallel), engine={layout_engine}")
         got = None
         try:
             got = _layout_parallel(doc, layout_tmp, workers, sink, control,
-                                   n_pages)
+                                   n_pages, engine=layout_engine)
         finally:
             try:
                 layout_tmp.unlink(missing_ok=True)
@@ -265,15 +377,25 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         if got is not None:
             page_layouts, page_pixmaps = got
     if not page_layouts:      # 串行路径（workers==1 或并行回退）
+        if workers > 1:
+            sink.warning("parallel layout failed; sequential fallback "
+                         "(progress counter restarts)")
         for pno in range(n_pages):
             if control:
                 control.checkpoint()
-            lay = layout_page(doc[pno])
+            lay = layout_page(doc[pno], engine=layout_engine)
             pixmaps = crop_formula_pixmaps(doc, pno, lay["formulas"]) \
                 if lay["formulas"] else {}
             page_layouts.append(lay)
             page_pixmaps.append(pixmaps)
             sink.page_done(pno, n_pages)
+    if page_layouts and page_layouts[0].get("layout_engine") == \
+            "pymupdf-layout-fallback":
+        w = ("performance.layout_engine='pymupdf-layout' but package not "
+             "installed/failed; heuristic fallback in use "
+             "(pip install pymupdf-layout)")
+        _log(f"WARNING: {w}")
+        all_warnings.append(w)
 
     pending: list[tuple[int, int]] = []   # (page_no, para_index)
     cell_pending: list[tuple[int, int]] = []   # v0.2.3: (page_no, cell_index)
@@ -293,11 +415,13 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
              f"{len(lay['paragraphs'])} paras, {len(lay['formulas'])} formulas, "
              f"{len(lay.get('tables_cells', []))} table cells")
 
-    # ---- v0.4.3: 扫描页检测 + 惰性 OCR（附录页方案，见 ocr.py）----
+    # ---- OCR：扫描页检测 + 惰性提取（appendix/inplace 两种呈现）----
     from . import ocr as ocr_mod
-    ocr_units: list[tuple[int, str]] = []       # (pno, OCR 文本)
+    # ocr_jobs: {pno, mode, text(附录全文), blocks(原位块 [(bbox,text)])}
+    ocr_jobs: list[dict] = []
     scanned = [p for p in range(n_pages)
                if not page_has_text_layer(doc[p], cfg.ocr.min_chars)]
+    ocr_mode = (getattr(cfg.ocr, "mode", "appendix") or "appendix").strip()
     if scanned:
         pages_fmt = ", ".join(f"p.{p + 1}" for p in scanned)
         engine = (cfg.ocr.engine or "").strip()
@@ -314,16 +438,34 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             for pno in scanned:
                 if control:
                     control.checkpoint()
-                text = ocr_mod.ocr_page_text(
-                    doc[pno], engine=engine, src_lang=cfg.io.source_lang)
-                if text and len(text.strip()) >= 10:
-                    ocr_units.append((pno, text))
-                    _log(f"page {pno + 1}: scanned, OCR extracted "
-                         f"{len(text)} chars → appendix translation")
-                else:
-                    w = f"OCR page {pno + 1}: no text recognized; kept as-is"
-                    _log(f"WARNING: {w}")
-                    all_warnings.append(w)
+                job: dict = {"pno": pno, "mode": "appendix", "text": "",
+                             "blocks": []}
+                lines = None
+                if ocr_mode == "inplace":
+                    lines = ocr_mod.ocr_page_lines(
+                        doc[pno], engine=engine, src_lang=cfg.io.source_lang)
+                if lines:
+                    blocks = _group_ocr_lines(lines)
+                    if blocks and sum(len(t) for _, t in blocks) >= 10:
+                        job["mode"] = "inplace"
+                        job["blocks"] = blocks
+                        _log(f"page {pno + 1}: scanned, OCR {len(blocks)} "
+                             f"block(s) → in-place paste-back")
+                    else:
+                        lines = None   # 块化失败 → 全文附录兜底
+                if lines is None:
+                    text = ocr_mod.ocr_page_text(
+                        doc[pno], engine=engine, src_lang=cfg.io.source_lang)
+                    if text and len(text.strip()) >= 10:
+                        job["text"] = text
+                        _log(f"page {pno + 1}: scanned, OCR extracted "
+                             f"{len(text)} chars → appendix translation")
+                    else:
+                        w = f"OCR page {pno + 1}: no text recognized; kept as-is"
+                        _log(f"WARNING: {w}")
+                        all_warnings.append(w)
+                        continue
+                ocr_jobs.append(job)
 
     # ---- v0.2.3: 跨页断句合并 ----
     # 一句话被分页截断（前半句在 pN 尾、后半句在 pN+1 头）时拆成两段
@@ -368,7 +510,6 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     # ---- 批量翻译（全文档统一排队，摊薄调用次数）----
     texts_by_page: dict[int, list[str | None]] = {}
     cell_texts: dict[tuple[int, int], str] = {}   # v0.2.3: (pno, ci) → 译文
-    ocr_translations: list[str] = []
     if client is not None:
         # v0.2.3: 合并组拼成翻译单元（组内段落用 \n 连接送译）
         unit_texts: list[str] = []
@@ -382,24 +523,39 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         cell_flat: list[str] = []
         for pno, ci in cell_pending:
             cell_flat.append(page_layouts[pno]["tables_cells"][ci]["text"])
-        all_flat = unit_texts + cell_flat + [t for _, t in ocr_units]
+        # v0.5.0: OCR 翻译单元——inplace 页按块、appendix 页按整页文本
+        ocr_flat: list[str] = []
+        for jb in ocr_jobs:
+            if jb["mode"] == "inplace":
+                ocr_flat.extend(t for _, t in jb["blocks"])
+            else:
+                ocr_flat.append(jb["text"])
+        all_flat = unit_texts + cell_flat + ocr_flat
 
+        # v0.5.0: llm.effective()——rpm/tpm 配额自动换算 interval/batch
+        # （显式配置优先；dry-run 日志里能看到实际生效值）
+        llm_eff = cfg.llm.effective()
+        if (llm_eff.min_call_interval, llm_eff.batch_char_budget) != \
+                (cfg.llm.min_call_interval, cfg.llm.batch_char_budget):
+            _log(f"llm quota auto: interval={llm_eff.min_call_interval}s, "
+                 f"batch_char_budget={llm_eff.batch_char_budget} "
+                 f"(rpm={cfg.llm.rpm_limit}, tpm={cfg.llm.tpm_limit})")
         tc = TranslationClient(
-            client, model=cfg.llm.model,
-            temperature=cfg.llm.temperature,
+            client, model=llm_eff.model,
+            temperature=llm_eff.temperature,
             glossary_prompt=glossary.prompt_block() if glossary else "",
             src_lang=cfg.io.source_lang, tgt_lang=cfg.io.target_lang,
-            batch_size=cfg.llm.batch_size,
-            batch_char_budget=cfg.llm.batch_char_budget,
-            max_llm_calls=cfg.llm.max_llm_calls,
-            min_call_interval=cfg.llm.min_call_interval,
-            max_workers=cfg.llm.max_workers,
-            fallback_model=cfg.llm.fallback_model,
-            timeout=cfg.llm.timeout,
-            max_retries=cfg.llm.max_retries,
-            backoff_base=cfg.llm.backoff_base,
-            backoff_cap=cfg.llm.backoff_cap,
-            retry_delay_cap=cfg.llm.retry_delay_cap,
+            batch_size=llm_eff.batch_size,
+            batch_char_budget=llm_eff.batch_char_budget,
+            max_llm_calls=llm_eff.max_llm_calls,
+            min_call_interval=llm_eff.min_call_interval,
+            max_workers=llm_eff.max_workers,
+            fallback_model=llm_eff.fallback_model,
+            timeout=llm_eff.timeout,
+            max_retries=llm_eff.max_retries,
+            backoff_base=llm_eff.backoff_base,
+            backoff_cap=llm_eff.backoff_cap,
+            retry_delay_cap=llm_eff.retry_delay_cap,
             sink=sink, control=control,
         )
         if control:
@@ -450,6 +606,9 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     if control:
         control.checkpoint()
     sink.stage("render")
+    renderer = (getattr(cfg.features, "renderer", "writer") or "writer").strip()
+    if renderer == "htmlbox":
+        _log("renderer: htmlbox (experimental insert_htmlbox engine)")
     for pno in range(len(doc)):
         if control:
             control.checkpoint()
@@ -466,22 +625,44 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                     bilingual=cfg.features.bilingual,
                     warnings=all_warnings,
                     typography=typo,
-                    cell_texts=page_cell_texts)
+                    cell_texts=page_cell_texts,
+                    renderer=renderer)
 
-    # ---- v0.4.3: OCR 译文附录页（插在扫描页之后）----
+    # ---- OCR 译文落页（appendix 插页 / inplace 原位回贴）----
     ocr_pages_added = 0
-    if ocr_units:
-        ocr_pages_added = _append_ocr_pages(
-            doc, ocr_units, ocr_translations, font_path, all_warnings)
-        _log(f"ocr: {ocr_pages_added} appendix page(s) inserted")
+    ocr_inplace_blocks = 0
+    if ocr_jobs:
+        appendix_pairs: list[tuple[int, str]] = []
+        appendix_texts: list[str] = []
+        consumed = 0
+        for jb in ocr_jobs:
+            if jb["mode"] == "inplace":
+                n = len(jb["blocks"])
+                ocr_inplace_blocks += _apply_ocr_inplace(
+                    doc, jb["pno"], jb["blocks"],
+                    ocr_translations[consumed:consumed + n],
+                    font_path, all_warnings)
+                consumed += n
+            else:
+                appendix_pairs.append((jb["pno"], jb["text"]))
+                appendix_texts.append(ocr_translations[consumed])
+                consumed += 1
+        if appendix_pairs:
+            ocr_pages_added = _append_ocr_pages(
+                doc, appendix_pairs, appendix_texts, font_path, all_warnings)
+            _log(f"ocr: {ocr_pages_added} appendix page(s) inserted")
+        if ocr_inplace_blocks:
+            _log(f"ocr: {ocr_inplace_blocks} block(s) pasted in-place")
 
     # 原子写:先 .tmp 再 rename,中途崩溃不留半成品 PDF
-    tmp_path = out_path.with_suffix(".pdf.tmp")
-    doc.save(str(tmp_path), garbage=4, deflate=True)
-    doc.close()
-    os.replace(tmp_path, out_path)
-    if cache:
-        cache.close()
+    try:
+        tmp_path = out_path.with_suffix(".pdf.tmp")
+        doc.save(str(tmp_path), garbage=4, deflate=True)
+        doc.close()
+        os.replace(tmp_path, out_path)
+    finally:
+        if cache:
+            cache.close()
 
     stats = {
         "pages": n_pages,
@@ -490,10 +671,12 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         "warnings": all_warnings,
         "output": str(out_path),
         "ocr_pages": ocr_pages_added,
+        "ocr_inplace_blocks": ocr_inplace_blocks,
     }
     sink.emit("done", output=str(out_path), pages=n_pages,
               paragraphs=n_paras, calls=total_calls,
               ocr_pages=ocr_pages_added,
+              ocr_inplace_blocks=ocr_inplace_blocks,
               elapsed=round(time.time() - t0, 1))
     _log(f"done: {n_paras} paras, {total_calls} LLM calls, "
          f"{len(all_warnings)} warnings, {time.time() - t0:.1f}s")

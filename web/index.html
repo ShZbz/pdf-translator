@@ -312,7 +312,7 @@ body.dragging::after {
 <!-- 主卡片 -->
 <div class="card">
   <h1>PDF 翻译器</h1>
-  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.4.3</div>
+  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.5.0</div>
 
   <div class="field">
     <input type="text" id="inputPath" placeholder="翻译原文件路径 (.pdf)" spellcheck="false">
@@ -406,6 +406,18 @@ body.dragging::after {
         <label class="switch"><input type="checkbox" id="cfg-watermark" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>双语对照模式</label>
         <label class="switch"><input type="checkbox" id="cfg-bilingual"><span class="slider"></span></label></div>
+      <div class="set-row"><label>扫描页译文呈现
+        <span class="hint">附录页=译文插附加页（稳）；原位回贴=白块覆盖原位回灌（v0.5.0 实验性，观感更好）</span></label>
+        <select id="cfg-ocrmode" style="width:160px;">
+          <option value="appendix">附录页（默认）</option>
+          <option value="inplace">原位回贴（实验）</option>
+        </select></div>
+      <div class="set-row"><label>渲染引擎
+        <span class="hint">writer=逐字排印（稳）；htmlbox=HTML+CSS 排版引擎（v0.5.0 实验性，自带两端对齐/复杂文字整形）</span></label>
+        <select id="cfg-renderer" style="width:160px;">
+          <option value="writer">TextWriter（默认）</option>
+          <option value="htmlbox">insert_htmlbox（实验）</option>
+        </select></div>
     </div>
 
     <!-- 性能 -->
@@ -417,8 +429,14 @@ body.dragging::after {
         <span class="hint">每批段落数上限（v0.4.3 起另有字符预算）</span></label>
         <input type="text" id="cfg-batchsize" value="6"></div>
       <div class="set-row"><label>批字符预算
-        <span class="hint">~3000 字符/批，长短段不混批；0=仅按段数</span></label>
+        <span class="hint">~3000 字符/批，长短段不混批；0=仅按段数；设置配额后可留默认自动换算</span></label>
         <input type="text" id="cfg-batchchars" value="3000"></div>
+      <div class="set-row"><label>Provider 配额 RPM
+        <span class="hint">每分钟请求上限；设置后自动换算调用间隔与批预算（v0.5.0，显式配置优先）</span></label>
+        <input type="text" id="cfg-rpm" value="0" inputmode="numeric"></div>
+      <div class="set-row"><label>Provider 配额 TPM
+        <span class="hint">每分钟 token 上限；与 RPM 同时设置时自动换算批字符预算</span></label>
+        <input type="text" id="cfg-tpm" value="0" inputmode="numeric"></div>
       <div class="set-row"><label>布局并行数
         <span class="hint">版面分析进程数；0=自动，1=串行</span></label>
         <input type="text" id="cfg-layoutworkers" value="0"></div>
@@ -554,11 +572,15 @@ async function loadConfig() {
     $('cfg-formatting').checked = (CFG.features||{}).preserve_formatting !== false;
     $('cfg-watermark').checked = (CFG.features||{}).watermark_removal !== false;
     $('cfg-bilingual').checked = !!(CFG.features||{}).bilingual;
+    $('cfg-renderer').value = (CFG.features||{}).renderer || 'writer';
+    $('cfg-ocrmode').value = (CFG.ocr||{}).mode || 'appendix';
     $('cfg-cache').checked = (CFG.features||{}).translation_cache !== false;
     $('cfg-glosslock').checked = (CFG.features||{}).glossary_lock !== false;
     $('cfg-workers').value = llm.max_workers ?? 3;
     $('cfg-batchsize').value = llm.batch_size ?? 6;
     $('cfg-batchchars').value = llm.batch_char_budget ?? 3000;
+    $('cfg-rpm').value = llm.rpm_limit ?? 0;
+    $('cfg-tpm').value = llm.tpm_limit ?? 0;
     const perf = CFG.performance || {};
     $('cfg-layoutworkers').value = perf.layout_workers ?? 0;
     $('cfg-interval').value = llm.min_call_interval ?? 2;
@@ -587,6 +609,8 @@ function collectConfig() {
       temperature: num($('cfg-temperature').value, 0),
       batch_size: num($('cfg-batchsize').value, 6),
       batch_char_budget: num($('cfg-batchchars').value, 3000),
+      rpm_limit: num($('cfg-rpm').value, 0),
+      tpm_limit: num($('cfg-tpm').value, 0),
       max_llm_calls: num($('cfg-maxcalls').value, 40),
       min_call_interval: num($('cfg-interval').value, 2),
       max_workers: num($('cfg-workers').value, 3),
@@ -600,6 +624,7 @@ function collectConfig() {
       glossary_lock: $('cfg-glosslock').checked,
       translation_cache: $('cfg-cache').checked,
       bilingual: $('cfg-bilingual').checked,
+      renderer: $('cfg-renderer').value || 'writer',
     },
     glossary_file: $('cfg-glossary').value.trim(),
     performance: {
@@ -607,7 +632,7 @@ function collectConfig() {
       cache_max_entries: (CFG.performance || {}).cache_max_entries ?? 50000,
     },
     fonts: { cjk: '' },
-    ocr: { engine: 'paddle', min_chars: 50 },
+    ocr: { engine: 'paddle', min_chars: 50, mode: $('cfg-ocrmode').value || 'appendix' },
   };
 }
 
@@ -857,9 +882,9 @@ const TERMINAL = ['done', 'error', 'cancelled'];
 function updateProgressUI(j) {
   const zone = $('progressZone');
   const btn = $('btnTranslate');
+  if (!j || j.status === 'idle') j = {status: 'idle', queue_len: j?.queue_len ?? 0};
   const busy = ['queued','running','paused'].includes(j.status);
   // v0.4.3 修复：终态（完成/出错/取消）保持进度区展开展示结果——
-  // 旧版一进 else 就收起 zone，「✅完成·打开输出PDF」与错误信息永远不可见；
   // 仅 idle（无任务）时收起
   if (busy || TERMINAL.includes(j.status)) {
     zone.classList.add('open');
@@ -891,6 +916,19 @@ function updateProgressUI(j) {
     if (p && p.total > 0) setBar(Math.round(100 * p.done / p.total));
     else setBar(0, true);
   }
+  // v0.5.0: 警告列表（服务端 v0.5.0 起透传管线 warning 事件，旧版被丢弃）
+  if (Array.isArray(j.warnings) && j.warnings.length) {
+    const host = $('warnList');
+    const known = new Set(Array.from(host.children).map(el => el.dataset.w));
+    j.warnings.slice(-30).forEach(w => {
+      if (known.has(w)) return;
+      const d = document.createElement('div');
+      d.dataset.w = w;
+      d.textContent = '⚠ ' + w;
+      host.appendChild(d);
+      host.scrollTop = host.scrollHeight;
+    });
+  }
   if (j.output_path) {
     $('doneRow').classList.add('show');
     // v0.4.2：file:// 链接被 Chrome/Edge 从 http 页面拦截
@@ -908,10 +946,52 @@ function updateProgressUI(j) {
   if (j.status === 'cancelled') { $('statusLine').textContent = '已取消'; }
 }
 
+/* ---- v0.5.0: SSE 实时流（优先），失败自动退回轮询 ---- */
+let sse = null, sseHealthy = false;
+function startSSE() {
+  if (!window.EventSource || sse) return;
+  try { sse = new EventSource('/api/jobs/current/stream'); } catch(e) { sse = null; return; }
+  sse.onopen = () => { sseHealthy = true; };
+  sse.onmessage = (m) => {
+    sseHealthy = true;
+    let d; try { d = JSON.parse(m.data); } catch(e) { return; }
+    if (d.kind === 'state') {
+      const cur = d.current
+        ? {...d.current, queue_len: d.current.queue_len ?? d.queue_len ?? 0}
+        : {status: 'idle', queue_len: d.queue_len ?? 0};
+      updateProgressUI(cur);
+    } else if (d.kind === 'job_event') {
+      const job = d.job || {};
+      job.queue_len = job.queue_len ?? lastQueueLen ?? 0;
+      updateProgressUI(job);
+    }
+  };
+  sse.onerror = () => { sseHealthy = false; };   // EventSource 自动重连
+}
+let lastQueueLen = 0;
+const _origUpdate = updateProgressUI;
+updateProgressUI = function(j) {
+  if (j && typeof j.queue_len === 'number') lastQueueLen = j.queue_len;
+  _origUpdate(j);
+};
+
+/* v0.5.0: 取消当前或排队中的任务（服务端 find 支持队列） */
+async function cancelCurrent() {
+  try {
+    const st = await api('/api/jobs');
+    const id = st.current?.id || (st.queued || [])[0]?.id;
+    if (!id) { toast('当前没有可取消的任务'); return; }
+    await api(`/api/jobs/${id}/cancel`, {method:'POST'});
+    toast('取消中…（当前批次完成后停止）');
+  } catch(e) { toast(e.message, true); }
+}
+
+/* ---- 轮询兜底：SSE 健康时降频到 20s 校准，否则维持动态间隔 ---- */
 let pollActive = false;
 function startPolling() {
   if (pollTimer) return;
   const tick = async () => {
+    if (sseHealthy) return;              // SSE 在流，轮询只作断连兜底
     const j = await refreshJob();
     const busy = ['queued','running','paused'].includes(j?.status || 'idle');
     // 忙时 1.2s 快轮询；空闲 15s 慢轮询（动态换 interval）
@@ -924,6 +1004,8 @@ function startPolling() {
   };
   let curInterval = 1200;
   pollTimer = setInterval(tick, curInterval);
+  // SSE 健康监测：每 20s 探一次，SSE 断连时轮询自然接管
+  setInterval(() => { if (!sseHealthy) tick(); }, 20000);
 }
 
 let submitting = false;
@@ -958,11 +1040,7 @@ $('btnPause').onclick = async () => {
   await api(`/api/jobs/${j.id}/${action}`, {method:'POST'});
   refreshJob();
 };
-$('btnCancel').onclick = async () => {
-  const j = await refreshJob(); if (!j?.id) return;
-  await api(`/api/jobs/${j.id}/cancel`, {method:'POST'});
-  toast('取消中…（当前批次完成后停止）');
-};
+$('btnCancel').onclick = cancelCurrent;
 
 /* ---------- 拖放 ---------- */
 ['dragenter','dragover'].forEach(ev =>
@@ -981,8 +1059,9 @@ $('btnCancel').onclick = async () => {
 /* ---------- init ---------- */
 loadConfig();
 startPolling();
+startSSE();
 
-// 进度条事件驱动增强：从 job events 快照拉取（简化：轮询 snapshot 即够）
+// 进度条事件驱动增强：SSE 推送为主（v0.5.0），轮询兜底
 </script>
 </body>
 </html>

@@ -36,6 +36,10 @@ class LLMConfig:
     # v0.4.3: 批字符预算——组批按字符量而非纯段数，长短段混批导致单批
     # token 失衡（长批易超时失败）。0=关闭（退回纯段数模式）
     batch_char_budget: int = 3000
+    # v0.5.0: provider 配额（RPM/TPM，0=未设置）。设置后自动换算
+    # min_call_interval 与 batch_char_budget（显式写出的配置项优先）
+    rpm_limit: int = 0
+    tpm_limit: int = 0
     max_llm_calls: int = 10
     min_call_interval: float = 0.0   # 两次 LLM 请求最小间隔秒（免费档 RPM 保护）
     max_workers: int = 3             # 并发批翻译线程数（1=串行;免费档建议 ≤4）
@@ -67,6 +71,30 @@ class LLMConfig:
             key = os.environ.get("OPENCODE_API_KEY", "")
         return base, key
 
+    # v0.5.0: load_config 会把 YAML 里显式出现的 llm 键记到这里——
+    # effective() 据此区分「用户显式配置」与「默认值」，自动换算不覆盖前者
+    _explicit: set = field(default_factory=set, repr=False, compare=False)
+
+    def effective(self) -> "LLMConfig":
+        """v0.5.0 配额自适应：按 rpm_limit/tpm_limit 换算调用间隔与批预算。
+
+        规则（显式配置优先，未显式写的键才允许自动值）：
+        - min_call_interval 未显式且 rpm_limit>0 → 60/rpm（把 RPM 摊满每分钟）
+        - batch_char_budget 未显式且 rpm/tpm 均设 → (tpm/rpm)×3.2 字符/token
+          ×0.8 安全系数，clamp 到 [400, 12000]——每分钟发满 rpm 次请求、
+          每请求约 tpm/rpm 个 token，正好吃满 TPM 而不超限
+        """
+        from dataclasses import replace
+        out = replace(self)
+        if self.rpm_limit > 0:
+            if "min_call_interval" not in self._explicit:
+                out.min_call_interval = round(60.0 / self.rpm_limit, 2)
+            if "batch_char_budget" not in self._explicit and self.tpm_limit > 0:
+                per_call_tok = self.tpm_limit / self.rpm_limit
+                budget = int(per_call_tok * 3.2 * 0.8)
+                out.batch_char_budget = max(400, min(12000, budget))
+        return out
+
 
 @dataclass
 class FeatureConfig:
@@ -75,12 +103,19 @@ class FeatureConfig:
     glossary_lock: bool = True
     translation_cache: bool = True
     bilingual: bool = False
+    # v0.5.0: 渲染器选择。writer=TextWriter 逐字排印（稳定默认）；
+    # htmlbox=insert_htmlbox HTML+CSS 排版引擎（自带 shaping/bidi/两端
+    # 对齐，解锁 RTL 语言的实验性预览，v0.5 主线的种子实现）
+    renderer: str = "writer"
 
 
 @dataclass
 class OCRConfig:
     engine: str = "paddle"
     min_chars: int = 50
+    # v0.5.0: 扫描页译文呈现方式。appendix=附录页（保守默认）；
+    # inplace=白块覆盖+原位回灌（观感更好，与图形重叠的块自动跳过）
+    mode: str = "appendix"
 
 
 @dataclass
@@ -88,6 +123,9 @@ class PerformanceConfig:
     """v0.4.3 性能段：本地管线并行度与缓存容量。"""
     layout_workers: int = 0      # 布局阶段进程并行数（0=自动：min(4, cpu)；1=串行）
     cache_max_entries: int = 50000   # 翻译缓存容量上限（0=不限制），超出淘汰最旧
+    # v0.5.0: 版面引擎。heuristic=内置启发式（默认）；pymupdf-layout=
+    # 外部 GNN 版面检测（需 pip install pymupdf-layout，未装自动回退启发式）
+    layout_engine: str = "heuristic"
 
 
 def _filtered(dc, raw: dict):
@@ -112,9 +150,20 @@ def load_config(path: str | Path) -> Config:
                       if k in IOConfig.__dataclass_fields__})
     llm_raw = raw.get("llm", {})
     llm = LLMConfig(**{k: v for k, v in llm_raw.items() if k in LLMConfig.__dataclass_fields__})
+    llm._explicit = set(llm_raw.keys()) & set(LLMConfig.__dataclass_fields__)
     feat = _filtered(FeatureConfig, raw.get("features", {}))
+    if feat.renderer not in ("writer", "htmlbox"):
+        raise ValueError(
+            f"features.renderer 必须是 'writer' 或 'htmlbox'，当前 {feat.renderer!r}")
     perf = _filtered(PerformanceConfig, raw.get("performance", {}))
+    if perf.layout_engine not in ("heuristic", "pymupdf-layout"):
+        raise ValueError(
+            "performance.layout_engine 必须是 'heuristic' 或 'pymupdf-layout'，"
+            f"当前 {perf.layout_engine!r}")
     ocr = _filtered(OCRConfig, raw.get("ocr", {}))
+    if ocr.mode not in ("appendix", "inplace"):
+        raise ValueError(
+            f"ocr.mode 必须是 'appendix' 或 'inplace'，当前 {ocr.mode!r}")
     cfg = Config(io=io_, llm=llm, features=feat, performance=perf, ocr=ocr,
                  glossary_file=raw.get("glossary_file", ""),
                  fonts=raw.get("fonts") or {"cjk": ""})

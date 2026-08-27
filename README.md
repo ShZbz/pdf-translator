@@ -8,6 +8,12 @@
 
 ## 功能特性
 
+- **渲染引擎换代种子（v0.5.0，实验性）**：`features.renderer: htmlbox` 切换到 pymupdf `insert_htmlbox`（HTML+CSS 排版引擎，Story 内核）——断行/避头尾/试排降字号交给排版引擎，自带两端对齐与复杂文字整形（shaping/bidi），是 v0.5 渲染器主线的种子实现；默认仍为稳定的 `writer`（TextWriter 逐字排印），逐段可对比两种引擎输出
+- **任务持久化（v0.5.0）**：队列/历史落 SQLite（`.ui_jobs.db`），服务重启自动恢复未完成任务重新排队——配合翻译缓存，重跑只剩增量段；历史跨重启可查（`GET /api/jobs`）
+- **UI 实时推送（v0.5.0）**：新增 SSE 端点 `/api/jobs/current/stream`，进度/阶段/警告事件服务端推送（EventSource），替代 1.2s 轮询；浏览器不支持时自动回退轮询
+- **LLM 配额自适应（v0.5.0）**：`llm.rpm_limit`/`llm.tpm_limit` 填入 provider 配额后自动换算调用间隔（60/RPM）与批字符预算（TPM/RPM × 3.2 字符/token × 0.8 安全系数），显式写出的配置项优先
+- **OCR 原位回贴（v0.5.0，实验性）**：`ocr.mode: inplace`——OCR 行 bbox 聚类成块、白块覆盖原文、译文原位回灌（PDFMathTranslate 式），与页内插图重叠的块自动跳过保留原样；默认仍为附录页方案
+- **pymupdf-layout 适配层（v0.5.0）**：`performance.layout_engine: pymupdf-layout` 启用 GNN 版面检测（图/表/公式结构化区域替代 bbox 启发式），未安装包自动回退内置启发式并告警——接口已就绪，`pip install pymupdf-layout` 即用
 - **批字符预算组批（v0.4.3）**：LLM 组批按 ~3000 字符/批贪心装填（`batch_char_budget`），长短段不再混批——旧版按固定段数打包，长批 token 失衡易超时失败；失败率与平均延迟双降，`batch_size` 降级为每批段数上限
 - **布局阶段多进程并行（v0.4.3）**：逐页版面分析互相独立，`ProcessPoolExecutor` 并行（`performance.layout_workers`，0=自动 min(4,CPU)）；水印清理后的文档落临时文件供 worker 读取，任何并行故障自动回退串行
 - **扫描页惰性 OCR（v0.4.3）**：文字层 < 50 字符的页检出为扫描页，paddleocr 可用时 OCR 提取文字 → 翻译 → 译文以附录页插在扫描页之后（原扫描页不动，零排版风险）；未安装则明确警告并保留原样（不再静默跳过）
@@ -142,6 +148,10 @@ llm:
   batch_size: 6            # 每批段落数上限。限流严的模型调小到 2-3
   batch_char_budget: 3000  # v0.4.3 每批字符预算：长短段不混批，降低长批
                            # 超时失败率。0=仅按段数（v0.4.2 行为）
+  rpm_limit: 0             # v0.5.0 provider 每分钟请求配额。设置后自动换算
+                           # min_call_interval=60/rpm；YAML 显式写出的键优先
+  tpm_limit: 0             # v0.5.0 每分钟 token 配额。与 rpm 同设时自动换算
+                           # batch_char_budget=(tpm/rpm)×3.2×0.8（clamp 400-12000）
   max_llm_calls: 40        # 单文档调用上限（防跑飞）
   min_call_interval: 2     # 相邻调用最小间隔秒。限流严的调大到 5-10
   max_workers: 3           # 并发线程数。免费档建议 1
@@ -152,9 +162,12 @@ llm:
   retry_delay_cap: 60.0    # 服务端 RetryInfo 建议等待的封顶秒
   fallback_model: ""       # 逗号分隔备用链 "m2, m3"，主模型日配额耗尽自动切换
 
-performance:               # v0.4.3 本地性能
+performance:               # 本地性能（v0.4.3 起）
   layout_workers: 0        # 版面分析进程并行数；0=自动 min(4,CPU)，1=串行
   cache_max_entries: 50000 # 翻译缓存条目上限（0=不限制），超出淘汰最旧
+  layout_engine: heuristic # v0.5.0 版面引擎：heuristic=内置启发式（默认）；
+                           # pymupdf-layout=GNN 版面检测（需 pip install
+                           # pymupdf-layout，未装自动回退启发式并告警）
 ```
 
 ### 免费档使用备注（实测 2026-08）
@@ -223,11 +236,15 @@ Weyl semimetal: 外尔半金属
 python -m pytest tests/ -q
 ```
 
-80 个单测覆盖：批字符预算组批、缓存容量淘汰、单元格原文回灌（dry-run 回归）、
+103 个单测覆盖：批字符预算组批、缓存容量淘汰、单元格原文回灌（dry-run 回归）、
 扫描页 OCR 警告/附录页（mock 注入）、布局并行与串行结果一致性、任务队列与
 history 归档、provider 参数透传、跨页断句拆分、公式编号剥离、Algorithm 框判定、
 三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行
-（欧洲/西里尔词边界）、服务端目录浏览与输出预览端点等核心逻辑。
+（欧洲/西里尔词边界）、服务端目录浏览与输出预览端点等核心逻辑；
+v0.5.0 新增：配额自适应换算（显式优先/边界 clamp）、htmlbox 双渲染路径
+（含双语）、OCR 行分组/图形避让/原位回贴端到端、pymupdf-layout 适配层
+（伪造模块注入/回退标记）、JobStore 往返/重启恢复/排队取消落盘、
+SSE 广播与端点帧契约、/api/translate key 回填、崩溃归档 error。
 测试不需要网络和 API key。
 
 ## 项目结构
@@ -235,15 +252,20 @@ history 归档、provider 参数透传、跨页断句拆分、公式编号剥离
 ```
 translator/
   cli.py         # 命令行入口
-  pipeline.py    # 主流程编排（布局→裁图→排队→翻译→回灌；v0.4.3 并行布局/OCR）
+  pipeline.py    # 主流程编排（布局→裁图→排队→翻译→回灌；v0.4.3 并行
+                 #   布局/OCR；v0.5.0 配额自适应/OCR 原位回贴/双渲染引擎）
+  render.py      # 渲染回灌（redaction/重排/公式回贴；v0.5.0 writer +
+                 #   htmlbox 双引擎，htmlbox=insert_htmlbox 实验路径）
   extract.py     # 文本块提取（扫描页检测 page_has_text_layer）
-  layout.py      # 版面分析（双栏/公式区/三线表/图注/页眉脚/Algorithm框）
+  layout.py      # 版面分析（双栏/公式区/三线表/图注/页眉脚/Algorithm框；
+                 #   v0.5.0 pymupdf-layout 外部引擎适配层）
   refsplit.py    # 参考文献条目重切
   llm.py         # LLM 客户端（批字符预算组批/重试退避/fallback链/限流）
   langs.py       # v0.4.2 多语言注册表 + 跨平台字体解析
   cache.py       # SQLite 翻译缓存（v0.4.3 容量上限淘汰）
   glossary.py    # 术语表锁定
-  ocr.py         # v0.4.3 扫描页惰性 OCR（paddleocr 可选依赖）
+  ocr.py         # 扫描页惰性 OCR（paddleocr 可选依赖；v0.5.0 行级
+                 #   bbox 提取供原位回贴）
   render.py      # 渲染回灌（redaction/重排/公式回贴）
   typography.py  # 期刊级排版（按目标语言选字体族）
   wrap_mixed.py  # CJK/拉丁/西里尔混排断行
@@ -251,10 +273,13 @@ translator/
   control.py     # v0.4.0 暂停/恢复/取消（批间协作式检查点）
   events.py      # v0.4.0 进度事件流
 server/
-  app.py         # FastAPI：静态 UI + REST API（翻译提交/排队/进度轮询/
-                 #   配置读写/目录浏览/key连通性测试/输出预览/任务历史）
-  jobs.py        # 任务管理器（子进程隔离，JSONL 事件流 + stdin 控制管道；
-                 #   v0.4.3 忙时入队接力 + history 归档）
+  app.py         # FastAPI：静态 UI + REST/SSE API（翻译提交/排队/进度
+                 #   轮询+SSE 推送/配置读写/目录浏览/key 连通性测试/
+                 #   输出预览/任务历史；v0.5.0 key 回填/队列任务取消）
+  jobs.py        # 任务管理器（子进程隔离，JSONL 事件流 + 控制文件轮询；
+                 #   v0.4.3 忙时入队接力；v0.5.0 事件广播/警告接活/
+                 #   崩溃归档 error/持久化恢复）
+  store.py       # v0.5.0 任务持久化（SQLite：队列/历史/重启恢复）
   glossary_io.py # 术语表批量导入（合并/校验/行号级报错）
 web/
   index.html     # Liquid Glass 单文件前端
@@ -266,10 +291,14 @@ glossary-physics-example.yaml  # 物理/量子材料术语表示例
 
 ## 已知限制
 
-- 扫描件翻译为**附录页方案**（v0.4.3）：扫描页 OCR 文字翻译后插入
-  附加译文页（`[OCR · p.N]` 标头），原扫描页不动。需要另装
-  `paddleocr`（`pip install paddleocr`），未安装时该页保留原样并给出
-  警告；OCR 识别质量决定译文质量，单页译文超一页时截断告警
+- 扫描件翻译默认为**附录页方案**（v0.4.3）：扫描页 OCR 文字翻译后插入
+  附加译文页（`[OCR · p.N]` 标头），原扫描页不动。`ocr.mode: inplace`
+  （v0.5.0，实验性）改为白块覆盖+原位回灌，与页内插图重叠的块自动跳过。
+  需要另装 `paddleocr`（`pip install paddleocr`），未安装时该页保留原样
+  并给出警告；OCR 识别质量决定译文质量
+- `htmlbox` 渲染引擎为实验性（v0.5.0）：段落排版交给 Story 引擎，单元格
+  窄格仍走 writer 路径；个别 PDF 的字体子集嵌入可能缺字，遇到异常切回
+  `writer` 即可（两者可按段对比）
 - 竖排文本、旋转页面不支持翻译（原样保留）
 - RTL 语言（阿拉伯语/希伯来语）与天城文暂不支持（双向/复杂整形超出
   当前逐字排印渲染器能力）
@@ -278,13 +307,15 @@ glossary-physics-example.yaml  # 物理/量子材料术语表示例
 - UI 暂停为**批间暂停**：正在飞行中的那次 LLM 请求会跑完才停（几秒内生效）；
   取消同理，且不产出半成品 PDF；并行布局阶段的取消在页粒度生效
 
-## 路线图（v0.5 候选）
+## 路线图（v0.5.x → v0.6 候选）
 
-- **渲染器换代**：TextWriter 逐字排印 → pymupdf `Story`/`insert_htmlbox`
-  （HTML+CSS 排版，自带 shaping/bidi）——可一并解锁阿拉伯语/印地语和
-  更好的两端对齐；双语层/公式防压/单元格回灌逻辑需要重写，是 v0.5 主线
-- **版面识别升级**：接入 [pymupdf-layout](https://pypi.org/project/pymupdf-layout/)
-  （CPU-only GNN 版面检测，pymupdf 1.27 运行时也会提示该包）或轻量
-  布局模型提升复杂版面（多栏嵌套/跨页表格）的段落切分精度
-- **任务持久化**：jobs 队列/历史目前为内存态，服务重启即清空；
-  可落 SQLite 支持断点续跑与历史查询
+- **渲染器换代收尾**（v0.5.0 已落种子）：htmlbox 路径在真实文献上灰度验证
+  后转默认——单元格回灌与公式防压迁移到 HTML 框架，随后解锁 RTL 语言
+  （阿拉伯语/希伯来语）与天城文：`insert_htmlbox` 的 Story 内核已具备
+  shaping/bidi 能力，缺的是语言注册表、字体链与验收样张
+- **pymupdf-layout 实装验证**（v0.5.0 适配层已就绪）：安装包后在复杂版面
+  （嵌套多栏/跨页表）上与启发式对比精度，GNN 文本区接管段落切分
+- **断点续跑细化**：当前恢复语义为整任务重跑（缓存兜底增量）；可细化到
+  段落级断点（记录已译段索引，跳过布局后直接进翻译阶段）
+- **UI 历史面板**：历史已在 API（`GET /api/jobs`）与 SQLite 里，前端可加
+  列表视图（重跑/打开输出/看警告）

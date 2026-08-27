@@ -24,6 +24,12 @@ llm:
   batch_size: 6                     # 每批段落数上限；限流严调小到 2-3
   batch_char_budget: 3000           # v0.4.3 每批字符预算：长短段不混批，
                                     # 降低长批超时失败率；0=仅按段数
+                                    # （设置下方配额且此处未显式配置时，自动换算优先）
+  rpm_limit: 0                      # v0.5.0 provider 每分钟请求配额（0=不启用）；
+                                    # 设置后自动换算 min_call_interval=60/rpm
+                                    # （YAML 里显式写出的配置项优先于自动值）
+  tpm_limit: 0                      # v0.5.0 每分钟 token 配额；与 rpm 同设时
+                                    # 自动换算批字符预算 (tpm/rpm)×3.2×0.8
   max_llm_calls: 40                 # 单文档调用上限
   min_call_interval: 2              # 相邻调用最小间隔秒；限流严调大到 5-10
   max_workers: 3                    # 并发数；免费档建议 1
@@ -39,6 +45,9 @@ llm:
 performance:
   layout_workers: 0                 # 版面分析进程并行数；0=自动(min(4,CPU))，1=串行
   cache_max_entries: 50000          # 翻译缓存条目上限（0=不限制），超出淘汰最旧
+  layout_engine: heuristic          # v0.5.0 版面引擎：heuristic=内置启发式（默认）；
+                                    # pymupdf-layout=GNN 版面检测（需 pip install
+                                    # pymupdf-layout，未装自动回退启发式并告警）
 
 features:
   watermark_removal: true           # 三层水印移除
@@ -46,6 +55,9 @@ features:
   glossary_lock: true               # 术语一致性校验
   translation_cache: true           # SQLite 缓存，二次运行零调用
   bilingual: false                  # true=双语对照模式
+  renderer: writer                  # v0.5.0 渲染器：writer=TextWriter 逐字排印
+                                    # （稳定默认）；htmlbox=insert_htmlbox HTML+CSS
+                                    # 引擎（实验性，自带两端对齐/复杂文字整形）
 
 glossary_file: ""                   # 术语表 YAML 路径（可选）
 
@@ -59,3 +71,6 @@ ocr:
   engine: paddle                    # 扫描件 OCR（v0.4.3 起真实接入；需另装
                                     # paddleocr，未装则警告并保留原样；none=关闭）
   min_chars: 50                     # 文字层少于此字符数的页视为扫描页
+  mode: appendix                    # v0.5.0 译文呈现：appendix=附录页（默认）；
+                                    # inplace=白块覆盖+原位回灌（实验性，与图形
+                                    # 重叠的块自动跳过保留原样）

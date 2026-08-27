@@ -391,7 +391,10 @@ class TranslationClient:
             for b in batches:
                 if self.control is not None:
                     self.control.checkpoint()
-                batch_idx, out = self._process_batch(b, paras)
+                # v0.5.0: 串行路径与并发路径同走 _guarded_batch——旧版直接调
+                # _process_batch，worker 内意外异常（如极端内容的序列化失败）
+                # 会炸掉整个任务；并发路径本就有隔离，两路径行为对齐
+                batch_idx, out = self._guarded_batch(b, paras)
                 if out is None:
                     continue
                 for j, dst in out.items():

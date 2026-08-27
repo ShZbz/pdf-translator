@@ -877,8 +877,59 @@ def collect_display_formulas(page, blocks: list[dict]) -> list[dict]:
     return merged_regions
 
 
-def layout_page(page) -> dict:
-    """单页总编排：blocks → 栏检测/重切 → 排除 → 合并 → 表格/公式。"""
+def external_layout_regions(page) -> dict | None:
+    """v0.5.0: pymupdf-layout GNN 版面检测适配层（任务 2-2）。
+
+    装有 pymupdf-layout 时（import pymupdf.layout 会向 pymupdf 注册
+    page.get_layout() 钩子），返回 {"figures": [...], "tables": [...],
+    "formulas": [...]}（Rect 列表）；未安装/检测失败返回 None，
+    调用方回退内置启发式（行为不回退原则）。
+
+    区域分类按 kind 字段防御式归一（int/str 都接受，子串匹配）：
+    figure/image/picture → 图区；table → 表区；formula/equation/math →
+    公式区；text/title/list/code/header/footer 等文本类不产出保护区。
+    """
+    try:
+        import pymupdf.layout  # noqa: F401  (注册 _get_layout 钩子)
+    except Exception:
+        return None
+    try:
+        page.get_layout()
+        items = getattr(page, "layout_information", None) or []
+    except Exception:
+        return None
+    figs: list[pymupdf.Rect] = []
+    tables: list[pymupdf.Rect] = []
+    formulas: list[pymupdf.Rect] = []
+    for it in items:
+        bbox = getattr(it, "bbox", None) or (it[0] if isinstance(it, (list, tuple))
+                                             and len(it) >= 2 else None)
+        kind = getattr(it, "kind", None)
+        if kind is None and isinstance(it, (list, tuple)) and len(it) >= 2:
+            kind = it[1]
+        if bbox is None or kind is None:
+            continue
+        k = str(kind).strip().lower()
+        r = pymupdf.Rect(bbox)
+        if r.is_empty or r.is_infinite:
+            continue
+        if any(s in k for s in ("fig", "image", "pic")):
+            figs.append(r)
+        elif "table" in k:
+            tables.append(r)
+        elif any(s in k for s in ("formul", "equation", "math")):
+            formulas.append(r)
+    if not (figs or tables or formulas):
+        return None
+    return {"figures": figs, "tables": tables, "formulas": formulas}
+
+
+def layout_page(page, engine: str = "heuristic") -> dict:
+    """单页总编排：blocks → 栏检测/重切 → 排除 → 合并 → 表格/公式。
+
+    engine: "heuristic"（默认）| "pymupdf-layout"（GNN 版面检测，未装
+    自动回退启发式，返回值 layout_engine 字段标记实际使用的引擎）。
+    """
     from . import extract as ex
 
     # v0.4.2: dict/表格检测每页只取一次，向下游透传（旧版 table_cells
@@ -914,14 +965,29 @@ def layout_page(page) -> dict:
 
     figs = figure_regions(page)
     detected = _detected_tables(page)
-    tables = [pymupdf.Rect(t) for t in find_tables(page, detected=detected)]
+    formulas: list[dict] = []
+    layout_engine_used = "heuristic"
+    ext = external_layout_regions(page) if engine == "pymupdf-layout" else None
+    if ext is not None:
+        # GNN 版面检测接管图/表/公式区（结构化区域替代 bbox 启发式）；
+        # 段落切分/合并/栏检测仍走内置管线（GNN 文本区粒度不含阅读序）
+        layout_engine_used = "pymupdf-layout"
+        figs = ext["figures"]
+        tables = ext["tables"]
+        formulas = [{"bbox": r, "para_hint_y": r.y0, "is_display": True}
+                    for r in ext["formulas"]]
+        detected = []          # 表区已由 GNN 给出，跳过 find_tables
+    else:
+        if engine == "pymupdf-layout":
+            layout_engine_used = "pymupdf-layout-fallback"
+        tables = [pymupdf.Rect(t) for t in find_tables(page, detected=detected)]
+        # P3: display 公式区先于段落收集（基于原始 body 块），文字块受保护：
+        # 公式区内的 span/碎片不进翻译队列、原文不抹除，仅裁图回贴（D6 完整闭环）。
+        formulas = collect_display_formulas(page, body)
+    formula_rects = [pymupdf.Rect(f["bbox"]) for f in formulas]
     # v0.2.3: Algorithm 伪代码框几何检测——框内段落全部 verbatim
     # （主体被拆成多块时 span 启发式必漏，实测 paper3 p4 行 7-9 独立成块）
     alg_boxes = _algorithm_box_regions(page)
-    # P3: display 公式区先于段落收集（基于原始 body 块），文字块受保护：
-    # 公式区内的 span/碎片不进翻译队列、原文不抹除，仅裁图回贴（D6 完整闭环）。
-    formulas = collect_display_formulas(page, body)
-    formula_rects = [pymupdf.Rect(f["bbox"]) for f in formulas]
     # v0.2.2: 保护判定从"块中心"改为"块与公式区相交"——混合块
     # （如 'dt .\n(6)'，一半公式碎片一半编号）中心在区外会被漏保护，
     # 导致 redact 抹掉编号+碎片重灌成乱码（实测 page3 (6)(7) 被吞根因）。
@@ -1024,4 +1090,5 @@ def layout_page(page) -> dict:
         "hf_blocks": hf,
         "fig_text_blocks": fig_text,
         "figure_regions": figs,
+        "layout_engine": layout_engine_used,
     }

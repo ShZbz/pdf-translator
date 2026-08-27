@@ -1,12 +1,16 @@
-"""FastAPI 服务：静态 UI + REST API（v0.4.0）。
+"""FastAPI 服务：静态 UI + REST/SSE API（v0.4.0 起）。
 
 端点：
 - GET  /                     → web/index.html
 - POST /api/translate        → 提交翻译任务 {input, output_dir, llm?, features?}
                                 （忙时入队，v0.4.3；队列满才 409）
 - GET  /api/jobs/current     → 当前任务状态+事件快照
-- GET  /api/jobs             → 当前任务 + 排队任务 + 历史归档（v0.4.3）
+- GET  /api/jobs/current/stream → SSE 实时流（v0.5.0：事件推送替代轮询，
+                                前端不支持 EventSource 时自动退轮询）
+- GET  /api/jobs             → 当前任务 + 排队任务 + 历史归档（v0.4.3；
+                                v0.5.0 历史落 SQLite，重启可查）
 - POST /api/jobs/{id}/pause|resume|cancel
+                                （v0.5.0: 排队中的任务也可取消）
 - GET  /api/config           → 读 UI 配置（key 打码）
 - PUT  /api/config           → 写 UI 配置
 - POST /api/validate-key     → 测试 provider 连通性
@@ -14,6 +18,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import time
 import uuid
@@ -21,18 +27,23 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .glossary_io import collect_yaml_files, dump_merged, validate_and_merge, validate_text
 from .jobs import JobManager
+from .store import JobStore
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 UI_CONFIG_PATH = PROJECT_ROOT / "ui_config.yaml"
+# v0.5.0: 任务持久化库路径可用 PDF_TRANSLATOR_JOBS_DB 覆盖（测试隔离用）
+JOBS_DB_PATH = Path(os.environ.get("PDF_TRANSLATOR_JOBS_DB")
+                    or PROJECT_ROOT / ".ui_jobs.db")
 
 app = FastAPI(title="pdf-translator UI")
-manager = JobManager(PROJECT_ROOT)
+# v0.5.0: 队列/历史持久化（.ui_jobs.db）——服务重启恢复未完成任务
+manager = JobManager(PROJECT_ROOT, store=JobStore(JOBS_DB_PATH))
 
 
 # ---------- 静态页 ----------
@@ -56,15 +67,7 @@ def translate(req: TranslateReq) -> dict:
     if src.suffix.lower() != ".pdf":
         raise HTTPException(400, "只支持 PDF")
 
-    # 由 UI 配置合成临时运行配置
-    # v0.4.3: 文件名带任务 id——旧版固定 .ui_run_config.yaml，忙时入队的
-    # 第二个任务会被下一次提交覆盖配置（排队任务跑错输入文件）
-    cfg_data = req.config or {}
-    cfg_data.setdefault("io", {})
-    cfg_data["io"]["input"] = str(src)
-    out_dir = req.output_dir or cfg_data["io"].get("output_dir") or str(src.parent)
-    cfg_data["io"]["output_dir"] = out_dir
-
+    cfg_data = _build_run_config(req, src)
     run_cfg = PROJECT_ROOT / f".ui_run_config_{uuid.uuid4().hex[:8]}.yaml"
     run_cfg.write_text(yaml.safe_dump(cfg_data, allow_unicode=True),
                        encoding="utf-8")
@@ -73,6 +76,40 @@ def translate(req: TranslateReq) -> dict:
     if not result.get("ok"):
         raise HTTPException(409, result.get("error", "submit failed"))
     return result
+
+
+def _build_run_config(req: "TranslateReq", src: Path) -> dict:
+    """由 UI 配置合成运行配置（v0.4.3: 文件名带任务 id 防忙时覆盖）。
+
+    v0.5.0 修复（B1）: UI 重载后 key 输入框为空、collectConfig 提交的是
+    空 api_key——旧版 run config 只带空 key，worker 的 resolve() 只查
+    环境变量不查 ui_config.yaml 存量 → 已保存过 key 的用户照样 401。
+    这里从存储配置回填（key 只在本机文件间流转，不出本机）。
+    """
+    # 由 UI 配置合成临时运行配置
+    cfg_data = req.config or {}
+    cfg_data.setdefault("io", {})
+    cfg_data["io"]["input"] = str(src)
+    out_dir = req.output_dir or cfg_data["io"].get("output_dir") or str(src.parent)
+    cfg_data["io"]["output_dir"] = out_dir
+    llm_data = cfg_data.get("llm") or {}
+    if not (llm_data.get("api_key") or "").strip() \
+            or "***" in llm_data.get("api_key", ""):
+        stored = _stored_llm()
+        if stored.get("api_key"):
+            llm_data["api_key"] = stored["api_key"]
+    return cfg_data
+
+
+def _stored_llm() -> dict:
+    """读取 ui_config.yaml 的 llm 段（不存在返回空 dict）。"""
+    if not UI_CONFIG_PATH.exists():
+        return {}
+    try:
+        return yaml.safe_load(
+            UI_CONFIG_PATH.read_text(encoding="utf-8")).get("llm", {}) or {}
+    except Exception:
+        return {}
 
 
 @app.get("/api/jobs/current")
@@ -87,11 +124,11 @@ def current_job() -> dict:
 
 @app.get("/api/jobs")
 def all_jobs() -> dict:
-    """v0.4.3: 当前任务 + 排队任务 + 历史归档。"""
-    cur = manager.current()
+    """v0.4.3: 当前任务 + 排队任务 + 历史归档（v0.5.0: 历史持久化重启可查）。"""
+    snap = manager.current_snapshot()
     return {
-        "current": cur.snapshot() if cur else None,
-        "queued": [j.snapshot() for j in manager.queue],
+        "current": snap["current"],
+        "queued": snap["queued"],
         "history": manager.history[-20:],
     }
 
@@ -105,11 +142,56 @@ def job_action(job_id: str, action: str) -> dict:
     # v0.4.3: 动作白名单——旧版 getattr(job, action) 任意方法可调
     if action not in ("pause", "resume", "cancel"):
         raise HTTPException(400, f"未知操作: {action}")
-    job = manager.current()
-    if not job or job.id != job_id:
+    # v0.5.0 修复（B2）: 旧版只查当前任务，排队中的任务永远 404——
+    # 用户提交错了只能干等它排到队首。排队任务现在可取消/暂停意图登记
+    job = manager.act(job_id, action)
+    if job is None:
         raise HTTPException(404, "任务不存在或已结束")
-    getattr(job, action)()
     return job.snapshot()
+
+
+# ---------- SSE 实时流（v0.5.0: 任务 2-5）----------
+@app.get("/api/jobs/current/stream")
+async def job_stream():
+    """当前任务/队列的服务端推送事件流。
+
+    帧格式 `data: {json}\n\n`：
+    - {"kind":"state", ...}   全量状态（连接建立首发 + 队列推进时）
+    - {"kind":"job_event", "event":..., "job":...}  任务事件（进度/阶段/警告）
+    每 15s 发一行 `: ping` 心跳防中间层断连。事件泵线程 → SimpleQueue →
+    本协程 0.25s 间隔取帧（无第三方依赖的线程→异步io 桥）。
+    """
+    q = manager.subscribe()
+
+    async def gen():
+        try:
+            snap = manager.current_snapshot()
+            yield f"data: {json.dumps({'kind': 'state', **snap}, ensure_ascii=False)}\n\n"
+            last_beat = time.monotonic()
+            while True:
+                try:
+                    payload = q.get_nowait()
+                except Exception:
+                    payload = None
+                if payload is not None:
+                    if payload.get("kind") == "manager":
+                        # 队列推进/新提交 → 补发全量状态
+                        s = manager.current_snapshot()
+                        yield f"data: {json.dumps({'kind': 'state', **s}, ensure_ascii=False)}\n\n"
+                    else:
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    continue
+                now = time.monotonic()
+                if now - last_beat >= 15.0:
+                    yield ": ping\n\n"
+                    last_beat = now
+                await asyncio.sleep(0.25)
+        finally:
+            manager.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 # ---------- 配置读写 ----------
