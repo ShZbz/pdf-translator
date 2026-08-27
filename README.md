@@ -8,21 +8,18 @@
 
 ## 功能特性
 
-- **渲染引擎换代种子（v0.5.0，实验性）**：`features.renderer: htmlbox` 切换到 pymupdf `insert_htmlbox`（HTML+CSS 排版引擎，Story 内核）——断行/避头尾/试排降字号交给排版引擎，自带两端对齐与复杂文字整形（shaping/bidi），是 v0.5 渲染器主线的种子实现；默认仍为稳定的 `writer`（TextWriter 逐字排印），逐段可对比两种引擎输出
-- **任务持久化（v0.5.0）**：队列/历史落 SQLite（`.ui_jobs.db`），服务重启自动恢复未完成任务重新排队——配合翻译缓存，重跑只剩增量段；历史跨重启可查（`GET /api/jobs`）
-- **UI 实时推送（v0.5.0）**：新增 SSE 端点 `/api/jobs/current/stream`，进度/阶段/警告事件服务端推送（EventSource），替代 1.2s 轮询；浏览器不支持时自动回退轮询
-- **LLM 配额自适应（v0.5.0）**：`llm.rpm_limit`/`llm.tpm_limit` 填入 provider 配额后自动换算调用间隔（60/RPM）与批字符预算（TPM/RPM × 3.2 字符/token × 0.8 安全系数），显式写出的配置项优先
-- **OCR 原位回贴（v0.5.0，实验性）**：`ocr.mode: inplace`——OCR 行 bbox 聚类成块、白块覆盖原文、译文原位回灌（PDFMathTranslate 式），与页内插图重叠的块自动跳过保留原样；默认仍为附录页方案
-- **pymupdf-layout 适配层（v0.5.0）**：`performance.layout_engine: pymupdf-layout` 启用 GNN 版面检测（图/表/公式结构化区域替代 bbox 启发式），未安装包自动回退内置启发式并告警——接口已就绪，`pip install pymupdf-layout` 即用
-- **批字符预算组批（v0.4.3）**：LLM 组批按 ~3000 字符/批贪心装填（`batch_char_budget`），长短段不再混批——旧版按固定段数打包，长批 token 失衡易超时失败；失败率与平均延迟双降，`batch_size` 降级为每批段数上限
-- **布局阶段多进程并行（v0.4.3）**：逐页版面分析互相独立，`ProcessPoolExecutor` 并行（`performance.layout_workers`，0=自动 min(4,CPU)）；水印清理后的文档落临时文件供 worker 读取，任何并行故障自动回退串行
-- **扫描页惰性 OCR（v0.4.3）**：文字层 < 50 字符的页检出为扫描页，paddleocr 可用时 OCR 提取文字 → 翻译 → 译文以附录页插在扫描页之后（原扫描页不动，零排版风险）；未安装则明确警告并保留原样（不再静默跳过）
-- **任务队列（v0.4.3）**：UI/API 忙时提交自动入队（最多 5 个）接力执行，任务终态归档 history（`GET /api/jobs` 可查）；不再「已有翻译任务在运行」直接拒绝
-- **翻译缓存容量上限（v0.4.3）**：`performance.cache_max_entries`（默认 5 万条）超出淘汰最旧，防 DB 无限膨胀
-- **UI 对比度修复（v0.4.3）**：暗色主题下原生下拉弹出列表白底浅字几乎不可见 → `color-scheme: dark` + option 显式配色；术语表文本域引用未定义 `--fg` 变量导致黑底黑字一并修复
-- **多语言翻译（v0.4.2）**：源/目标语言扩展为 12 种——中文、英语、日语、韩语、德语、法语、西班牙语、意大利语、葡萄牙语、俄语、土耳其语、越南语；输出排版按目标语言自动选字体（中文宋体/黑体、日韩相应字体、西文 Times 系），输出文件名带语言标记（`-Zh`/`-Ja`/`-De`…）
-- **跨平台字体自动探测（v0.4.2）**：Windows 原生 / WSL / Linux / macOS 全支持（旧版仅 WSL 路径，原生 Windows 直接崩溃）；字形覆盖率自动校验，缺字形语言会预警
-- **图形界面（v0.4.0+）**：Liquid Glass 风格本地 Web UI——路径选择/拖放、设置面板（模型/翻译/性能/高级四类）、实时进度条（阶段+页/批粒度）、批间暂停/恢复/取消、连通性测试、服务端目录浏览、完成后浏览器内联预览输出 PDF
+- **渲染引擎双路径**：默认 `writer`（TextWriter 逐字排印，稳定）；实验性 `htmlbox`（`features.renderer: htmlbox`）走 pymupdf `insert_htmlbox`（Story 排版引擎）——断行/避头尾/试排降字号交给引擎，自带两端对齐与复杂文字整形（shaping/bidi），两种引擎可逐段对比
+- **任务持久化**：队列/历史落 SQLite（`.ui_jobs.db`），服务重启自动恢复未完成任务重新排队——配合翻译缓存，重跑只剩增量段；历史跨重启可查（`GET /api/jobs`）
+- **UI 实时推送**：SSE 端点 `/api/jobs/current/stream` 事件流（进度/阶段/警告），EventSource 优先，浏览器不支持时自动回退轮询
+- **LLM 配额自适应**：`llm.rpm_limit`/`llm.tpm_limit` 填入 provider 配额后自动换算调用间隔（60/RPM）与批字符预算（TPM/RPM × 3.2 字符/token × 0.8 安全系数），显式写出的配置项优先
+- **任务队列**：UI/API 忙时提交自动入队接力执行，任务终态归档 history（`GET /api/jobs` 可查）
+- **批字符预算组批**：LLM 组批按 ~3000 字符/批贪心装填（`batch_char_budget`），长短段不混批，降低长批超时失败率；`batch_size` 为每批段数上限
+- **布局阶段多进程并行**：逐页版面分析互相独立，`ProcessPoolExecutor` 并行（`performance.layout_workers`，0=自动），任何并行故障自动回退串行
+- **扫描页 OCR**：文字层 < 50 字符的页检出为扫描页，paddleocr 可用时 OCR 提取并翻译——默认附录页方案（译文页插在扫描页后，零排版风险）；实验性 `ocr.mode: inplace` 白块覆盖+译文原位回灌（与页内插图重叠的块自动跳过保留原样）；未安装则警告并保留原样
+- **pymupdf-layout 适配层**：`performance.layout_engine: pymupdf-layout` 启用 GNN 版面检测（图/表/公式结构化区域替代 bbox 启发式），未安装包自动回退内置启发式并告警
+- **图形界面**：Liquid Glass 风格本地 Web UI——路径选择/拖放、设置面板（模型/翻译/性能/高级四类）、实时进度条（阶段+页/批粒度）、批间暂停/恢复/取消、连通性测试、服务端目录浏览、完成后浏览器内联预览输出 PDF
+- **多语言翻译**：源/目标语言 12 种——中文、英语、日语、韩语、德语、法语、西班牙语、意大利语、葡萄牙语、俄语、土耳其语、越南语；输出排版按目标语言自动选字体（中文宋体/黑体、日韩相应字体、西文 Times 系），输出文件名带语言标记（`-Zh`/`-Ja`/`-De`…）
+- **跨平台字体自动探测**：Windows 原生 / WSL / Linux / macOS 全支持；字形覆盖率自动校验，缺字形语言会预警
 - **版面保留**：redaction 只删文字层，图片、矢量图形、双栏结构原样保留
 - **display 公式裁图回贴**：数学字体主导的独立公式区先裁成 300dpi 位图，翻译后原位浮回；公式编号 `(n)` 自动吸收进位图
 - **三线表检测与翻译**：横线聚类启发式兜底（不依赖 PDF 表格标记），单元格逐格翻译原位回灌，数字列自动对齐
@@ -30,21 +27,19 @@
 - **跨页断句合并**：页尾开放句 + 下页首段合并为一个翻译单元，译文按长度比例拆回两页
 - **双栏重切**：跨栏块自动按中线拆分，左栏译文不侵入右栏
 - **批量翻译**：全文档段落统一排队，batch JSON 协议，摊薄 LLM 调用次数
-- **SQLite 缓存**：key = MD5(engine|model|lang|text)，二次运行零 LLM 调用
-- **失败降级**：LLM 失败/触顶段落保留原文重灌，版面完整不塌陷；表格单元格译文缺失时同样回灌原文（v0.4.3 修复 dry-run 表格被清空的缺陷）
+- **SQLite 缓存**：key = MD5(engine|model|lang|text)，二次运行零 LLM 调用；容量上限可配（`performance.cache_max_entries`，超出淘汰最旧）
+- **失败降级**：LLM 失败/触顶段落保留原文重灌，版面完整不塌陷；表格单元格译文缺失时同样回灌原文
 - **多 provider 支持**：OpenAI 兼容协议，内置 DeepSeek/智谱/Gemini/SiliconFlow/Ollama/LM Studio preset
 - **双语对照模式**（可选开关）：译文在上、灰色原文在下同框对照，标题/公式区不重复排版；输出文件名带 `-bilingual` 后缀
-- **术语表锁定**：外部 YAML 术语表注入翻译提示词 + 译后逐段校验，专业术语全篇一致；违例段落以 `glossary violation` 警告提示。仓库附物理/拓扑材料示例表 `glossary-physics-example.yaml`
-- **版面元素识别**：页眉/页脚自动剔除（顶部 8% / 底部 6% 阈值判定，不译不干扰正文）；Fig./Table 开头的图注表注智能豁免误保护
+- **术语表锁定**：外部 YAML 术语表注入翻译提示词 + 译后逐段校验，专业术语全篇一致；仓库附物理/量子材料示例表 `glossary-physics-example.yaml`
+- **版面元素识别**：页眉/页脚自动剔除（顶部 8% / 底部 6% 阈值判定）；Fig./Table 开头的图注表注智能豁免误保护
 - **零成本试跑**：CLI `--dry-run` 跳过 LLM 翻译跑完整布局/水印/渲染管线，验证配置是否正确不花一个 token
 
 ## 环境要求
 
 - Python 3.11+
 - 依赖：`pymupdf`、`openai`、`pyyaml`（UI 另需 `fastapi`、`uvicorn`）
-- 字体：按目标语言自动探测（Windows 自带宋体/黑体/times 即可；
-  Linux 需 Noto CJK / Noto Serif / DejaVu 任一；macOS 用系统字体）；
-  找不到时可在 config `fonts:` 段显式指定
+- 字体：按目标语言自动探测（Windows 自带宋体/黑体/times 即可；Linux 需 Noto CJK / Noto Serif / DejaVu 任一；macOS 用系统字体）；找不到时可在 config `fonts:` 段显式指定
 - 一个 LLM API key（任选一家，见下文 provider 配置）
 
 ## 安装
@@ -107,7 +102,7 @@ python -m translator.cli -c myconfig.yaml
 4. 运行结束后在 `output_dir` 里拿 `<文件名>-<目标语言>.pdf`
    （如 `paper-Zh.pdf` / `paper-De.pdf`；双语模式 `-bilingual-<语言>.pdf`）。
 
-## 支持语言（v0.4.2）
+## 支持语言
 
 | code | 语言 | 输出排版字体（自动探测） |
 |---|---|---|
@@ -117,12 +112,9 @@ python -m translator.cli -c myconfig.yaml
 | `ja` | 日语 | MS Gothic / Yu Gothic / Noto Sans JP |
 | `ko` | 韩语 | Malgun / Nanum / Noto Sans KR |
 
-- 源语言同样从上表选择（默认 `en`）。版面分析启发式（图注/参考文献/标题判定）
-  针对英文文献优化，其他源语言可运行但识别精度略降
-- 每种语言附带字形覆盖率校验：选到的字体缺目标语言字符（豆腐块风险）时
-  输出 warning 并提示在 `fonts:` 段指定字体
-- 暂不支持 RTL 语言（阿拉伯语/希伯来语）与天城文：逐字排印无法做
-  双向/复杂整形，输出不可读（见「已知限制」）
+- 源语言同样从上表选择（默认 `en`）。版面分析启发式（图注/参考文献/标题判定）针对英文文献优化，其他源语言可运行但识别精度略降
+- 每种语言附带字形覆盖率校验：选到的字体缺目标语言字符（豆腐块风险）时输出 warning 并提示在 `fonts:` 段指定字体
+- RTL 语言（阿拉伯语/希伯来语）与天城文暂不支持（见「已知限制」）
 
 ## Provider 配置
 
@@ -146,11 +138,11 @@ key 解析优先级：**config 的 `api_key` > provider 专属环境变量 > `OP
 ```yaml
 llm:
   batch_size: 6            # 每批段落数上限。限流严的模型调小到 2-3
-  batch_char_budget: 3000  # v0.4.3 每批字符预算：长短段不混批，降低长批
-                           # 超时失败率。0=仅按段数（v0.4.2 行为）
-  rpm_limit: 0             # v0.5.0 provider 每分钟请求配额。设置后自动换算
-                           # min_call_interval=60/rpm；YAML 显式写出的键优先
-  tpm_limit: 0             # v0.5.0 每分钟 token 配额。与 rpm 同设时自动换算
+  batch_char_budget: 3000  # 每批字符预算：长短段不混批，降低长批超时失败率。
+                           # 0=仅按段数
+  rpm_limit: 0             # provider 每分钟请求配额。设置后自动换算
+                           # min_call_interval=60/rpm；显式写出的键优先
+  tpm_limit: 0             # 每分钟 token 配额。与 rpm 同设时自动换算
                            # batch_char_budget=(tpm/rpm)×3.2×0.8（clamp 400-12000）
   max_llm_calls: 40        # 单文档调用上限（防跑飞）
   min_call_interval: 2     # 相邻调用最小间隔秒。限流严的调大到 5-10
@@ -162,19 +154,17 @@ llm:
   retry_delay_cap: 60.0    # 服务端 RetryInfo 建议等待的封顶秒
   fallback_model: ""       # 逗号分隔备用链 "m2, m3"，主模型日配额耗尽自动切换
 
-performance:               # 本地性能（v0.4.3 起）
+performance:               # 本地性能
   layout_workers: 0        # 版面分析进程并行数；0=自动 min(4,CPU)，1=串行
   cache_max_entries: 50000 # 翻译缓存条目上限（0=不限制），超出淘汰最旧
-  layout_engine: heuristic # v0.5.0 版面引擎：heuristic=内置启发式（默认）；
+  layout_engine: heuristic # 版面引擎：heuristic=内置启发式（默认）；
                            # pymupdf-layout=GNN 版面检测（需 pip install
                            # pymupdf-layout，未装自动回退启发式并告警）
 ```
 
 ### 免费档使用备注（实测 2026-08）
 
-- **智谱 GLM-4.7-flash（免费）**：能连通、翻译质量尚可，但免费档速率限制极紧
-  （错误码 `1302 账户已达到速率限制`）。实测 8 页论文 39 次调用中 18 批被拒，
-  即使 `min_call_interval: 2 / max_workers: 1` 也大量失败。若坚持使用：
+- **智谱 GLM-4.7-flash（免费）**：能连通、翻译质量尚可，但免费档速率限制极紧（错误码 `1302 账户已达到速率限制`）。实测 8 页论文 39 次调用中 18 批被拒，即使 `min_call_interval: 2 / max_workers: 1` 也大量失败。若坚持使用：
   ```yaml
   llm:
     model: "glm-4.7-flash"
@@ -184,12 +174,8 @@ performance:               # 本地性能（v0.4.3 起）
     timeout: 180           # 该模型带思维链，响应慢
   ```
   代价是单文档耗时 10 分钟以上且仍可能部分降级。**日常使用推荐 deepseek-chat**。
-- **Gemini API（免费 tier）**：`gemini-2.5-flash` 等模型的日配额按模型独立计数，
-  耗尽的报错含 `PerDay quotaId`，此时可用 `fallback_model: "gemini-2.5-flash-lite"`
-  自动切换。但**预付费余额归零**时报 `RESOURCE_EXHAUSTED: Your prepayment credits
-  are depleted`——这是账户级的，所有模型一起不可用，换模型无效，只能充值或换 provider。
-- **本地模型**（Ollama/LM Studio）：零成本无限流，`base_url` 指向本地端口即可；
-  注意上下文窗口 ≥8k、指令遵循能力会影响 batch JSON 协议的成功率，失败段落自动降级保留原文。
+- **Gemini API（免费 tier）**：`gemini-2.5-flash` 等模型的日配额按模型独立计数，耗尽的报错含 `PerDay quotaId`，此时可用 `fallback_model: "gemini-2.5-flash-lite"` 自动切换。但**预付费余额归零**时报 `RESOURCE_EXHAUSTED: Your prepayment credits are depleted`——这是账户级的，所有模型一起不可用，换模型无效，只能充值或换 provider。
+- **本地模型**（Ollama/LM Studio）：零成本无限流，`base_url` 指向本地端口即可；注意上下文窗口 ≥8k、指令遵循能力会影响 batch JSON 协议的成功率，失败段落自动降级保留原文。
 
 ## 命令行
 
@@ -206,8 +192,7 @@ warning 类型：
 - `batch failed after retry, keep source: [...]` — 这些批次翻译失败已降级为原文，可重跑（有缓存，成功的批次不会重复调用）
 - `cellN: narrow box ... < text width` — 表格窄格文字略超格宽，仅提示不影响内容
 - `glossary violation` — 术语表校验违例（启用 `glossary_lock` 时）
-- `scanned pages ... not installed (pip install paddleocr)` — 检出扫描页但未装
-  OCR 引擎（v0.4.3），该页保留原样
+- `scanned pages ... not installed (pip install paddleocr)` — 检出扫描页但未装 OCR 引擎，该页保留原样
 - `OCR page N: no text recognized` — OCR 未识别出文字，该页保留原样
 
 ## 术语表
@@ -236,15 +221,7 @@ Weyl semimetal: 外尔半金属
 python -m pytest tests/ -q
 ```
 
-103 个单测覆盖：批字符预算组批、缓存容量淘汰、单元格原文回灌（dry-run 回归）、
-扫描页 OCR 警告/附录页（mock 注入）、布局并行与串行结果一致性、任务队列与
-history 归档、provider 参数透传、跨页断句拆分、公式编号剥离、Algorithm 框判定、
-三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行
-（欧洲/西里尔词边界）、服务端目录浏览与输出预览端点等核心逻辑；
-v0.5.0 新增：配额自适应换算（显式优先/边界 clamp）、htmlbox 双渲染路径
-（含双语）、OCR 行分组/图形避让/原位回贴端到端、pymupdf-layout 适配层
-（伪造模块注入/回退标记）、JobStore 往返/重启恢复/排队取消落盘、
-SSE 广播与端点帧契约、/api/translate key 回填、崩溃归档 error。
+103 个单测覆盖核心逻辑：批字符预算组批、缓存容量淘汰、单元格原文回灌、扫描页 OCR、布局并行与串行一致性、任务队列/history 归档/重启恢复、SSE 端点帧契约、配额自适应换算、htmlbox 双渲染路径、OCR 行分组/图形避让/原位回贴、pymupdf-layout 适配层回退、provider 参数透传、跨页断句拆分、公式编号剥离、Algorithm 框判定、三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行、服务端目录浏览与输出预览、key 回填等。
 测试不需要网络和 API key。
 
 ## 项目结构
@@ -252,34 +229,25 @@ SSE 广播与端点帧契约、/api/translate key 回填、崩溃归档 error。
 ```
 translator/
   cli.py         # 命令行入口
-  pipeline.py    # 主流程编排（布局→裁图→排队→翻译→回灌；v0.4.3 并行
-                 #   布局/OCR；v0.5.0 配额自适应/OCR 原位回贴/双渲染引擎）
-  render.py      # 渲染回灌（redaction/重排/公式回贴；v0.5.0 writer +
-                 #   htmlbox 双引擎，htmlbox=insert_htmlbox 实验路径）
+  pipeline.py    # 主流程编排（布局→裁图→排队→翻译→回灌；并行布局/OCR、配额自适应、OCR 原位回贴、双渲染引擎）
+  render.py      # 渲染回灌（redaction/重排/公式回贴；writer + htmlbox 双引擎）
   extract.py     # 文本块提取（扫描页检测 page_has_text_layer）
-  layout.py      # 版面分析（双栏/公式区/三线表/图注/页眉脚/Algorithm框；
-                 #   v0.5.0 pymupdf-layout 外部引擎适配层）
+  layout.py      # 版面分析（双栏/公式区/三线表/图注/页眉脚/Algorithm框；pymupdf-layout 外部引擎适配层）
   refsplit.py    # 参考文献条目重切
-  llm.py         # LLM 客户端（批字符预算组批/重试退避/fallback链/限流）
-  langs.py       # v0.4.2 多语言注册表 + 跨平台字体解析
-  cache.py       # SQLite 翻译缓存（v0.4.3 容量上限淘汰）
+  llm.py         # LLM 客户端（批字符预算组批/重试退避/fallback链/限流/配额自适应）
+  langs.py       # 多语言注册表 + 跨平台字体解析
+  cache.py       # SQLite 翻译缓存（容量上限淘汰）
   glossary.py    # 术语表锁定
-  ocr.py         # 扫描页惰性 OCR（paddleocr 可选依赖；v0.5.0 行级
-                 #   bbox 提取供原位回贴）
-  render.py      # 渲染回灌（redaction/重排/公式回贴）
+  ocr.py         # 扫描页惰性 OCR（paddleocr 可选依赖；行级 bbox 提取供原位回贴）
   typography.py  # 期刊级排版（按目标语言选字体族）
   wrap_mixed.py  # CJK/拉丁/西里尔混排断行
   preprocess.py  # 水印移除
-  control.py     # v0.4.0 暂停/恢复/取消（批间协作式检查点）
-  events.py      # v0.4.0 进度事件流
+  control.py     # 暂停/恢复/取消（批间协作式检查点）
+  events.py      # 进度事件流
 server/
-  app.py         # FastAPI：静态 UI + REST/SSE API（翻译提交/排队/进度
-                 #   轮询+SSE 推送/配置读写/目录浏览/key 连通性测试/
-                 #   输出预览/任务历史；v0.5.0 key 回填/队列任务取消）
-  jobs.py        # 任务管理器（子进程隔离，JSONL 事件流 + 控制文件轮询；
-                 #   v0.4.3 忙时入队接力；v0.5.0 事件广播/警告接活/
-                 #   崩溃归档 error/持久化恢复）
-  store.py       # v0.5.0 任务持久化（SQLite：队列/历史/重启恢复）
+  app.py         # FastAPI：静态 UI + REST/SSE API（翻译提交/排队/进度轮询+SSE推送/配置读写/目录浏览/key 连通性测试/输出预览/任务历史；key 回填/队列任务取消）
+  jobs.py        # 任务管理器（子进程隔离，JSONL 事件流 + 控制文件轮询；忙时入队接力/事件广播/警告接活/崩溃归档/持久化恢复）
+  store.py       # 任务持久化（SQLite：队列/历史/重启恢复）
   glossary_io.py # 术语表批量导入（合并/校验/行号级报错）
 web/
   index.html     # Liquid Glass 单文件前端
@@ -291,31 +259,14 @@ glossary-physics-example.yaml  # 物理/量子材料术语表示例
 
 ## 已知限制
 
-- 扫描件翻译默认为**附录页方案**（v0.4.3）：扫描页 OCR 文字翻译后插入
-  附加译文页（`[OCR · p.N]` 标头），原扫描页不动。`ocr.mode: inplace`
-  （v0.5.0，实验性）改为白块覆盖+原位回灌，与页内插图重叠的块自动跳过。
-  需要另装 `paddleocr`（`pip install paddleocr`），未安装时该页保留原样
-  并给出警告；OCR 识别质量决定译文质量
-- `htmlbox` 渲染引擎为实验性（v0.5.0）：段落排版交给 Story 引擎，单元格
-  窄格仍走 writer 路径；个别 PDF 的字体子集嵌入可能缺字，遇到异常切回
-  `writer` 即可（两者可按段对比）
+- 扫描件翻译默认**附录页方案**：扫描页 OCR 文字翻译后插入附加译文页（`[OCR · p.N]` 标头），原扫描页不动。`ocr.mode: inplace`（实验性）改为白块覆盖+原位回灌，与页内插图重叠的块自动跳过。需要另装 `paddleocr`（`pip install paddleocr`），未安装时该页保留原样并给出警告；OCR 识别质量决定译文质量
+- `htmlbox` 渲染引擎为实验性：段落排版交给 Story 引擎，单元格窄格仍走 writer 路径；个别 PDF 的字体子集嵌入可能缺字，遇到异常切回 `writer` 即可（两者可按段对比）
 - 竖排文本、旋转页面不支持翻译（原样保留）
-- RTL 语言（阿拉伯语/希伯来语）与天城文暂不支持（双向/复杂整形超出
-  当前逐字排印渲染器能力）
+- RTL 语言（阿拉伯语/希伯来语）与天城文暂不支持（双向/复杂整形超出当前逐字排印渲染器能力）
 - 极复杂嵌套表格可能切分不准，单元格译文以警告提示
 - 水印移除仅处理**文字层水印**（出版社/preprint 声明类）；扫描件中烤在图像像素里的水印无法移除
-- UI 暂停为**批间暂停**：正在飞行中的那次 LLM 请求会跑完才停（几秒内生效）；
-  取消同理，且不产出半成品 PDF；并行布局阶段的取消在页粒度生效
+- UI 暂停为**批间暂停**：正在飞行中的那次 LLM 请求会跑完才停（几秒内生效）；取消同理，且不产出半成品 PDF；并行布局阶段的取消在页粒度生效
 
-## 路线图（v0.5.x → v0.6 候选）
+## 版本历史
 
-- **渲染器换代收尾**（v0.5.0 已落种子）：htmlbox 路径在真实文献上灰度验证
-  后转默认——单元格回灌与公式防压迁移到 HTML 框架，随后解锁 RTL 语言
-  （阿拉伯语/希伯来语）与天城文：`insert_htmlbox` 的 Story 内核已具备
-  shaping/bidi 能力，缺的是语言注册表、字体链与验收样张
-- **pymupdf-layout 实装验证**（v0.5.0 适配层已就绪）：安装包后在复杂版面
-  （嵌套多栏/跨页表）上与启发式对比精度，GNN 文本区接管段落切分
-- **断点续跑细化**：当前恢复语义为整任务重跑（缓存兜底增量）；可细化到
-  段落级断点（记录已译段索引，跳过布局后直接进翻译阶段）
-- **UI 历史面板**：历史已在 API（`GET /api/jobs`）与 SQLite 里，前端可加
-  列表视图（重跑/打开输出/看警告）
+各版本变更见 GitHub Releases：<https://github.com/ShZbz/pdf-translator/releases>
