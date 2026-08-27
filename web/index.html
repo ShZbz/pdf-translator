@@ -374,8 +374,11 @@ body.dragging::after {
 
     <!-- 翻译 -->
     <div class="pane" id="pane-trans">
+      <div class="set-row"><label>源语言
+        <span class="hint">版面识别启发式针对英文文献优化</span></label>
+        <select id="cfg-srclang"></select></div>
       <div class="set-row"><label>目标语言</label>
-        <select id="cfg-tgtlang"><option value="zh">中文</option><option value="en">英文</option></select></div>
+        <select id="cfg-tgtlang"></select></div>
       <div class="set-row" style="align-items:flex-start;"><label>术语表 (YAML)
         <span class="hint">锁定专业术语一致性</span></label>
         <div style="display:flex;flex-direction:column;gap:4px;max-width:60%;">
@@ -387,7 +390,7 @@ body.dragging::after {
           </button>
         </div></div>
       <div class="set-row"><label>期刊排版
-        <span class="hint">宋体正文/黑体标题</span></label>
+        <span class="hint">按目标语言选字体：中文宋体/黑体，日韩相应字体，西文 Times 系</span></label>
         <label class="switch"><input type="checkbox" id="cfg-formatting" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>水印移除
         <span class="hint">仅文字层水印（出版社声明类）；扫描图片型水印无法移除</span></label>
@@ -500,7 +503,25 @@ function toast(msg, isErr=false) {
 
 /* ---------- 设置 ---------- */
 const PROVIDERS = ['deepseek','zhipu','gemini','siliconflow','openai','ollama','lmstudio'];
+// v0.4.2: 多语言（源/目标共用清单；输出排版按目标语言选字体，见 translator/langs.py）
+const LANGS = [
+  ['en','English'], ['zh','中文（简体）'], ['ja','日本語'], ['ko','한국어'],
+  ['de','Deutsch'], ['fr','Français'], ['es','Español'], ['it','Italiano'],
+  ['pt','Português'], ['ru','Русский'], ['tr','Türkçe'], ['vi','Tiếng Việt'],
+];
 let CFG = {};
+
+(function initLangs() {
+  [['cfg-srclang','en'], ['cfg-tgtlang','zh']].forEach(([id, dft]) => {
+    const sel = $(id);
+    LANGS.forEach(([code, name]) => {
+      const o = document.createElement('option');
+      o.value = code; o.textContent = name;
+      sel.appendChild(o);
+    });
+    sel.value = dft;
+  });
+})();
 
 async function loadConfig() {
   try {
@@ -512,6 +533,7 @@ async function loadConfig() {
     $('cfg-key').placeholder = llm.has_key ? `已保存 (${llm.api_key_masked})` : '未设置';
     $('cfg-fallback').value = llm.fallback_model || '';
     $('cfg-baseurl').value = llm.base_url || '';
+    $('cfg-srclang').value = (CFG.io||{}).source_lang || 'en';
     $('cfg-tgtlang').value = (CFG.io||{}).target_lang || 'zh';
     $('cfg-glossary').value = CFG.glossary_file || '';
     $('cfg-formatting').checked = (CFG.features||{}).preserve_formatting !== false;
@@ -535,7 +557,9 @@ async function loadConfig() {
 function collectConfig() {
   const num = (v, d) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
   return {
-    io: { input:'', output_dir:'', source_lang:'en', target_lang:$('cfg-tgtlang').value },
+    io: { input:'', output_dir:'',
+          source_lang:$('cfg-srclang').value || 'en',
+          target_lang:$('cfg-tgtlang').value || 'zh' },
     llm: {
       provider: $('cfg-provider').value,
       model: $('cfg-model').value.trim(),
@@ -592,6 +616,7 @@ $('btnTestKey').onclick = async () => {
     const r = await api('/api/validate-key', {method:'POST', body: JSON.stringify({
       provider: cfgNow.provider, model: cfgNow.model || 'deepseek-chat',
       api_key: cfgNow.api_key, base_url: cfgNow.base_url,
+      target_lang: $('cfg-tgtlang').value,
     })});
     if (r.ok) {
       el.style.color = '#7ed88f';
@@ -803,22 +828,56 @@ function setBar(pct, indet=false) {
   bar.style.width = pct + '%';
 }
 
+const STAGE_NAMES = { layout: '布局分析', translate: 'LLM 翻译', render: '渲染回灌' };
+const TERMINAL = ['done', 'error', 'cancelled'];
+
 function updateProgressUI(j) {
   const zone = $('progressZone');
   const btn = $('btnTranslate');
-  if (j.status === 'idle' && !pollActive) { /* nothing */ }
-  if (['queued','running','paused'].includes(j.status)) {
+  const busy = ['queued','running','paused'].includes(j.status);
+  // v0.4.2 修复：终态（完成/出错/取消）保持进度区展开展示结果——
+  // 旧版一进 else 就收起 zone，「✅完成·打开输出PDF」与错误信息永远不可见；
+  // 仅 idle（无任务）时收起
+  if (busy || TERMINAL.includes(j.status)) {
     zone.classList.add('open');
-    btn.disabled = true; btn.textContent = j.status === 'paused' ? '已暂停 ⏸' : '翻译中…';
-    $('btnPause').textContent = j.status === 'paused' ? '▶ 继续' : '⏸ 暂停';
   } else {
     zone.classList.remove('open');
+  }
+  if (busy) {
+    btn.disabled = true;
+    btn.textContent = j.status === 'paused' ? '已暂停 ⏸' : '翻译中…';
+    $('btnPause').textContent = j.status === 'paused' ? '▶ 继续' : '⏸ 暂停';
+  } else {
     btn.disabled = false; btn.textContent = '翻 译';
+  }
+  $('btnPause').style.visibility = busy ? 'visible' : 'hidden';
+  $('btnCancel').style.visibility = busy ? 'visible' : 'hidden';
+  // 状态行：阶段 + 进度（v0.4.2：旧版只写死「启动中…」，无任何进度数字）
+  if (busy) {
+    let s = STAGE_NAMES[j.stage] || (j.status === 'paused' ? '已暂停' : '处理中…');
+    const p = j.progress;
+    if (p && p.total > 0) {
+      const unit = p.unit === 'batch' ? '批' : '页';
+      s = `${s} ${p.done}/${p.total} ${unit}`
+        + (p.unit === 'batch' && p.calls ? ` · ${p.calls} 次调用` : '');
+    }
+    if (j.status === 'paused') s = `⏸ 已暂停（${s}）`;
+    $('statusLine').textContent = s;
+    if (p && p.total > 0) setBar(Math.round(100 * p.done / p.total));
+    else setBar(0, true);
   }
   if (j.output_path) {
     $('doneRow').classList.add('show');
-    $('doneLink').href = 'file://' + encodeURI(j.output_path).replace(/#/g,'%23');
-    // done stats 由 exit 事件携带
+    // v0.4.2：file:// 链接被 Chrome/Edge 从 http 页面拦截
+    // （Not allowed to load local resource）→ 改走服务端转发预览
+    $('doneLink').href = '/api/output?path=' + encodeURIComponent(j.output_path);
+    $('doneLink').target = '_blank';
+    const st = [];
+    if (j.pages) st.push(`${j.pages} 页`);
+    if (j.calls != null) st.push(`${j.calls} 次调用`);
+    if (j.elapsed) st.push(`${j.elapsed}s`);
+    $('doneStats').textContent = st.length ? `（${st.join(' · ')}）` : '';
+    $('statusLine').textContent = '✅ 完成';
   }
   if (j.status === 'error') { $('statusLine').textContent = '❌ ' + (j.error || '失败'); }
   if (j.status === 'cancelled') { $('statusLine').textContent = '已取消'; }

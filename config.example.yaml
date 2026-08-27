@@ -1,8 +1,12 @@
 # 新测试样张: arxiv 2308.13658 (IEEE 双栏 8页,10公式,22+文献)
 io:
   input: "paper.pdf"                # 待翻译 PDF 路径
-  output_dir: "out"                 # 输出目录，生成 <文件名>-Zh.pdf
-  source_lang: en
+  output_dir: "out"                 # 输出目录，生成 <文件名>-<目标语言>.pdf
+  # 源/目标语言（v0.4.2 支持 12 种，输出排版按目标语言自动选字体）：
+  #   zh 简体中文 | en 英文 | ja 日语 | ko 韩语
+  #   de 德语 | fr 法语 | es 西语 | it 意语 | pt 葡语 | tr 土语 | vi 越南语
+  #   ru 俄语
+  source_lang: en                   # 版面识别启发式针对英文文献优化
   target_lang: zh
 
 llm:
@@ -39,7 +43,10 @@ features:
 glossary_file: ""                   # 术语表 YAML 路径（可选）
 
 fonts:
-  cjk: ""                           # 留空自动探测；或指定如 "C:/Windows/Fonts/simsun.ttc"
+  cjk: ""                           # 留空自动探测（Windows/WSL/Linux/macOS）；
+                                    # 或指定如 "C:/Windows/Fonts/simsun.ttc"
+  # body: ""                        # 目标语言正文字体（中性名，同 cjk）
+  # heading: ""                     # 目标语言标题字体
 
 ocr:
   engine: paddle                    # 扫描件 OCR 引擎（需另装 paddleocr）

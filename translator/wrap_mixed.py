@@ -18,12 +18,17 @@ _NO_LINE_START = set("，。、；：？！」』）】〉》〕〗〙％‰.,;:
 _NO_LINE_END = set("（「『【〈《〔〖〘([{‘“")
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff01-\uffee]")
-_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\u2019\-]*|\s+")
-_LATIN_DETECT_RE = re.compile(r"[A-Za-z]")
+# v0.4.2: Unicode 词元（原 [A-Za-z0-9] 会把 Über→"U"+"ber"、Квант→逐字
+# 拆散，欧洲/西里尔语言断行在词内断开）。\w 含 CJK 但 CJK 已在上游分流。
+_TOKEN_RE = re.compile(r"[\w'\u2019\-]+|\s+", re.UNICODE)
+# 非经典拉丁的字母文字（带变音符拉丁/希腊/西里尔）也走词边界断行，
+# 不能落进 CJK 逐字断行路径（俄语逐字断行=单词被任意腰斩）。
+_LATIN_DETECT_RE = re.compile(
+    r"[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u1E00-\u1FFF]")
 
 
 def _has_latin(text: str) -> bool:
-    """文本是否含 Latin 字母（决定断行策略分发）。"""
+    """文本是否含字母文字（决定断行策略分发：词边界 vs CJK 逐字）。"""
     return bool(_LATIN_DETECT_RE.search(text))
 
 

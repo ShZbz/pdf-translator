@@ -13,18 +13,22 @@ def page_has_text_layer(page, min_chars: int = 50) -> bool:
     return len(page.get_text().strip()) >= min_chars
 
 
-def get_page_blocks(page) -> list[dict]:
+def get_page_blocks(page, page_dict: dict | None = None) -> list[dict]:
     """提取一页全部文字块。
 
     返回块列表，每块:
       bbox:   pymupdf.Rect
-      text:   块内全文（行内 span 按 x0 排序拼接，行间 \n）
+      text:   块内全文（行内 span 按 x0 排序拼接，行间 \\n）
       spans:  [{text, size, flags, font, bbox}]（保持行序）
       lines:  [{bbox, text}]（v0.2.3 新增：行级 bbox/text，供
               公式编号行剥离 / Algorithm caption 带拆分用）
+
+    v0.4.2: page_dict 可传入预取的 get_text("dict") 结果（布局层
+    已取一次，避免同页重复解析）。
     """
     blocks = []
-    for b in page.get_text("dict")["blocks"]:
+    pd = page_dict if page_dict is not None else page.get_text("dict")
+    for b in pd["blocks"]:
         if b.get("type") != 0:  # 非文字块（图片）
             continue
         # v0.2.2: 旋转文本块过滤（arXiv 侧边竖排水印 dir=(0,1)），

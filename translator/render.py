@@ -11,14 +11,8 @@ import re
 
 import pymupdf
 
+from .langs import is_cjk_script, resolve_original_font
 from .layout import dominant_size
-
-DEFAULT_FONTS = [
-    "/mnt/c/Windows/Fonts/SourceHanSansCN-Normal.ttf",
-    "/mnt/c/Windows/Fonts/Noto Sans SC (TrueType).otf",
-    "/mnt/c/Windows/Fonts/msyh.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-]
 
 MIN_FONT = 6.5
 
@@ -162,15 +156,24 @@ def _draw_para(tw, rect: "pymupdf.Rect", txt: str, font: "pymupdf.Font",
         y += lh
 
 
-def find_cjk_font(explicit: str | None = None) -> str:
-    """按显式路径 → 常见路径顺序找第一个存在的 CJK 字体文件。"""
-    import os
-    for p in ([explicit] if explicit else []) + DEFAULT_FONTS:
-        if p and os.path.exists(p):
-            return p
-    raise FileNotFoundError(
-        "no CJK font found; set fonts.cjk in config.yaml "
-        f"(tried: {[explicit] + DEFAULT_FONTS})")
+def find_cjk_font(explicit: str | None = None, lang: str = "zh") -> str:
+    """目标语言正文字体（v0.4.2 多语言化，函数名保留旧称兼容）。
+
+    平台三通吃（Windows 原生 / WSL / Linux·macOS），候选链见 langs.py。
+    CJK/西里尔目标找不到字体文件时抛错（豆腐块不可接受，提示用户配置）；
+    西文目标返回 ""（pymupdf.Font(fontfile="") = 内置 Noto Serif，覆盖拉丁-1）。
+    """
+    from . import langs
+    body, _ = langs.resolve_output_fonts(
+        lang, {"cjk": explicit} if explicit else None)
+    if body:
+        return body
+    if is_cjk_script(lang) or langs.lang_info(lang).script == "cyrillic":
+        raise FileNotFoundError(
+            f"no font found for target language {lang!r}; set fonts.body "
+            f"(or fonts.cjk) in config.yaml to a font covering it "
+            f"(tried dirs: {[str(d) for d in langs.font_dirs()]})")
+    return ""   # 西文：内置衬线兜底（覆盖率告警由 pipeline 补发）
 
 
 def _fit_fontsize(rect: pymupdf.Rect, text: str, font: pymupdf.Font,
@@ -239,8 +242,14 @@ def render_page(page, layout: dict, translated: list[dict],
     # v0.2.2: 标题用黑体族（typography 提供时）
     tw_head = pymupdf.TextWriter(page.rect)
     f_head = typography.f_head if typography else font
-    # 双语 en 层字体:原文含 CJK(ZH→EN 反向翻译)时用 CJK 字体,否则 Helvetica
-    en_font = font if _has_cjk("".join(p["text"] for p in paras)) else pymupdf.Font("helv")
+    # 双语原文层字体:原文含 CJK(如 zh→en 反向)用目标 CJK 字体;西文原文用
+    # Times 系（覆盖西里尔/扩展拉丁，Helvetica 只有拉丁-1，俄语原文会豆腐块）
+    if _has_cjk("".join(p["text"] for p in paras)):
+        en_font = font
+    else:
+        en_path = (typography.en_body_path if typography
+                   else None) or resolve_original_font()
+        en_font = pymupdf.Font(fontfile=en_path) if en_path else pymupdf.Font("helv")
     # D6 公式区 rects(双语 en 层防压公式位图)
     formula_rects = [pymupdf.Rect(f["bbox"]) for f in layout.get("formulas", [])]
 
@@ -300,8 +309,11 @@ def render_page(page, layout: dict, translated: list[dict],
             use_font = font
             tw_target = tw
             is_ref = bool(re.match(r"^\[\d+\]", txt.strip()))
+            # v0.4.2: 首行缩进 2 字符仅 CJK 目标语言（中文期刊惯例）；
+            # 西文按学术惯例不缩进
+            base_indent = 2 if _has_cjk(txt) else 0
             indent_chars = 0 if (p.get("is_heading") or p.get("is_caption")
-                                 or is_ref or len(txt) < 40) else 2
+                                 or is_ref or len(txt) < 40) else base_indent
             tag_extra = ""
             lh_factor = 1.32
             center = False

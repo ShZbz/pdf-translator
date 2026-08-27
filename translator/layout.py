@@ -493,21 +493,33 @@ def _h_overlap(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
     return inter / denom
 
 
-def find_tables(page) -> list[pymupdf.Rect]:
+def _detected_tables(page) -> list:
+    """page.find_tables() 安全包装（异常返回空）。
+
+    v0.4.2: 每页只调一次——此前 layout_page 调 1 次、table_cells 对每个
+    表区再各调 1 次（find_tables 是重操作，全页文本+线条分析），
+    双表页 = 3 次全页分析，纯浪费。
+    """
+    try:
+        tf = page.find_tables()
+        return list(tf.tables) if tf else []
+    except Exception:
+        return []
+
+
+def find_tables(page, detected: list | None = None) -> list[pymupdf.Rect]:
     """D3: 表格区域圈定。
 
     v0.2.3: find_tables() 对无竖线三线表（IEEE/学术排版主流）检出 0 张
     （实测 paper3 p6 表 I）→ 表区不保护、单元格被当正文重灌成乱码。
     补充三线表启发式：同栏内 ≥3 条全宽横线（顶线/表头线/底线，x 覆盖
     >70% 栏宽、间距 8-80pt）围出的区域判为表区。
+
+    v0.4.2: detected 参数透传预检测结果（_detected_tables），避免重复分析。
     """
     rects: list[pymupdf.Rect] = []
-    try:
-        tf = page.find_tables()
-        if tf and tf.tables:
-            rects = [pymupdf.Rect(t.bbox) for t in tf.tables]
-    except Exception:
-        rects = []
+    for t in (detected if detected is not None else _detected_tables(page)):
+        rects.append(pymupdf.Rect(t.bbox))
     # ---- 三线表启发式（find_tables 检不出时兜底）----
     pw, ph = page.rect.width, page.rect.height
     mid = pw / 2.0
@@ -569,18 +581,22 @@ def find_tables(page) -> list[pymupdf.Rect]:
     return dedup
 
 
-def table_cells(page, table_bbox: pymupdf.Rect) -> list[dict]:
+def table_cells(page, table_bbox: pymupdf.Rect,
+                detected: list | None = None,
+                page_dict: dict | None = None) -> list[dict]:
     """D3 单元格原子块：返回 {bbox, text} 列表。
 
     v0.2.3: find_tables 检不出三线表时（启发式兜底圈出的表区），
     按行带切分单元格——用表区内的文字块 y 带分组，每行带内按 x0 排序
     逐块成格。单元格粒度粗于 find_tables 但足以让每格独立翻译不糊。
+
+    v0.4.2: detected/page_dict 透传预取结果（旧版每表区各跑一次
+    find_tables + 一次全页 get_text("dict")，多表页重复全页分析）。
     """
     cells = []
     try:
-        tf = page.find_tables()
         found = False
-        for t in (tf.tables if tf else []):
+        for t in (detected if detected is not None else _detected_tables(page)):
             tb = pymupdf.Rect(t.bbox)
             if not tb.intersects(table_bbox):
                 continue
@@ -598,8 +614,9 @@ def table_cells(page, table_bbox: pymupdf.Rect) -> list[dict]:
         pass
     # ---- 三线表行带切分兜底 ----
     tb = pymupdf.Rect(table_bbox)
+    pd = page_dict if page_dict is not None else page.get_text("dict")
     blocks = []
-    for b in page.get_text("dict")["blocks"]:
+    for b in pd["blocks"]:
         if b.get("type") != 0:
             continue
         r = pymupdf.Rect(b["bbox"])
@@ -864,7 +881,10 @@ def layout_page(page) -> dict:
     """单页总编排：blocks → 栏检测/重切 → 排除 → 合并 → 表格/公式。"""
     from . import extract as ex
 
-    raw = ex.get_page_blocks(page)
+    # v0.4.2: dict/表格检测每页只取一次，向下游透传（旧版 table_cells
+    # 每个表区各重跑一次 find_tables + get_text("dict")）
+    page_dict = page.get_text("dict")
+    raw = ex.get_page_blocks(page, page_dict)
     mode = detect_columns(page, raw)
 
     # v0.2.3: 块内独立成行的公式编号 '(n)' 行剥离——编号与公式主体不同块时
@@ -893,7 +913,8 @@ def layout_page(page) -> dict:
     assign_columns(body, page.rect.width, mode)
 
     figs = figure_regions(page)
-    tables = [pymupdf.Rect(t) for t in find_tables(page)]
+    detected = _detected_tables(page)
+    tables = [pymupdf.Rect(t) for t in find_tables(page, detected=detected)]
     # v0.2.3: Algorithm 伪代码框几何检测——框内段落全部 verbatim
     # （主体被拆成多块时 span 启发式必漏，实测 paper3 p4 行 7-9 独立成块）
     alg_boxes = _algorithm_box_regions(page)
@@ -978,9 +999,13 @@ def layout_page(page) -> dict:
     # D6 裁图回贴仅限 display 公式块与图内公式区。
 
     # v0.2.3: 全部表区的单元格平铺（pipeline 翻译队列用）
+    # v0.4.2: 每表只切一次 cells，"tables" 元数据与 "tables_cells" 共用
+    tables_meta: list[dict] = []
     tables_cells: list[dict] = []
     for t in tables:
-        tables_cells.extend(table_cells(page, t))
+        cells = table_cells(page, t, detected=detected, page_dict=page_dict)
+        tables_meta.append({"bbox": t, "cells": cells})
+        tables_cells.extend(cells)
 
     # v0.2.3: Algorithm 框内块并入 paragraphs 尾部（按 y 排序恢复阅读序），
     # 标记 verbatim——不进翻译队列、不 redact
@@ -993,7 +1018,7 @@ def layout_page(page) -> dict:
     return {
         "mode": mode,
         "paragraphs": paras,
-        "tables": [{"bbox": t, "cells": table_cells(page, t)} for t in tables],
+        "tables": tables_meta,
         "tables_cells": tables_cells,
         "formulas": formulas,
         "hf_blocks": hf,

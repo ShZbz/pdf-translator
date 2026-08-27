@@ -4,11 +4,13 @@
   <img src="assets/ui-main.png" alt="pdf-translator Web UI" width="720"/>
 </div>
 
-学术 PDF 整册翻译工具：保留原始版面（图片/表格/公式/双栏）的 EN→ZH 翻译。
+学术 PDF 整册翻译工具：保留原始版面（图片/表格/公式/双栏），12 种国际常用语言互译。
 
 ## 功能特性
 
-- **图形界面（v0.4.0）**：Liquid Glass 风格本地 Web UI——路径选择/拖放、设置面板（模型/翻译/性能/高级四类）、实时进度条、批间暂停/恢复/取消、连通性测试、服务端目录浏览
+- **多语言翻译（v0.4.2）**：源/目标语言扩展为 12 种——中文、英语、日语、韩语、德语、法语、西班牙语、意大利语、葡萄牙语、俄语、土耳其语、越南语；输出排版按目标语言自动选字体（中文宋体/黑体、日韩相应字体、西文 Times 系），输出文件名带语言标记（`-Zh`/`-Ja`/`-De`…）
+- **跨平台字体自动探测（v0.4.2）**：Windows 原生 / WSL / Linux / macOS 全支持（旧版仅 WSL 路径，原生 Windows 直接崩溃）；字形覆盖率自动校验，缺字形语言会预警
+- **图形界面（v0.4.0+）**：Liquid Glass 风格本地 Web UI——路径选择/拖放、设置面板（模型/翻译/性能/高级四类）、实时进度条（阶段+页/批粒度）、批间暂停/恢复/取消、连通性测试、服务端目录浏览、完成后浏览器内联预览输出 PDF
 - **版面保留**：redaction 只删文字层，图片、矢量图形、双栏结构原样保留
 - **display 公式裁图回贴**：数学字体主导的独立公式区先裁成 300dpi 位图，翻译后原位浮回；公式编号 `(n)` 自动吸收进位图
 - **三线表检测与翻译**：横线聚类启发式兜底（不依赖 PDF 表格标记），单元格逐格翻译原位回灌，数字列自动对齐
@@ -27,8 +29,10 @@
 ## 环境要求
 
 - Python 3.11+
-- 依赖：`pymupdf`、`openai`、`pyyaml`
-- 中文字体：Windows 自带宋体/黑体即可；Linux 需安装 Noto Sans CJK 或思源字体
+- 依赖：`pymupdf`、`openai`、`pyyaml`（UI 另需 `fastapi`、`uvicorn`）
+- 字体：按目标语言自动探测（Windows 自带宋体/黑体/times 即可；
+  Linux 需 Noto CJK / Noto Serif / DejaVu 任一；macOS 用系统字体）；
+  找不到时可在 config `fonts:` 段显式指定
 - 一个 LLM API key（任选一家，见下文 provider 配置）
 
 ## 安装
@@ -48,7 +52,8 @@ uv pip install pymupdf openai pyyaml pytest
 ### 方式 A：图形界面（推荐）
 
 ```bash
-.venv/bin/python run_ui.py        # 起服务并自动开浏览器，默认 http://127.0.0.1:8618
+.venv/bin/python run_ui.py        # Linux/macOS/WSL，默认 http://127.0.0.1:8618
+.venv/Scripts/python run_ui.py    # Windows 原生
 ```
 
 浏览器里：填输入/输出路径（或拖 PDF 进窗口）→ 左下角 ⚙️ 设置 provider/key → 点「翻译」。
@@ -67,9 +72,9 @@ cp config.example.yaml myconfig.yaml
 ```yaml
 io:
   input: "paper.pdf"           # 待翻译 PDF 路径
-  output_dir: "out"            # 输出目录（生成 <文件名>-Zh.pdf）
-  source_lang: en
-  target_lang: zh
+  output_dir: "out"            # 输出目录（生成 <文件名>-<语言>.pdf）
+  source_lang: en              # 源语言（版面启发式针对英文文献优化）
+  target_lang: zh              # 目标语言，见下方语言表
 llm:
   provider: deepseek           # 见下方 Provider 配置
   api_key: ""                  # 留空则从环境变量读取
@@ -77,7 +82,7 @@ llm:
 features:
   translation_cache: true      # 二次运行零调用
 fonts:
-  cjk: ""                      # 留空自动探测（Windows 找 simsun/simhei）
+  cjk: ""                      # 留空自动探测；也可用 fonts.body/fonts.heading
 ```
 
 3. 设置 API key（环境变量优先于配置文件）：
@@ -87,7 +92,25 @@ export DEEPSEEK_API_KEY="sk-..."    # provider 对应的环境变量名见下表
 python -m translator.cli -c myconfig.yaml
 ```
 
-4. 运行结束后在 `output_dir` 里拿 `<文件名>-Zh.pdf`。
+4. 运行结束后在 `output_dir` 里拿 `<文件名>-<目标语言>.pdf`
+   （如 `paper-Zh.pdf` / `paper-De.pdf`；双语模式 `-bilingual-<语言>.pdf`）。
+
+## 支持语言（v0.4.2）
+
+| code | 语言 | 输出排版字体（自动探测） |
+|---|---|---|
+| `zh` | 简体中文 | 宋体 / Noto Serif SC（标题黑体 / Noto Sans SC Bold） |
+| `en` `de` `fr` `es` `it` `pt` `tr` `vi` | 西文 | Times New Roman / Noto Serif / DejaVu（标题粗体） |
+| `ru` | 俄语 | 同上（Times/DejaVu 含西里尔） |
+| `ja` | 日语 | MS Gothic / Yu Gothic / Noto Sans JP |
+| `ko` | 韩语 | Malgun / Nanum / Noto Sans KR |
+
+- 源语言同样从上表选择（默认 `en`）。版面分析启发式（图注/参考文献/标题判定）
+  针对英文文献优化，其他源语言可运行但识别精度略降
+- 每种语言附带字形覆盖率校验：选到的字体缺目标语言字符（豆腐块风险）时
+  输出 warning 并提示在 `fonts:` 段指定字体
+- 暂不支持 RTL 语言（阿拉伯语/希伯来语）与天城文：逐字排印无法做
+  双向/复杂整形，输出不可读（见「已知限制」）
 
 ## Provider 配置
 
@@ -185,8 +208,10 @@ Weyl semimetal: 外尔半金属
 python -m pytest tests/ -q
 ```
 
-26 个单测覆盖：provider 参数透传、跨页断句拆分、公式编号剥离、Algorithm 框判定、
-三线表检测、页脚阈值、渲染回灌等核心逻辑。测试不需要网络和 API key。
+62 个单测覆盖：provider 参数透传、跨页断句拆分、公式编号剥离、Algorithm 框判定、
+三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行
+（欧洲/西里尔词边界）、服务端目录浏览与输出预览端点等核心逻辑。
+测试不需要网络和 API key。
 
 ## 项目结构
 
@@ -198,16 +223,17 @@ translator/
   layout.py      # 版面分析（双栏/公式区/三线表/图注/页眉脚/Algorithm框）
   refsplit.py    # 参考文献条目重切
   llm.py         # LLM 客户端（批量协议/重试退避/fallback链/限流）
+  langs.py       # v0.4.2 多语言注册表 + 跨平台字体解析
   cache.py       # SQLite 翻译缓存
   glossary.py    # 术语表锁定
   render.py      # 渲染回灌（redaction/重排/公式回贴）
-  typography.py  # 中文字体排版
-  wrap_mixed.py  # CJK/拉丁混排断行
+  typography.py  # 期刊级排版（按目标语言选字体族）
+  wrap_mixed.py  # CJK/拉丁/西里尔混排断行
   preprocess.py  # 水印移除
   control.py     # v0.4.0 暂停/恢复/取消（批间协作式检查点）
   events.py      # v0.4.0 进度事件流
 server/
-  app.py         # FastAPI：静态 UI + REST API（翻译提交/进度轮询/配置读写/目录浏览/key连通性测试）
+  app.py         # FastAPI：静态 UI + REST API（翻译提交/进度轮询/配置读写/目录浏览/key连通性测试/输出预览）
   jobs.py        # 任务管理器（子进程隔离，JSONL 事件流 + stdin 控制管道）
 web/
   index.html     # Liquid Glass 单文件前端
@@ -219,8 +245,11 @@ glossary-physics-example.yaml  # 物理/量子材料术语表示例
 
 ## 已知限制
 
-- 手写体/艺术字扫描件依赖 OCR 质量（默认 PaddleOCR，需另装）
+- 手写体/艺术字扫描件依赖 OCR 质量（默认 PaddleOCR，需另装，且当前版本
+  尚未接入 OCR 调用链——扫描件暂只保留原样）
 - 竖排文本、旋转页面不支持翻译（原样保留）
+- RTL 语言（阿拉伯语/希伯来语）与天城文暂不支持（双向/复杂整形超出
+  当前逐字排印渲染器能力）
 - 极复杂嵌套表格可能切分不准，单元格译文以警告提示
 - 水印移除仅处理**文字层水印**（出版社/preprint 声明类）；扫描件中烤在图像像素里的水印无法移除
 - UI 暂停为**批间暂停**：正在飞行中的那次 LLM 请求会跑完才停（几秒内生效）；

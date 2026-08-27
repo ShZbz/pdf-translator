@@ -76,8 +76,13 @@ class TranslationClient:
 
     # ---- prompt 构造 ----
     def _system_prompt(self) -> str:
+        from .langs import prompt_lang_name
         rules = [
-            f"You are a professional academic translator from {self.src_lang} to {self.tgt_lang}.",
+            f"You are a professional academic translator from "
+            f"{prompt_lang_name(self.src_lang)} to "
+            f"{prompt_lang_name(self.tgt_lang)}.",
+            f"Write the translation in {prompt_lang_name(self.tgt_lang)}"
+            f" ({self.tgt_lang}).",
             "Input is a JSON object mapping numeric ids to paragraphs.",
             "Output MUST be a single JSON object with the SAME ids mapped to translations. No extra text.",
             "Keep placeholders like [FORMULA_0] EXACTLY as-is, unchanged count and position semantics.",
@@ -87,8 +92,6 @@ class TranslationClient:
         if self.glossary_prompt:
             rules.append(self.glossary_prompt)
         return "\n".join(rules)
-
-    _TRANSPORT_BACKOFF_BASE = 8.0
 
     def _warn(self, msg: str) -> None:
         """警告统一出口：进 warnings 列表 + 推事件流（sink 存在时）。"""

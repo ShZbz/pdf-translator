@@ -124,15 +124,21 @@ class _RateLimitLLM(FakeLLM):
         return super().create(**kwargs)
 
 
-def test_rate_limit_failure_does_not_burn_budget(monkeypatch):
+def test_rate_limit_failure_does_not_burn_budget():
     """429 失败不计入预算：预算 2，前 3 次请求全 429。
-    旧代码下失败烧光预算、B 批不会发起；新代码 B 批重试成功。"""
-    import translator.llm as llm_mod
-    monkeypatch.setattr(llm_mod.TranslationClient, "_TRANSPORT_BACKOFF_BASE", 0.01)
+    旧代码下失败烧光预算、B 批不会发起；新代码 B 批重试成功。
+
+    v0.4.2 修复测试自身的两个缺陷：
+    - monkeypatch 类属性 _TRANSPORT_BACKOFF_BASE 是死代码（_ask 用的是
+      实例属性 self.backoff_base），测试靠硬扛 8s 退避通过 → 改为构造参数
+    - 两批默认并发，共享 fail_times 计数，哪批拿到成功响应取决于线程调度
+      （全量回归下概率性 flaky，实测触发）→ max_workers=1 串行化
+    """
     fake = _RateLimitLLM(fail_times=3, responses=[
         json.dumps({"2": "乙。"}, ensure_ascii=False),
     ])
-    tc = TranslationClient(fake, model="mock", max_llm_calls=2, batch_size=1)
+    tc = TranslationClient(fake, model="mock", max_llm_calls=2, batch_size=1,
+                           max_workers=1, backoff_base=0.01, backoff_cap=0.02)
     out, calls = tc.translate_paragraphs(["A.", "B."])
     assert calls == 4          # A批2次全败 + B批1败1成
     assert out == ["A.", "乙。"]  # A留原文，B翻出
@@ -263,16 +269,14 @@ class _DailyQuotaLLM(FakeLLM):
         return super().create(**kwargs)
 
 
-def test_daily_quota_switches_fallback_model(monkeypatch):
+def test_daily_quota_switches_fallback_model():
     """日配额耗尽 → 自动切 fallback 模型继续翻译。"""
-    import translator.llm as llm_mod
-    monkeypatch.setattr(llm_mod.TranslationClient, "_TRANSPORT_BACKOFF_BASE", 0.01)
     fake = _DailyQuotaLLM(fail_times=1, responses=[
         json.dumps({"1": "乙。"}, ensure_ascii=False),
     ])
     tc = TranslationClient(fake, model="gemini-2.5-flash",
                            fallback_model="gemini-3.5-flash-lite",
-                           max_llm_calls=5)
+                           max_llm_calls=5, backoff_base=0.01)
     out, calls = tc.translate_paragraphs(["B."])
     assert out == ["乙。"]
     assert tc.model == "gemini-3.5-flash-lite"
@@ -302,20 +306,16 @@ def test_rpm_quota_does_not_switch_model():
 
 def test_no_fallback_configured_keeps_source():
     """未配置 fallback 且日配额耗尽 → 重试后保留原文（不崩）。"""
-    import translator.llm as llm_mod
-    monkeypatch_stub = None
     fake = _DailyQuotaLLM(fail_times=99, responses=[])
-    tc = TranslationClient(fake, model="m1", fallback_model="", max_llm_calls=5)
+    tc = TranslationClient(fake, model="m1", fallback_model="", max_llm_calls=5,
+                           backoff_base=0.01, backoff_cap=0.02)
     out, _ = tc.translate_paragraphs(["A."])
     assert out == ["A."]
     assert any("keep source" in w for w in tc.warnings)
 
 
-def test_fallback_chain_multi_model(monkeypatch):
+def test_fallback_chain_multi_model():
     """备用链:主模型+2备用,前两个都日配额耗尽 → 依次切换到第三个。"""
-    import translator.llm as llm_mod
-    monkeypatch.setattr(llm_mod.TranslationClient, "_TRANSPORT_BACKOFF_BASE", 0.01)
-
     class _ChainLLM(FakeLLM):
         """按当前请求的 model 抛日配额异常:m1/m2 耗尽,m3 正常。"""
         def create(self, **kwargs):
@@ -326,7 +326,8 @@ def test_fallback_chain_multi_model(monkeypatch):
 
     fake = _ChainLLM([json.dumps({"1": "丙。"}, ensure_ascii=False)])
     tc = TranslationClient(fake, model="m1",
-                           fallback_model="m2, m3", max_llm_calls=5)
+                           fallback_model="m2, m3", max_llm_calls=5,
+                           backoff_base=0.01)
     out, _ = tc.translate_paragraphs(["C."])
     assert out == ["丙。"]
     assert tc.model == "m3"

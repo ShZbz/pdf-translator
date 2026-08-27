@@ -10,7 +10,6 @@
 """
 from __future__ import annotations
 
-import os
 import re
 
 # 罗马数字节标题: "I. INTRODUCTION" / "IV. FINITE ELEMENT MODELING"
@@ -20,57 +19,40 @@ _ABSTRACT_RE = re.compile(r"^Abstract[:\s]*", re.I)
 _INDEX_TERMS_RE = re.compile(r"^Index Terms[:\s]*", re.I)
 
 
-def _first_existing(paths: list) -> str | None:
-    for p in paths:
-        if p and os.path.exists(p):
-            return p
-    return None
-
-
 class Typography:
     """字体族加载 + 段落→样式解析。
 
     用法:
-        ty = Typography(cfg_fonts)          # 加载字体族
-        style = ty.resolve(para_dict)       # → ParaStyle
+        ty = Typography(cfg_fonts, lang="zh")  # 加载目标语言字体族
+        style = ty.resolve(para_dict)          # → ParaStyle
         tw, fs, align = ty.draw_prepare(page_rect)
+
+    v0.4.2: 字体候选链改为三平台（Windows 原生 / WSL / Linux·macOS）+
+    按目标语言解析（langs.py 注册表）。旧版 WSL-only 路径在原生 Windows
+    上全部落空 → 静默退到 pymupdf 内置 Noto Serif（无 CJK 字形，中文
+    全豆腐块）——本次修复的根因之一。
     """
 
-    def __init__(self, fonts_cfg: dict | None = None):
+    def __init__(self, fonts_cfg: dict | None = None, lang: str = "zh"):
+        from . import langs
+        from .langs import is_cjk_script
         cfg = fonts_cfg or {}
-        # ---- 中文字体族 ----
-        self.body_path = _first_existing([
-            cfg.get("cjk_body"),
-            "/mnt/c/Windows/Fonts/simsun.ttc",
-            "/mnt/c/Windows/Fonts/NotoSerifSC-VF.ttf",
-            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
-            "/mnt/c/Windows/Fonts/msyh.ttc",
-        ]) or ""
-        self.heading_path = _first_existing([
-            cfg.get("cjk_heading"),
-            "/mnt/c/Windows/Fonts/simhei.ttf",
-            "/mnt/c/Windows/Fonts/msyhbd.ttc",
-            "/mnt/c/Windows/Fonts/Noto Sans SC Bold (TrueType).otf",
-        ]) or ""
-        # 兜底:标题字体找不到时退回正文字体
-        self.heading_path = self.heading_path or self.body_path
-        # ---- 英文层字体（双语原文/保留原文段）----
-        self.en_body_path = _first_existing([
-            "/mnt/c/Windows/Fonts/times.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-        ])
-        self.en_bold_path = _first_existing([
-            "/mnt/c/Windows/Fonts/timesbd.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-        ])
+        self.lang = (lang or "zh").strip().lower()
+        self.cjk = is_cjk_script(self.lang)
+        # ---- 目标语言字体族（跨平台候选链 + 显式覆盖）----
+        body_path, heading_path = langs.resolve_output_fonts(self.lang, cfg)
+        self.body_path = body_path or ""
+        self.heading_path = heading_path or self.body_path
+        # ---- 原文层字体（双语对照/保留原文段，Times 系含西里尔）----
+        self.en_body_path = cfg.get("en") or langs.resolve_original_font()
+        self.en_bold_path = self.en_body_path
 
         import pymupdf
-        self.f_body = pymupdf.Font(fontfile=self.body_path)   # 宋体正文
-        self.f_head = pymupdf.Font(fontfile=self.heading_path)  # 黑体标题
+        self.f_body = pymupdf.Font(fontfile=self.body_path)   # 宋体/Times
+        self.f_head = pymupdf.Font(fontfile=self.heading_path)  # 黑体/粗衬线
         self.f_en = pymupdf.Font(fontfile=self.en_body_path) \
             if self.en_body_path else pymupdf.Font("tiro")     # Times 兜底内置
-        self.f_en_bold = pymupdf.Font(fontfile=self.en_bold_path) \
-            if self.en_bold_path else self.f_en
+        self.f_en_bold = self.f_en
 
     def resolve(self, para: dict, body_size: float | None) -> "ParaStyle":
         """段落元数据 → 排版样式（期刊映射规则）。"""
@@ -109,7 +91,9 @@ class Typography:
         if _ABSTRACT_RE.match(txt) or _INDEX_TERMS_RE.match(txt):
             return ParaStyle("abstract", size=size * 0.95, indent=0, bold_lead=True)
 
-        return ParaStyle("body", size=size, indent=2)
+        # v0.4.2: 首行缩进 2 字符仅 CJK 目标语言（中文期刊惯例），
+        # 西文/西里尔按学术惯例顶格
+        return ParaStyle("body", size=size, indent=2 if self.cjk else 0)
 
 
 class ParaStyle:

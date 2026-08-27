@@ -144,12 +144,14 @@ class ValidateReq(BaseModel):
     api_key: str = ""
     base_url: str = ""
     model: str
+    target_lang: str = "zh"
 
 
 @app.post("/api/validate-key")
 def validate_key(req: ValidateReq):
     """发一条最小翻译请求验证连通性。key 打码时用存储的旧值。"""
     from translator.config import PRESETS
+    from translator.langs import prompt_lang_name
     p = PRESETS.get(req.provider, {})
     base_url = req.base_url or p.get("base_url", "")
     api_key = req.api_key
@@ -171,7 +173,8 @@ def validate_key(req: ValidateReq):
             model=req.model,
             messages=[
                 {"role": "system",
-                 "content": "Translate to Chinese. Output only translation."},
+                 "content": f"Translate to {prompt_lang_name(req.target_lang)}. "
+                            f"Output only the translation."},
                 {"role": "user", "content": "Hello."},
             ],
             max_tokens=50,
@@ -243,10 +246,14 @@ def glossary_save(req: GlossarySaveReq):
 def browse(path: str = "") -> dict:
     """列出目录内容（只读）。空路径从常用根开始。"""
     if not path:
-        # 常用起点：Windows 用户目录 / home / 各挂载盘（存在哪个用哪个）
+        # 常用起点：按存在性挑第一个（v0.4.2 修复：旧版 next(iter(...))
+        # 不检查存在性，原生 Windows 上拿到 /mnt/c/Users 直接 404，
+        # 文件浏览器打不开）
         candidates = ["/mnt/c/Users", str(Path.home())]
-        candidates += [f"/mnt/{c}" for c in "defghijkl" if Path(f"/mnt/{c}").exists()]
-        path = next(iter(candidates), str(Path.home()))
+        candidates += [f"/mnt/{c}" for c in "defghijkl"
+                       if Path(f"/mnt/{c}").exists()]
+        path = next((c for c in candidates if Path(c).is_dir()),
+                    str(Path.home()))
     p = Path(path).expanduser().resolve()
     if not p.exists():
         raise HTTPException(404, f"路径不存在: {p}")
@@ -266,3 +273,21 @@ def browse(path: str = "") -> dict:
         raise HTTPException(403, "无权限读取该目录")
     return {"path": str(p), "parent": str(p.parent) if p.parent != p else "",
             "entries": entries[:400]}
+
+
+# ---------- 输出文件预览 ----------
+@app.get("/api/output")
+def get_output(path: str, download: int = 0) -> FileResponse:
+    """输出 PDF 预览/下载。
+
+    v0.4.2：旧版完成链接用 file:// 协议，Chrome/Edge 从 http 页面点击
+    会被「Not allowed to load local resource」拦截——改为服务端转发，
+    浏览器内联预览或下载均可用。仅放行 .pdf（本地单用户工具，防误取）。
+    """
+    p = Path(path).expanduser()
+    if p.suffix.lower() != ".pdf" or not p.is_file():
+        raise HTTPException(404, f"输出文件不存在: {p}")
+    if download:
+        return FileResponse(p, media_type="application/pdf",
+                            filename=p.name)
+    return FileResponse(p, media_type="application/pdf")

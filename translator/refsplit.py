@@ -15,18 +15,28 @@ _ENTRY_TOKEN_RE = re.compile(r"^\[(\d+)\]$")
 def split_ref_blocks(page, blocks: list[dict]) -> list[dict]:
     """把块内嵌的多条参考文献按 [N] 行首边界拆成独立块。
 
-    触发条件：块文本含 \n[N] 行首模式（条目边界嵌在块中）。
+    触发条件：块文本含 \\n[N] 行首模式（条目边界嵌在块中）。
+
+    v0.4.2: 全页 words 至多取一次——旧版对每个待拆块各跑一次
+    clip 提取（参考文献页常有 10+ 个多条件目块 = 10+ 次全页词提取）。
     """
+    words: list | None = None   # 惰性：首个待拆块出现时才取全页词
     out: list[dict] = []
     for b in blocks:
         parts = _REF_SPLIT_RE.split(b["text"])
         if len(parts) <= 1:
             out.append(b)
             continue
+        if words is None:
+            words = page.get_text("words")
         # 该块区域内的全部词,找每个条目编号 token 的 y0
-        words = page.get_text("words", clip=b["bbox"])
+        bb = b["bbox"]
         entry_y: dict[int, float] = {}
         for w in words:
+            # 词与块 bbox 相交即属于该块（等价旧版 clip 语义）
+            if not (w[0] < bb.x1 and w[2] > bb.x0
+                    and w[1] < bb.y1 and w[3] > bb.y0):
+                continue
             m = _ENTRY_TOKEN_RE.match(w[4])
             if m:
                 n = int(m.group(1))

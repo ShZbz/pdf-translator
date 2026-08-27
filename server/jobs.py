@@ -75,6 +75,13 @@ class Job:
         self.output_path = ""
         self.error = ""
         self.created = time.time()
+        # v0.4.2: 进度/统计快照字段（UI 状态行与完成行展示用）
+        self.stage = ""             # layout / translate / render
+        self.progress: dict = {}    # {done, total, unit, calls?}
+        self.pages = 0
+        self.paragraphs = 0
+        self.calls = 0
+        self.elapsed = 0.0
         self._proc: subprocess.Popen | None = None
         self._stdin = None
         self._lock = threading.Lock()
@@ -123,12 +130,19 @@ class Job:
             pass
 
     def snapshot(self) -> dict:
-        return {
-            "id": self.id,
-            "status": self.status,
-            "output_path": self.output_path,
-            "error": self.error,
-        }
+        with self._lock:
+            return {
+                "id": self.id,
+                "status": self.status,
+                "output_path": self.output_path,
+                "error": self.error,
+                "stage": self.stage,
+                "progress": dict(self.progress) if self.progress else None,
+                "pages": self.pages,
+                "paragraphs": self.paragraphs,
+                "calls": self.calls,
+                "elapsed": self.elapsed,
+            }
 
     # ---- 内部 ----
     def _pump_events(self) -> None:
@@ -144,8 +158,18 @@ class Job:
                 continue
             kind = ev.get("kind")
             with self._lock:
-                if kind == "progress" and ev.get("unit") == "batch":
-                    pass   # 进度由 /api/jobs/{id} 直接读 events 快照
+                if kind == "stage":
+                    self.stage = ev.get("name", "")
+                    if self.stage:
+                        self.progress = {}     # 阶段切换，进度清零
+                elif kind == "progress":
+                    self.progress = {k: ev.get(k) for k in
+                                     ("done", "total", "unit", "calls")}
+                elif kind == "done":
+                    self.pages = ev.get("pages", 0)
+                    self.paragraphs = ev.get("paragraphs", 0)
+                    self.calls = ev.get("calls", 0)
+                    self.elapsed = ev.get("elapsed", 0.0)
                 elif kind == "exit":
                     code = ev.get("code", 1)
                     if ev.get("cancelled"):

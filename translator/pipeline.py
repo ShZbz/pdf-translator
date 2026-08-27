@@ -17,6 +17,7 @@ from .control import JobControl, JobCancelled
 from .events import EventSink
 from .glossary import Glossary
 from .layout import layout_page
+from .langs import output_tag
 from .llm import TranslationClient
 from .render import crop_formula_pixmaps, find_cjk_font, render_page
 
@@ -24,16 +25,28 @@ _VERBOSE_TS = False
 
 
 def _split_proportional(dst: str, ratio: float) -> tuple[str, str]:
-    """v0.2.3 跨页断句：合并译文按原文长度比例在词/标点边界切成两半。"""
+    """v0.2.3 跨页断句：合并译文按原文长度比例在词/标点边界切成两半。
+
+    v0.4.2: 单字符译文守卫——len(dst)==1 时 range(1,1) 为空，
+    min() 直接 ValueError（极端短译文整篇崩溃）。
+    """
     if ratio <= 0.0:
         return "", dst
     if ratio >= 1.0:
         return dst, ""
+    if len(dst) < 2:
+        return "", dst
     target = len(dst) * ratio
     best = min(range(1, len(dst)), key=lambda i: (
         abs(i - target)
         + (0 if i >= len(dst) or dst[i] in " ，。；：、）】 " else 5)))
     return dst[:best].rstrip(), dst[best:].lstrip()
+
+
+def output_pdf_name(stem: str, tgt_lang: str, bilingual: bool) -> str:
+    """输出文件名：{stem}[-bilingual]-{语言标记}.pdf（zh→-Zh 旧版兼容）。"""
+    suffix = "-bilingual" if bilingual else ""
+    return f"{stem}{suffix}-{output_tag(tgt_lang)}.pdf"
 
 
 def _log(msg: str) -> None:
@@ -59,10 +72,11 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     src = Path(cfg.io.input)
     out_dir = Path(cfg.io.output_dir or src.parent)
     out_dir.mkdir(parents=True, exist_ok=True)
-    suffix = "-bilingual" if cfg.features.bilingual else ""
-    out_path = out_dir / f"{src.stem}{suffix}-Zh.pdf"
+    tgt_lang = (cfg.io.target_lang or "zh").strip() or "zh"
+    out_path = out_dir / output_pdf_name(src.stem, tgt_lang,
+                                         cfg.features.bilingual)
 
-    font_path = find_cjk_font(cfg.fonts.get("cjk"))
+    font_path = find_cjk_font(cfg.fonts.get("cjk"), lang=tgt_lang)
     glossary = Glossary.load(cfg.glossary_file) if cfg.glossary_file else None
     cache = TranslationCache(out_dir / ".translation_cache.db") \
         if cfg.features.translation_cache else None
@@ -85,13 +99,24 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
              f"{wm_stats['annots_removed']} annots removed")
 
     # v0.2.2: 期刊级排版系统（宋体正文/黑体标题/Times 英文层）
+    # v0.4.2: 字体族按目标语言解析（langs.py），跨平台候选链
     from .typography import Typography
     typo = None
     if getattr(cfg.features, "preserve_formatting", True):
         try:
-            typo = Typography(cfg.fonts)
-            _log(f"typography: body={os.path.basename(typo.body_path)}, "
-                 f"heading={os.path.basename(typo.heading_path)}")
+            typo = Typography(cfg.fonts, lang=tgt_lang)
+            _log(f"typography: body={os.path.basename(typo.body_path) or '(builtin)'}, "
+                 f"heading={os.path.basename(typo.heading_path) or '(builtin)'}")
+            # 字形覆盖率校验（选到的字体缺目标语言字符 → 豆腐块预警）
+            from .langs import coverage_warnings, lang_info
+            for w in coverage_warnings(typo.f_body, tgt_lang):
+                _log(f"WARNING: {w}")
+                all_warnings.append(w)
+            if typo.heading_path != typo.body_path:
+                for w in coverage_warnings(typo.f_head, tgt_lang):
+                    _log(f"WARNING: {w}")
+                    all_warnings.append(w)
+            _log(f"target language: {tgt_lang} ({lang_info(tgt_lang).native})")
         except Exception as e:
             _log(f"typography init failed ({e}); fallback to single-font mode")
             typo = None
@@ -206,6 +231,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         sink.stage("translate")
         translated_flat, total_calls = tc.translate_paragraphs(all_flat, cache=cache)
         all_warnings.extend(tc.warnings)
+        cell_translations = translated_flat[len(merge_groups):]
 
         # D4 译后校验（glossary_lock）——只校验单段单元（合并单元跳过）
         if glossary and cfg.features.glossary_lock:
@@ -239,9 +265,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 pno_b, [None] * len(page_layouts[pno_b]["paragraphs"]))
             texts_by_page[pno_a][pi_a] = part_a
             texts_by_page[pno_b][pi_b] = part_b
-        for pno, ci in cell_pending:
-            cell_texts[(pno, ci)] = translated_flat[len(merge_groups)
-                                                    + cell_pending.index((pno, ci))]
+        for ci, dst in enumerate(cell_translations):
+            cell_texts[cell_pending[ci]] = dst
 
     # ---- 渲染回灌 ----
     if control:
