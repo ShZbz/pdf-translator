@@ -90,7 +90,10 @@ try:
     client = None
     if base_url:
         from openai import OpenAI
-        client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop")
+        # v0.5.1: 超时透传——旧版不传 timeout（SDK 默认 600s），UI 里
+        # 配的「请求超时」对 UI 任务不生效，只有 validate-key 用自己的 15s
+        client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop",
+                        timeout=float(getattr(cfg.llm, "timeout", 120.0)))
     stats = translate_document(cfg, client=client, sink=sink, control=control)
     flush({{"kind": "exit", "code": 0, "output": stats["output"],
             "pages": stats["pages"], "calls": stats["calls"]}})
@@ -107,19 +110,25 @@ class Job:
     """单个翻译任务的句柄。"""
 
     def __init__(self, job_id: str, config_path: str,
-                 created: float | None = None):
+                 created: float | None = None,
+                 input_path: str = "", output_dir: str = ""):
         self.id = job_id
         self.config_path = config_path
         self.status = "queued"      # queued/running/paused/done/cancelled/error
         self.output_path = ""
         self.error = ""
         self.created = created if created is not None else time.time()
+        # v0.5.1: 历史面板字段——config_path 终态即删（临时文件清理），
+        # 重跑/展示所需的输入输出路径在提交时就快照进 Job
+        self.input_path = input_path
+        self.output_dir = output_dir
         # v0.4.2: 进度/统计快照字段（UI 状态行与完成行展示用）
         self.stage = ""             # layout / translate / render
         self.progress: dict = {}    # {done, total, unit, calls?}
         self.pages = 0
         self.paragraphs = 0
         self.calls = 0
+        self.cache_hits = 0         # v0.5.1: 缓存命中段数（节省报表）
         self.elapsed = 0.0
         self.warnings: list[str] = []   # v0.5.0: 最近 N 条管线警告
         self._proc: subprocess.Popen | None = None
@@ -148,6 +157,7 @@ class Job:
                 self.pages = ev.get("pages", 0)
                 self.paragraphs = ev.get("paragraphs", 0)
                 self.calls = ev.get("calls", 0)
+                self.cache_hits = ev.get("cache_hits", 0)
                 self.elapsed = ev.get("elapsed", 0.0)
             elif kind == "exit":
                 code = ev.get("code", 1)
@@ -225,9 +235,12 @@ class Job:
                 "pages": self.pages,
                 "paragraphs": self.paragraphs,
                 "calls": self.calls,
+                "cache_hits": self.cache_hits,
                 "elapsed": self.elapsed,
                 "created": round(self.created, 3),
                 "config_path": self.config_path,
+                "input": self.input_path,
+                "output_dir": self.output_dir,
                 "warnings": list(self.warnings),   # v0.5.0: 最近警告
             }
 
@@ -309,6 +322,15 @@ class JobManager:
         self.store = store
         # v0.5.0: SSE 订阅者（queue.SimpleQueue，事件泵线程生产）
         self._listeners: set["queue.SimpleQueue"] = set()
+        # v0.5.1: 事件 id 日志（SSE Last-Event-ID 断线续传重放源）。
+        # 有界环形（1000 条）：浏览器 EventSource 自动重连时携带
+        # Last-Event-ID 请求头，服务端按 id 补发错过的事件帧。
+        # 独立锁：_broadcast 可能被持 manager 锁的 submit 调用，
+        # 与 manager 锁复用会死锁（非重入）
+        self._elog_lock = threading.Lock()
+        self._event_seq = 0
+        self._event_log: list[tuple[int, dict]] = []
+        self._EVENT_LOG_CAP = 1000
         if store is not None:
             self._restore_from_store()
 
@@ -331,7 +353,9 @@ class JobManager:
             unfinished = []
         for i, snap in enumerate(unfinished):
             cfgp = snap.get("config_path") or ""
-            job = Job(snap["id"], cfgp, created=snap.get("created"))
+            job = Job(snap["id"], cfgp, created=snap.get("created"),
+                      input_path=snap.get("input") or "",
+                      output_dir=snap.get("output_dir") or "")
             if not cfgp or not Path(cfgp).is_file():
                 job.status = "error"
                 job.error = "config file missing after restart"
@@ -388,7 +412,20 @@ class JobManager:
         except ValueError:
             return None
 
-    def _broadcast(self, payload: dict) -> None:
+    def _broadcast(self, payload: dict) -> tuple[int, dict]:
+        """广播一帧事件：推给所有订阅队列 + 记入有界 id 日志。
+
+        返回 (事件 id, payload)并把 eid 注入 payload——SSE 端据此发
+        `id:` 帧，断线重连的 EventSource 凭 Last-Event-ID 请求头从
+        日志补发错过的事件。
+        """
+        with self._elog_lock:
+            self._event_seq += 1
+            eid = self._event_seq
+            payload = dict(payload, eid=eid)
+            self._event_log.append((eid, payload))
+            if len(self._event_log) > self._EVENT_LOG_CAP:
+                self._event_log = self._event_log[-self._EVENT_LOG_CAP:]
         dead = []
         for q in list(self._listeners):
             try:
@@ -397,6 +434,12 @@ class JobManager:
                 dead.append(q)
         for q in dead:
             self._listeners.discard(q)
+        return eid, payload
+
+    def events_after(self, last_id: int) -> list[tuple[int, dict]]:
+        """SSE Last-Event-ID 重放：返回 id 大于 last_id 的日志帧。"""
+        with self._elog_lock:
+            return [(eid, p) for eid, p in self._event_log if eid > last_id]
 
     def subscribe(self) -> "queue.SimpleQueue":
         q = queue.SimpleQueue()
@@ -419,13 +462,15 @@ class JobManager:
             }
 
     # ---- 提交/查询/控制 ----
-    def submit(self, config_path: str) -> dict:
+    def submit(self, config_path: str, input_path: str = "",
+               output_dir: str = "") -> dict:
         with self._lock:
             busy = self.job is not None and self.job.status not in _TERMINAL
             if busy and len(self.queue) >= MAX_QUEUE:
                 return {"ok": False,
                         "error": f"队列已满（{MAX_QUEUE} 个排队任务）"}
-            job = Job(uuid.uuid4().hex[:12], config_path)
+            job = Job(uuid.uuid4().hex[:12], config_path,
+                      input_path=input_path, output_dir=output_dir)
             job.on_terminal = self._on_terminal
             job.on_event = self._on_job_event
             if busy:

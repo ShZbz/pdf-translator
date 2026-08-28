@@ -280,6 +280,48 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
 .browse-actions .primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
 .browse-actions button:hover { filter:brightness(1.15); }
 
+/* 历史面板（v0.5.1） */
+.hist-list { display:flex; flex-direction:column; gap:8px; }
+.hist-item {
+  border:0.8px solid var(--glass-border); border-radius:12px; padding:10px 12px;
+  background:rgba(127,127,127,0.08); font-size:12.5px;
+}
+.hist-top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.hist-file { font-weight:600; font-size:12.5px; flex:1; min-width:0;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.hist-badge { font-size:11px; padding:2px 8px; border-radius:8px; flex:none; }
+.hist-badge.done { background:rgba(126,216,143,.15); color:#7ed88f; }
+.hist-badge.error { background:rgba(231,76,60,.15); color:#ff9a8b; }
+.hist-badge.cancelled { background:rgba(149,165,166,.18); color:var(--text-dim); }
+.hist-meta { color:var(--text-dim); font-size:11.5px; margin-top:4px;
+  display:flex; gap:10px; flex-wrap:wrap; }
+.hist-actions { display:flex; gap:6px; margin-top:8px; }
+.hist-actions button {
+  padding:5px 12px; font-size:12px; cursor:pointer; border-radius:8px;
+  border:0.8px solid var(--glass-border); background:rgba(127,127,127,0.12);
+  color:var(--text); transition:all .2s;
+}
+.hist-actions button:hover { background:rgba(127,127,127,0.24); }
+.hist-warns { margin-top:8px; max-height:150px; overflow-y:auto;
+  color:#e8a33d; font-size:11.5px; line-height:1.6; word-break:break-all;
+  border-top:0.8px dashed var(--glass-border); padding-top:6px; }
+.hist-empty { color:var(--text-dim); font-size:13px; text-align:center;
+  padding:30px 0; }
+
+/* 左下角历史按钮 */
+.hist-btn {
+  position:fixed; left:82px; bottom:22px; z-index:10;
+  width:48px; height:48px; border-radius:50%; cursor:pointer;
+  background:var(--glass-bg); backdrop-filter:blur(30px);
+  border:0.8px solid var(--glass-border);
+  box-shadow:var(--shadow), inset 0 1px 0 var(--glass-highlight);
+  display:flex; align-items:center; justify-content:center; font-size:19px;
+  transition:all .35s var(--spring);
+}
+.hist-btn:hover { transform:scale(1.1); }
+.hist-btn svg { width:20px; height:20px; fill:var(--text-dim); transition:fill .3s; }
+.hist-btn:hover svg { fill:var(--text); }
+
 /* toast */
 .toast {
   position:fixed; top:26px; left:50%; transform:translate(-50%,-70px); z-index:200;
@@ -312,7 +354,7 @@ body.dragging::after {
 <!-- 主卡片 -->
 <div class="card">
   <h1>PDF 翻译器</h1>
-  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.5.0</div>
+  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.5.1</div>
 
   <div class="field">
     <input type="text" id="inputPath" placeholder="翻译原文件路径 (.pdf)" spellcheck="false">
@@ -345,6 +387,21 @@ body.dragging::after {
 <button class="gear" id="btnSettings" title="设置">
   <svg viewBox="0 0 24 24"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>
 </button>
+
+<!-- 左下角历史（v0.5.1） -->
+<button class="hist-btn" id="btnHistory" title="任务历史">
+  <svg viewBox="0 0 24 24"><path d="M13,3c-4.97,0-9,4.03-9,9H1l3.89,3.89l0.07,0.14L9,12H6c0-3.87,3.13-7,7-7s7,3.13,7,7s-3.13,7-7,7 c-1.93,0-3.68-0.79-4.94-2.06l-1.42,1.42C8.27,19.99,10.51,21,13,21c4.97,0,9-4.03,9-9S17.97,3,13,3z M12,8v5l4.28,2.54l0.72-1.21 l-3.5-2.08V8H12z"/></svg>
+</button>
+
+<!-- 历史模态（v0.5.1） -->
+<div class="modal-backdrop" id="historyBackdrop"></div>
+<div class="modal" id="historyModal" style="width:min(600px,calc(100vw - 36px))">
+  <div class="modal-head"><h2>任务历史</h2>
+    <button class="modal-close" id="closeHistory">关闭 ✕</button></div>
+  <div class="modal-body">
+    <div class="hist-list" id="histList"></div>
+  </div>
+</div>
 
 <!-- 设置模态 -->
 <div class="modal-backdrop" id="settingsBackdrop"></div>
@@ -413,10 +470,10 @@ body.dragging::after {
           <option value="inplace">原位回贴（实验）</option>
         </select></div>
       <div class="set-row"><label>渲染引擎
-        <span class="hint">writer=逐字排印（稳）；htmlbox=HTML+CSS 排版引擎（v0.5.0 实验性，自带两端对齐/复杂文字整形）</span></label>
-        <select id="cfg-renderer" style="width:160px;">
-          <option value="writer">TextWriter（默认）</option>
-          <option value="htmlbox">insert_htmlbox（实验）</option>
+        <span class="hint">htmlbox=HTML+CSS 排版引擎（v0.5.1 起默认，自带两端对齐/复杂文字整形，支持阿拉伯语等 RTL）；writer=逐字排印（遗留路径）</span></label>
+        <select id="cfg-renderer" style="width:170px;">
+          <option value="htmlbox">insert_htmlbox（默认）</option>
+          <option value="writer">TextWriter（遗留）</option>
         </select></div>
     </div>
 
@@ -537,10 +594,12 @@ function toast(msg, isErr=false) {
 /* ---------- 设置 ---------- */
 const PROVIDERS = ['deepseek','zhipu','gemini','siliconflow','openai','ollama','lmstudio'];
 // v0.4.2: 多语言（源/目标共用清单；输出排版按目标语言选字体，见 translator/langs.py）
+// v0.5.1: 解锁 RTL（阿拉伯语/希伯来语）与天城文（印地语）——htmlbox 引擎整形
 const LANGS = [
   ['en','English'], ['zh','中文（简体）'], ['ja','日本語'], ['ko','한국어'],
   ['de','Deutsch'], ['fr','Français'], ['es','Español'], ['it','Italiano'],
   ['pt','Português'], ['ru','Русский'], ['tr','Türkçe'], ['vi','Tiếng Việt'],
+  ['ar','العربية (RTL)'], ['he','עברית (RTL)'], ['hi','हिन्दी'],
 ];
 let CFG = {};
 
@@ -572,7 +631,7 @@ async function loadConfig() {
     $('cfg-formatting').checked = (CFG.features||{}).preserve_formatting !== false;
     $('cfg-watermark').checked = (CFG.features||{}).watermark_removal !== false;
     $('cfg-bilingual').checked = !!(CFG.features||{}).bilingual;
-    $('cfg-renderer').value = (CFG.features||{}).renderer || 'writer';
+    $('cfg-renderer').value = (CFG.features||{}).renderer || 'htmlbox';
     $('cfg-ocrmode').value = (CFG.ocr||{}).mode || 'appendix';
     $('cfg-cache').checked = (CFG.features||{}).translation_cache !== false;
     $('cfg-glosslock').checked = (CFG.features||{}).glossary_lock !== false;
@@ -624,7 +683,7 @@ function collectConfig() {
       glossary_lock: $('cfg-glosslock').checked,
       translation_cache: $('cfg-cache').checked,
       bilingual: $('cfg-bilingual').checked,
-      renderer: $('cfg-renderer').value || 'writer',
+      renderer: $('cfg-renderer').value || 'htmlbox',
     },
     glossary_file: $('cfg-glossary').value.trim(),
     performance: {
@@ -665,6 +724,8 @@ $('btnTestKey').onclick = async () => {
       provider: cfgNow.provider, model: cfgNow.model || 'deepseek-chat',
       api_key: cfgNow.api_key, base_url: cfgNow.base_url,
       target_lang: $('cfg-tgtlang').value,
+      // v0.5.1: 与翻译任务共用超时/重试（慢模型 15s 必超时误报 key 无效）
+      timeout: cfgNow.timeout, max_retries: cfgNow.max_retries,
     })});
     if (r.ok) {
       el.style.color = '#7ed88f';
@@ -938,6 +999,11 @@ function updateProgressUI(j) {
     const st = [];
     if (j.pages) st.push(`${j.pages} 页`);
     if (j.calls != null) st.push(`${j.calls} 次调用`);
+    // v0.5.1: 缓存节省报表（命中段折算批次数）
+    if (j.cache_hits > 0) {
+      st.push(`缓存命中 ${j.cache_hits} 段`);
+      if (j.cache_saved_calls > 0) st.push(`省约 ${j.cache_saved_calls} 次调用`);
+    }
     if (j.elapsed) st.push(`${j.elapsed}s`);
     $('doneStats').textContent = st.length ? `（${st.join(' · ')}）` : '';
     $('statusLine').textContent = '✅ 完成';
@@ -1041,6 +1107,91 @@ $('btnPause').onclick = async () => {
   refreshJob();
 };
 $('btnCancel').onclick = cancelCurrent;
+
+/* ---------- 任务历史（v0.5.1：数据在 SQLite 与 /api/jobs，前端列表视图） ---------- */
+const HIST_STATUS = { done: '✓ 完成', error: '✗ 失败', cancelled: '已取消' };
+
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function openHistory() {
+  openModal($('historyModal'), $('historyBackdrop'));
+  const host = $('histList');
+  host.innerHTML = '<div class="hist-empty">加载中…</div>';
+  let d;
+  try { d = await api('/api/jobs'); }
+  catch (e) { host.innerHTML = `<div class="hist-empty">${e.message}</div>`; return; }
+  const hist = d.history || [];
+  if (!hist.length) {
+    host.innerHTML = '<div class="hist-empty">暂无历史任务</div>';
+    return;
+  }
+  host.innerHTML = '';
+  hist.forEach(h => host.appendChild(renderHistItem(h)));
+}
+
+function renderHistItem(h) {
+  const it = document.createElement('div');
+  it.className = 'hist-item';
+  const file = (h.input || '').split(/[\\/]/).pop() || h.input || '(未知输入)';
+  const warns = h.warnings || [];
+  const meta = [];
+  if (h.pages) meta.push(`${h.pages} 页`);
+  if (h.calls != null) meta.push(`${h.calls} 次调用`);
+  if (h.cache_hits > 0) {
+    meta.push(`缓存命中 ${h.cache_hits} 段`);
+    if (h.cache_saved_calls > 0) meta.push(`省约 ${h.cache_saved_calls} 次`);
+  }
+  if (h.elapsed) meta.push(`${h.elapsed}s`);
+  meta.push(fmtTime(h.created));
+  it.innerHTML = `
+    <div class="hist-top">
+      <span class="hist-file" title="${h.input || ''}">${file}</span>
+      <span class="hist-badge ${h.status}">${HIST_STATUS[h.status] || h.status}</span>
+    </div>
+    ${h.error ? `<div class="hist-meta" style="color:#ff9a8b;">${h.error}</div>` : ''}
+    <div class="hist-meta"><span>${meta.join(' · ')}</span></div>
+    <div class="hist-actions">
+      ${h.input ? '<button data-act="rerun">↻ 重跑</button>' : ''}
+      ${h.output_path ? '<button data-act="open">📄 打开输出</button>' : ''}
+      ${warns.length ? `<button data-act="warns">⚠ 警告 (${warns.length})</button>` : ''}
+    </div>
+    <div class="hist-warns" style="display:none;">${
+      warns.map(w => `<div>⚠ ${w}</div>`).join('')}</div>`;
+  const btnRerun = it.querySelector('[data-act=rerun]');
+  if (btnRerun) btnRerun.onclick = async () => {
+    // 重跑：沿用历史任务的输入/输出目录 + 当前 UI 配置（模型/语言等）
+    try {
+      await saveConfigSilent();
+      const r = await api('/api/translate', {method: 'POST', body: JSON.stringify({
+        input: h.input, output_dir: h.output_dir || '', config: CFG,
+      })});
+      closeModal($('historyModal'), $('historyBackdrop'));
+      $('inputPath').value = h.input;
+      if (h.output_dir) $('outputDir').value = h.output_dir;
+      toast(r.queued ? '已加入队列（重跑）' : '重跑已启动');
+      startPolling();
+    } catch (e) { toast(e.message, true); }
+  };
+  const btnOpen = it.querySelector('[data-act=open]');
+  if (btnOpen) btnOpen.onclick = () => {
+    window.open('/api/output?path=' + encodeURIComponent(h.output_path), '_blank');
+  };
+  const btnWarns = it.querySelector('[data-act=warns]');
+  if (btnWarns) btnWarns.onclick = () => {
+    const el = it.querySelector('.hist-warns');
+    el.style.display = el.style.display === 'none' ? 'block' : 'none';
+  };
+  return it;
+}
+
+$('btnHistory').onclick = openHistory;
+$('closeHistory').onclick = () => closeModal($('historyModal'), $('historyBackdrop'));
+$('historyBackdrop').onclick = () => closeModal($('historyModal'), $('historyBackdrop'));
 
 /* ---------- 拖放 ---------- */
 ['dragenter','dragover'].forEach(ev =>

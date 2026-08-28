@@ -61,6 +61,7 @@ class TranslationClient:
         self._fb_idx = 0
         self.calls_used = 0          # 实际发出的 API 请求数（含失败，报告用）
         self.api_ok_calls = 0        # 收到可用响应的调用数（预算记账用）
+        self.cache_hits = 0          # v0.5.1: 缓存命中段数（文档级节省报表）
         self.warnings: list[str] = []
         # ---- 并发基础设施 ----
         self._lock = threading.Lock()          # 保护计数器/warnings
@@ -250,11 +251,14 @@ class TranslationClient:
 
     # ---- 单批完整流程（worker 入口）----
     def _guarded_batch(self, batch_idx: list[int],
-                       paras: list[str]) -> tuple[list[int], dict[int, str] | None]:
+                       paras: list[str]) -> tuple[list[int], dict[int, str] | None, str]:
         """并发模式下的 worker 包装：取消/暂停检查点 + 异常隔离。
 
         取消时返回 None（已发车的批自然跑完，未发车的批放弃——
         与触顶放弃语义一致）；其他异常不炸线程池，按失败批降级。
+        v0.5.1: 返回值追加本批实际使用的模型名（fallback 链切换后
+        self.model 会漂移，缓存 key 必须用翻译时点的模型快照——
+        旧版用写缓存时点的 self.model，m1 译文可能落到 m2 的 key 下）。
         """
         try:
             if self.control is not None:
@@ -268,14 +272,15 @@ class TranslationClient:
             raise
         except Exception as e:   # 防御：worker 内异常不炸线程池
             self._warn(f"batch worker exception: {e}")
-            return batch_idx, None
+            return batch_idx, None, self.model
 
     def _process_batch(self, batch_idx: list[int],
-                       paras: list[str]) -> tuple[list[int], dict[int, str] | None]:
-        """返回 (batch_idx, {全局段索引: 译文} 或 None=失败)。"""
+                       paras: list[str]) -> tuple[list[int], dict[int, str] | None, str]:
+        """返回 (batch_idx, {全局段索引: 译文} 或 None=失败, 本批模型)。"""
         batch = {str(j + 1): paras[j] for j in batch_idx}
         got = None
         prev_fail_transport = False
+        model_used = self.model   # v0.5.1: 本批模型快照（fallback 切换防串 key）
         # v0.2.2: while 循环替代 for——链式切换(m1→m2→m3)需要重置 attempt,
         # for 迭代器不受循环体内赋值影响,attempt-=1 是无效操作（实测教训）
         # v0.2.3: 重试次数上限 max_retries 可配（1=不重试）
@@ -285,12 +290,14 @@ class TranslationClient:
                             prev_fail_transport=prev_fail_transport)
             if got is not None and all(
                     self.formula_counts_ok(batch[k], got[k]) for k in batch):
+                model_used = self.model
                 break
             if got is None and attempt == 1 and self._last_daily_quota:
                 # 日配额耗尽:切 fallback 模型后本批立即用新模型重试。
                 # 切换成功则 attempt 重置（新模型配额独立,值得完整重试对）;
                 # 切换失败（未配置/链尽）→ 正常走退避重试路径。
                 if self._switch_to_fallback():
+                    model_used = self.model
                     attempt = 1
                     continue
             got = None
@@ -302,14 +309,14 @@ class TranslationClient:
             ids = ", ".join(f"#{k}:{batch[k][:30]!r}" for k in batch)
             self._warn(
                 f"batch failed after retry, keep source: [{ids}]")
-            return batch_idx, None
+            return batch_idx, None, model_used
         with self._lock:
             self._batches_ok += 1
         if self.sink is not None:
             self.sink.batch_done(self._batches_ok, self._batches_total,
                                  self.calls_used)
         out = {j: got[str(j + 1)] for j in batch_idx}
-        return batch_idx, out
+        return batch_idx, out, model_used
 
     def _pack_batches(self, miss: list[int],
                       paras: list[str]) -> list[list[int]]:
@@ -358,6 +365,7 @@ class TranslationClient:
                     self.src_lang, self.tgt_lang, t))
                 if hit is not None:
                     results[i] = hit
+                    self.cache_hits += 1
                     continue
             miss.append(i)
 
@@ -377,14 +385,14 @@ class TranslationClient:
                 futures = [pool.submit(self._guarded_batch, b, paras)
                            for b in batches]
                 for fut in futures:
-                    batch_idx, out = fut.result()
+                    batch_idx, out, model_used = fut.result()
                     if out is None:
                         continue
                     for j, dst in out.items():
                         results[j] = dst
                         if cache is not None:
                             cache.put(cache.make_key(
-                                "openai-compat", self.model,
+                                "openai-compat", model_used,
                                 self.src_lang, self.tgt_lang, paras[j]),
                                 paras[j], dst)
         else:
@@ -394,14 +402,14 @@ class TranslationClient:
                 # v0.5.0: 串行路径与并发路径同走 _guarded_batch——旧版直接调
                 # _process_batch，worker 内意外异常（如极端内容的序列化失败）
                 # 会炸掉整个任务；并发路径本就有隔离，两路径行为对齐
-                batch_idx, out = self._guarded_batch(b, paras)
+                batch_idx, out, model_used = self._guarded_batch(b, paras)
                 if out is None:
                     continue
                 for j, dst in out.items():
                     results[j] = dst
                     if cache is not None:
                         cache.put(cache.make_key(
-                            "openai-compat", self.model,
+                            "openai-compat", model_used,
                             self.src_lang, self.tgt_lang, paras[j]),
                             paras[j], dst)
 

@@ -888,6 +888,11 @@ def external_layout_regions(page) -> dict | None:
     区域分类按 kind 字段防御式归一（int/str 都接受，子串匹配）：
     figure/image/picture → 图区；table → 表区；formula/equation/math →
     公式区；text/title/list/code/header/footer 等文本类不产出保护区。
+
+    v0.5.1 实装修复：pymupdf-layout 1.28.x 的 layout_information 条目是
+    [x0, y0, x1, y1, kind] 五元组列表——旧适配层按 [bbox, kind] 二元组
+    解读，bbox 取到 float（pymupdf.Rect(72.0) 直接断言崩溃）、kind 取到
+    y 坐标数字。装包后启用该引擎会炸 layout_page；现在按元素形态分发。
     """
     try:
         import pymupdf.layout  # noqa: F401  (注册 _get_layout 钩子)
@@ -902,11 +907,16 @@ def external_layout_regions(page) -> dict | None:
     tables: list[pymupdf.Rect] = []
     formulas: list[pymupdf.Rect] = []
     for it in items:
-        bbox = getattr(it, "bbox", None) or (it[0] if isinstance(it, (list, tuple))
-                                             and len(it) >= 2 else None)
-        kind = getattr(it, "kind", None)
-        if kind is None and isinstance(it, (list, tuple)) and len(it) >= 2:
-            kind = it[1]
+        if isinstance(it, (list, tuple)) and len(it) >= 5 \
+                and isinstance(it[-1], str) \
+                and all(isinstance(v, (int, float)) for v in it[:4]):
+            bbox, kind = it[:4], it[-1]       # 1.28.x: [x0,y0,x1,y1,kind]
+        else:
+            bbox = getattr(it, "bbox", None) or (
+                it[0] if isinstance(it, (list, tuple)) and len(it) >= 2 else None)
+            kind = getattr(it, "kind", None)
+            if kind is None and isinstance(it, (list, tuple)) and len(it) >= 2:
+                kind = it[1]
         if bbox is None or kind is None:
             continue
         k = str(kind).strip().lower()

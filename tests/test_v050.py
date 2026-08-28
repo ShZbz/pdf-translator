@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 import types
 from pathlib import Path
@@ -486,8 +487,10 @@ def test_sse_endpoint_streams_initial_state(tmp_path, monkeypatch):
     resp, it, frame = asyncio.run(_first_frame())
     if isinstance(frame, bytes):
         frame = frame.decode("utf-8")
-    assert frame.startswith("data: ")
-    payload = _json.loads(frame[6:])
+    # v0.5.1: 帧契约加 id 行（Last-Event-ID 断线续传重放的定位依据）
+    m = re.match(r"id: (\d+)\ndata: ", frame)
+    assert m, f"frame missing id/data lines: {frame!r}"
+    payload = _json.loads(frame[m.end():])
     assert payload["kind"] == "state"
     assert "current" in payload and "queue_len" in payload
     # 心跳/后续帧不炸（再读一帧后主动终止，finally 退订）

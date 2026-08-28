@@ -8,8 +8,10 @@
   Windows 上"no CJK font found"整体崩溃的根因（v0.4.1 实测）。
 - 输出文件名后缀：-{Tag}.pdf（zh→Zh 保持旧版兼容）。
 
-不支持 RTL（阿拉伯语/希伯来语）与需要复杂整形的天城文：TextWriter 逐字
-排印无法做双向/shaping，输出会不可读——注册表不收录，避免用户踩坑。
+v0.5.1: 解锁 RTL（阿拉伯语/希伯来语）与天城文（印地语）——htmlbox
+渲染引擎（insert_htmlbox，Story 内核）自带双向排版与复杂文字整形，
+RTL 语言注入 direction:rtl 即可正确成形；writer 逐字排印路径不支持，
+pipeline 会在目标语言为 RTL/天城文时强制切换到 htmlbox。
 """
 from __future__ import annotations
 
@@ -25,10 +27,11 @@ class LangInfo:
     code: str
     name: str                 # LLM 提示词用英文全名
     native: str               # UI 显示名
-    script: str               # "cjk" | "latin" | "cyrillic"
+    script: str               # "cjk" | "latin" | "cyrillic" | "arabic" | "hebrew" | "indic"
     sample: str               # 字形覆盖率校验样本（含该语言特有字符）
     body: tuple[str, ...] = ()     # 正文字体候选文件名（按优先级）
     heading: tuple[str, ...] = ()  # 标题字体候选
+    rtl: bool = False              # v0.5.1: RTL 书写方向（htmlbox direction:rtl）
 
 
 LANGUAGES: dict[str, LangInfo] = {
@@ -73,6 +76,26 @@ LANGUAGES: dict[str, LangInfo] = {
                    _LATIN_BODY, _LATIN_HEADING),
     "vi": LangInfo("vi", "Vietnamese", "Tiếng Việt", "latin", "ầơn Aa",
                    _LATIN_BODY, _LATIN_HEADING),
+    # ---- v0.5.1: RTL/天城文解锁（htmlbox Story 引擎自带 shaping/bidi；
+    # writer 逐字排印无法成形，pipeline 会强制切到 htmlbox）----
+    "ar": LangInfo("ar", "Arabic", "العربية", "arabic", "مرحبا تجربة",
+                   ("arial.ttf", "times.ttf", "NotoNaskhArabic-Regular.ttf",
+                    "NotoSansArabic-Regular.ttf", "Amiri-Regular.ttf"),
+                   ("arialbd.ttf", "timesbd.ttf", "NotoSansArabic-Bold.ttf",
+                    "Amiri-Bold.ttf"),
+                   rtl=True),
+    "he": LangInfo("he", "Hebrew", "עברית", "hebrew", "שלום בדיקה",
+                   ("arial.ttf", "times.ttf", "NotoSansHebrew-Regular.ttf",
+                    "DavidCLM-Medium.ttf"),
+                   ("arialbd.ttf", "timesbd.ttf", "NotoSansHebrew-Bold.ttf",
+                    "DavidCLM-Bold.ttf"),
+                   rtl=True),
+    "hi": LangInfo("hi", "Hindi", "हिन्दी", "indic", "हिन्दी परीक्षण",
+                   ("nirmala.ttf", "mangal.ttf",
+                    "NotoSansDevanagari-Regular.ttf",
+                    "NotoSerifDevanagari-Regular.ttf"),
+                   ("NotoSansDevanagari-Bold.ttf", "nirmalab.ttf", "nirmala.ttf",
+                    "NotoSerifDevanagari-Bold.ttf")),
 }
 
 # ---- 字体目录解析（平台无关，存在性过滤）----
@@ -155,6 +178,11 @@ def lang_info(code: str) -> LangInfo:
 
 def is_cjk_script(code: str) -> bool:
     return lang_info(code).script == "cjk"
+
+
+def is_rtl(code: str) -> bool:
+    """v0.5.1: RTL 书写方向（阿拉伯语/希伯来语）。"""
+    return lang_info(code).rtl
 
 
 def prompt_lang_name(code: str) -> str:

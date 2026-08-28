@@ -24,16 +24,20 @@ from translator.wrap_mixed import _has_latin, _tokenize, wrap_mixed
 # ---------- 注册表完整性 ----------
 
 def test_languages_registry_structure():
-    """12 门语言元数据齐全；脚本/名称唯一；RTL 语言明确不收录。"""
-    assert len(LANGUAGES) >= 12
+    """15 门语言元数据齐全；脚本/名称唯一；v0.5.1 起 RTL/天城文收录
+    （htmlbox 渲染引擎自带 shaping/bidi，writer 路径由 pipeline 强制切换）。"""
+    assert len(LANGUAGES) >= 15
     codes = set(LANGUAGES)
     assert {"zh", "en", "ja", "ko", "de", "fr", "es", "it", "pt",
-            "ru", "tr", "vi"} <= codes
-    assert "ar" not in codes and "he" not in codes and "hi" not in codes
+            "ru", "tr", "vi", "ar", "he", "hi"} <= codes
     names = [v.name for v in LANGUAGES.values()]
     assert len(names) == len(set(names))          # LLM 提示名唯一
+    for code in ("ar", "he"):
+        assert LANGUAGES[code].rtl is True       # RTL 书写方向标记
+    assert LANGUAGES["hi"].rtl is False
     for info in LANGUAGES.values():
-        assert info.script in ("cjk", "latin", "cyrillic")
+        assert info.script in ("cjk", "latin", "cyrillic", "arabic",
+                               "hebrew", "indic")
         assert info.sample.strip()
         assert info.body and info.heading
 

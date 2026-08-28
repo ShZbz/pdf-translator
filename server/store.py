@@ -38,13 +38,29 @@ CREATE TABLE IF NOT EXISTS jobs (
 )
 """
 
+# v0.5.1 新增列（历史面板：重跑要 input/output_dir，看警告要 warnings，
+# 缓存报表要 cache_hits）。CREATE TABLE IF NOT EXISTS 不会给旧库加列，
+# 启动时 PRAGMA 探测 + ALTER TABLE 增量迁移。
+_SCHEMA_MIGRATIONS = (
+    ("input", "TEXT DEFAULT ''"),
+    ("output_dir", "TEXT DEFAULT ''"),
+    ("warnings", "TEXT DEFAULT '[]'"),
+    ("cache_hits", "INTEGER DEFAULT 0"),
+)
+
 _SNAP_COLS = ("id", "status", "config_path", "output_path", "error", "stage",
-              "pages", "paragraphs", "calls", "elapsed", "created")
+              "pages", "paragraphs", "calls", "elapsed", "created",
+              "input", "output_dir", "warnings", "cache_hits")
 
 # SELECT 列序（_row_to_snap 按此取列；progress 是 JSON 列，单独处理）
 _SELECT_COLS = ("id", "status", "config_path", "output_path", "error",
                 "stage", "progress", "pages", "paragraphs", "calls",
-                "elapsed", "created", "updated", "seq")
+                "elapsed", "created", "updated", "seq",
+                "input", "output_dir", "warnings", "cache_hits")
+
+_SELECT_SQL = ("SELECT id,status,config_path,output_path,error,stage,progress,"
+               "pages,paragraphs,calls,elapsed,created,updated,seq,"
+               "input,output_dir,warnings,cache_hits FROM jobs")
 
 
 class JobStore:
@@ -55,23 +71,36 @@ class JobStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute(_SCHEMA)
+        self._migrate()
         self._conn.commit()
         self._lock = threading.Lock()
+
+    def _migrate(self) -> None:
+        """v0.5.1: 旧库增量加列（无 ALTER 副作用，幂等）。"""
+        have = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+        for col, decl in _SCHEMA_MIGRATIONS:
+            if col not in have:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
 
     def upsert(self, snap: dict, seq: int | None = None) -> None:
         """写入任务快照（snapshot 字段 → 行）。seq=排队顺序，NULL=非排队态。"""
         prog = snap.get("progress")
+        warnings = snap.get("warnings") or []
         row = (snap.get("id"), snap.get("status"), snap.get("config_path"),
                snap.get("output_path") or "", snap.get("error") or "",
                snap.get("stage") or "", json.dumps(prog) if prog else "",
                int(snap.get("pages") or 0), int(snap.get("paragraphs") or 0),
                int(snap.get("calls") or 0), float(snap.get("elapsed") or 0),
-               float(snap.get("created") or time.time()), time.time(), seq)
+               float(snap.get("created") or time.time()), time.time(), seq,
+               snap.get("input") or "", snap.get("output_dir") or "",
+               json.dumps(warnings, ensure_ascii=False),
+               int(snap.get("cache_hits") or 0))
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO jobs (id,status,config_path,output_path,"
                 "error,stage,progress,pages,paragraphs,calls,elapsed,created,"
-                "updated,seq) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+                "updated,seq,input,output_dir,warnings,cache_hits) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
             self._conn.commit()
 
     def _row_to_snap(self, row) -> dict:
@@ -79,15 +108,17 @@ class JobStore:
         snap = {k: row[idx[k]] for k in _SNAP_COLS}
         raw_prog = row[idx["progress"]]
         snap["progress"] = (json.loads(raw_prog) or None) if raw_prog else None
+        try:
+            snap["warnings"] = json.loads(row[idx["warnings"]] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            snap["warnings"] = []
         return snap
 
     def unfinished(self) -> list[dict]:
         """非终态任务快照（按 seq→created 排序，重启恢复队列用）。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id,status,config_path,output_path,error,stage,progress,"
-                "pages,paragraphs,calls,elapsed,created,updated,seq FROM jobs "
-                "WHERE status IN ('queued','running','paused') "
+                _SELECT_SQL + " WHERE status IN ('queued','running','paused') "
                 "ORDER BY (seq IS NULL), seq, created").fetchall()
         return [self._row_to_snap(r) for r in rows]
 
@@ -95,9 +126,7 @@ class JobStore:
         """终态任务快照（最近在前）。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id,status,config_path,output_path,error,stage,progress,"
-                "pages,paragraphs,calls,elapsed,created,updated,seq FROM jobs "
-                "WHERE status IN ('done','cancelled','error') "
+                _SELECT_SQL + " WHERE status IN ('done','cancelled','error') "
                 "ORDER BY updated DESC LIMIT ?", (limit,)).fetchall()
         return [self._row_to_snap(r) for r in rows]
 

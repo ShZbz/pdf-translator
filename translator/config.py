@@ -103,10 +103,10 @@ class FeatureConfig:
     glossary_lock: bool = True
     translation_cache: bool = True
     bilingual: bool = False
-    # v0.5.0: 渲染器选择。writer=TextWriter 逐字排印（稳定默认）；
-    # htmlbox=insert_htmlbox HTML+CSS 排版引擎（自带 shaping/bidi/两端
-    # 对齐，解锁 RTL 语言的实验性预览，v0.5 主线的种子实现）
-    renderer: str = "writer"
+    # v0.5.1: htmlbox 转默认渲染引擎（灰度验证后接班）——insert_htmlbox
+    # HTML+CSS 排版，自带 shaping/bidi/两端对齐，RTL/天城文可用；
+    # writer=TextWriter 逐字排印（遗留稳定路径）
+    renderer: str = "htmlbox"
 
 
 @dataclass
@@ -126,6 +126,9 @@ class PerformanceConfig:
     # v0.5.0: 版面引擎。heuristic=内置启发式（默认）；pymupdf-layout=
     # 外部 GNN 版面检测（需 pip install pymupdf-layout，未装自动回退启发式）
     layout_engine: str = "heuristic"
+    # v0.5.1: 版面结果落盘缓存（段落级断点续跑）——同一输入（路径+大小+
+    # mtime+引擎）重跑时跳过布局阶段直达翻译（配合翻译缓存只剩增量段）
+    layout_cache: bool = True
 
 
 def _filtered(dc, raw: dict):

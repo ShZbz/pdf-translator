@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pymupdf
 
-from .langs import is_cjk_script, resolve_original_font
+from .langs import resolve_original_font
 from .layout import dominant_size
 
 MIN_FONT = 6.5
@@ -161,15 +161,16 @@ def find_cjk_font(explicit: str | None = None, lang: str = "zh") -> str:
     """目标语言正文字体（v0.4.2 多语言化，函数名保留旧称兼容）。
 
     平台三通吃（Windows 原生 / WSL / Linux·macOS），候选链见 langs.py。
-    CJK/西里尔目标找不到字体文件时抛错（豆腐块不可接受，提示用户配置）；
-    西文目标返回 ""（pymupdf.Font(fontfile="") = 内置 Noto Serif，覆盖拉丁-1）。
+    非拉丁文字系统（CJK/西里尔/阿拉伯/希伯来/天城文）找不到字体文件时
+    抛错（豆腐块不可接受，提示用户配置）；拉丁目标返回 ""
+    （pymupdf.Font(fontfile="") = 内置 Noto Serif，覆盖拉丁-1）。
     """
     from . import langs
     body, _ = langs.resolve_output_fonts(
         lang, {"cjk": explicit} if explicit else None)
     if body:
         return body
-    if is_cjk_script(lang) or langs.lang_info(lang).script == "cyrillic":
+    if langs.lang_info(lang).script != "latin":
         raise FileNotFoundError(
             f"no font found for target language {lang!r}; set fonts.body "
             f"(or fonts.cjk) in config.yaml to a font covering it "
@@ -207,7 +208,8 @@ def render_page(page, layout: dict, translated: list[dict],
                 warnings: list[str] | None = None,
                 typography=None,
                 cell_texts: dict[int, str | None] | None = None,
-                renderer: str = "writer") -> None:
+                renderer: str = "writer",
+                lang: str = "zh") -> None:
     """原地改造一页：redact 全部正文块 → 中文回灌 → display 公式位图回贴。
 
     layout:    layout_page() 输出
@@ -219,9 +221,10 @@ def render_page(page, layout: dict, translated: list[dict],
     typography: Typography 实例（v0.2.2 期刊级排版）；None 时退回单字体旧行为。
     cell_texts: v0.2.3 {cell_index: 译文}——表格单元格译文原位回灌；
                 None 值的单元格保留原文。
-    renderer:  v0.5.0 "writer"=TextWriter 逐字排印（默认）；
-               "htmlbox"=insert_htmlbox HTML+CSS 排版引擎（实验性，
-               自带 shaping/bidi/两端对齐；单元格仍走 writer 窄格路径）。
+    renderer:  v0.5.1 起 "htmlbox"=insert_htmlbox HTML+CSS 排版引擎（默认，
+               自带 shaping/bidi/两端对齐，段落与单元格全走该路径）；
+               "writer"=TextWriter 逐字排印（遗留稳定路径，RTL/复杂整形不可用）。
+    lang:      目标语言 code（v0.5.1：RTL 语言注入 direction:rtl CSS）。
     """
     paras = layout["paragraphs"]
     tmap = {t["index"]: t["text"] for t in translated}
@@ -266,9 +269,20 @@ def render_page(page, layout: dict, translated: list[dict],
             _sz[round(p.get("size") or dominant_size(p), 1)] += max(len(p["text"]), 1)
         body_size = _sz.most_common(1)[0][0] if _sz else None
 
-    # ---- 2. 段落回灌（P1 清洗+CJK断行+缩进 / D8 标题加粗 / P5 双语对照）----
-    # v0.2.3: verbatim 段跳过回灌（原文像素未动，无需重排）
-    # v0.2.3: 表格单元格译文回灌（原位、小字号、不缩进）
+    # ---- 2/3. 回灌 + 公式回贴（按渲染引擎分流）----
+    # v0.5.1 修复:旧版单元格先画进 writer 缓冲再判 renderer，htmlbox 分支
+    # 提前 return → tw.write_text 永不执行，htmlbox 模式表格文字全部丢失
+    # （redact 后空白）。现单元格与段落同引擎渲染，htmlbox 模式彻底无
+    # writer 残留路径。
+    if renderer == "htmlbox":
+        _render_cells_htmlbox(page, cells, cell_texts or {}, font_path,
+                              typography, lang, warn_local)
+        _render_paras_htmlbox(page, paras, tmap, font_path, typography,
+                              bilingual, formula_rects, lang, warn_local)
+        if formula_pixmaps:
+            _paste_formula_pixmaps(page, formula_pixmaps, layout["formulas"])
+        return
+
     cell_map = cell_texts or {}
     for ci, cell in enumerate(cells):
         dst = cell_map.get(ci)
@@ -287,18 +301,6 @@ def render_page(page, layout: dict, translated: list[dict],
         c_fs = min(dominant_size({"spans": cell.get("spans", [])}) or 8.0, 8.0)
         _draw_para(tw, crect, _clean_zh_text(dst), font, c_fs, 0,
                    warn_local, f"cell{ci}", lh_factor=1.25)
-    if renderer == "htmlbox":
-        _render_paras_htmlbox(page, paras, tmap, cells, cell_map, font_path,
-                              typography, bilingual, formula_rects,
-                              warn_local)
-        # ---- 3. D6 display 公式位图回贴（原 bbox 原位浮回）----
-        if formula_pixmaps:
-            for fi, png in formula_pixmaps.items():
-                if fi >= len(layout["formulas"]):
-                    continue
-                r = pymupdf.Rect(layout["formulas"][fi]["bbox"])
-                page.insert_image(r, stream=png)
-        return
     for i, p in enumerate(paras):
         if p.get("is_verbatim"):
             continue   # 原文像素保留
@@ -374,11 +376,17 @@ def render_page(page, layout: dict, translated: list[dict],
 
     # ---- 3. D6 display 公式位图回贴（原 bbox 原位浮回）----
     if formula_pixmaps:
-        for fi, png in formula_pixmaps.items():
-            if fi >= len(layout["formulas"]):
-                continue
-            r = pymupdf.Rect(layout["formulas"][fi]["bbox"])
-            page.insert_image(r, stream=png)
+        _paste_formula_pixmaps(page, formula_pixmaps, layout["formulas"])
+
+
+def _paste_formula_pixmaps(page, formula_pixmaps: dict[int, bytes],
+                          formulas: list[dict]) -> None:
+    """D6 display 公式位图回贴（原 bbox 原位浮回；两渲染引擎共用）。"""
+    for fi, png in formula_pixmaps.items():
+        if fi >= len(formulas):
+            continue
+        r = pymupdf.Rect(formulas[fi]["bbox"])
+        page.insert_image(r, stream=png)
 
 
 def _wrap_to_width(text: str, font: pymupdf.Font, fs: float, width: float) -> str:
@@ -418,11 +426,17 @@ def crop_formula_pixmaps(doc, page_no: int, formulas: list[dict]) -> dict[int, b
     return out
 
 
-# ---- v0.5.0: insert_htmlbox 渲染路径（渲染器换代种子，实验性）----
+# ---- v0.5.0: insert_htmlbox 渲染路径（v0.5.1 转默认引擎）----
 
 def _html_escape(text: str) -> str:
     import html as _html
     return _html.escape(text, quote=False)
+
+
+def _dir_css(lang: str) -> str:
+    """RTL 目标语言注入 direction:rtl（htmlbox Story 引擎自带 bidi 整形）。"""
+    from .langs import is_rtl
+    return "direction:rtl;" if is_rtl(lang) else ""
 
 
 def _build_font_archive(font_path: str, heading_path: str | None) \
@@ -445,12 +459,45 @@ def _build_font_archive(font_path: str, heading_path: str | None) \
     return arch, "\n".join(faces)
 
 
+def _render_cells_htmlbox(page, cells: list[dict], cell_map: dict,
+                          font_path: str, typography, lang: str,
+                          warnings: list[str]) -> None:
+    """表格单元格回灌的 HTML 框架路径（v0.5.1，替代 writer 残留路径）。
+
+    窄格（<20pt，如纯数字列 '0.3'）用 white-space:nowrap 单行语义——
+    Story 引擎 scale_low 自动整体缩字号装盒，等价旧 writer 窄格单行绘制；
+    常规格按 justify/左对齐断行。RTL 目标语言注入 direction:rtl。
+    """
+    if not cells:
+        return
+    heading_path = typography.heading_path if typography else None
+    arch, font_css = _build_font_archive(font_path, heading_path)
+    family = "ptbody, serif" if font_path else "serif"
+    d = _dir_css(lang)
+    for ci, cell in enumerate(cells):
+        dst = cell_map.get(ci)
+        if dst is None:
+            dst = cell.get("text") or ""
+        if not dst.strip():
+            continue
+        crect = pymupdf.Rect(cell["bbox"])
+        if crect.width < 8 or crect.height < 5:
+            continue
+        c_fs = min(dominant_size({"spans": cell.get("spans", [])}) or 8.0, 8.0)
+        nowrap = "white-space:nowrap;" if crect.width < 20 else ""
+        css = (font_css +
+               f" p {{font-family:{family}; font-size:{c_fs:.2f}pt;"
+               f" line-height:1.25; margin:0; text-align:left;{nowrap}{d}}}")
+        _insert_one_htmlbox(page, crect, _html_escape(_clean_zh_text(dst)),
+                            css, f"cell{ci}", warnings, archive=arch,
+                            scale_low=0.3)
+
+
 def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
-                          cells: list[dict], cell_map: dict,
                           font_path: str, typography, bilingual: bool,
                           formula_rects: list["pymupdf.Rect"],
-                          warnings: list[str]) -> None:
-    """段落回灌的 HTML+CSS 排版引擎路径（v0.5.0 实验性）。
+                          lang: str, warnings: list[str]) -> None:
+    """段落回灌的 HTML+CSS 排版引擎路径（v0.5.0 种子，v0.5.1 转默认）。
 
     与 writer 路径的差异：
     - 断行/避头尾/试排降字号全部交给 Story 引擎（justify + shaping + bidi），
@@ -458,7 +505,9 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
     - 双语原文层用 opacity 半透明呈现（writer 路径是灰色）
     - typography 样式映射保留：标题用标题字体加粗、caption/ref 小字号、
       CJK 正文首行缩进 2em
-    单元格窄格仍由调用方的 writer 路径处理（htmlbox 对 <8pt 窄格无优势）。
+    - v0.5.1: RTL 目标语言注入 direction:rtl；ref 条目不扩边（相邻条目
+      共享边界，扩边互相侵入，与 writer 路径同规则）；双语原文层含 CJK
+      时用 ptbody 家族（内置 serif 无 CJK 字形会豆腐块）
     """
     from .typography import line_height_factor
 
@@ -467,6 +516,7 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
     body_family = "ptbody, serif" if font_path else "serif"
     head_family = "pthead, ptbody, serif" \
         if heading_path and heading_path != font_path else body_family
+    d = _dir_css(lang)
 
     # 正文众数字号（样式基准，与 writer 路径同算法）
     from collections import Counter
@@ -483,7 +533,11 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
         if not txt.strip():
             continue
         rect = pymupdf.Rect(p["bbox"])
-        rect.x0 -= 0.5; rect.y0 -= 0.5; rect.x1 += 0.5; rect.y1 += 0.5
+        if p.get("is_ref"):
+            # ref 条目贴边排：不微扩（相邻条目共享边界，扩了互相侵入）
+            rect.y0 += 0.5; rect.y1 -= 0.5
+        else:
+            rect.x0 -= 0.5; rect.y0 -= 0.5; rect.x1 += 0.5; rect.y1 += 0.5
         base = p.get("size") or dominant_size(p) or 10.0
         if typography is not None:
             style = typography.resolve(p, body_size)
@@ -504,26 +558,30 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
             tag_extra = ""
         css = (font_css +
                f" p {{font-family:{family}; font-size:{base:.2f}pt;"
-               f" line-height:{lh}; margin:0; text-align:{align};{indent}}}")
+               f" line-height:{lh}; margin:0; text-align:{align};{indent}{d}}}")
         # 双语：上部 60% 译文；底部原文层半透明（与公式区重叠则放弃）
         if bilingual and raw != p["text"] and not p.get("is_heading"):
             split_y = rect.y0 + rect.height * 0.6
             zh_rect = pymupdf.Rect(rect.x0, rect.y0, rect.x1,
                                    max(split_y, rect.y0 + MIN_FONT * 2))
             en_rect = pymupdf.Rect(rect.x0, split_y + 1.0, rect.x1, rect.y1)
-            _insert_one_htmlbox(page, zh_rect, txt, css,
+            _insert_one_htmlbox(page, zh_rect, _html_escape(txt), css,
                                 f"render p{i}[{tag_extra}]/zh", warnings,
                                 archive=arch)
             if en_rect.height >= MIN_FONT * 1.5 and en_rect.width >= 20 \
                     and not any(en_rect.intersects(fr) for fr in formula_rects):
+                # 原文层字体：含 CJK（zh→en 反向）用 ptbody；西文用 serif
+                en_family = "ptbody, serif" \
+                    if (font_path and _has_cjk(p["text"])) else "serif"
                 en_css = (font_css +
-                          f" p {{font-family:serif; font-size:{max(MIN_FONT, base * 0.75):.2f}pt;"
+                          f" p {{font-family:{en_family};"
+                          f" font-size:{max(MIN_FONT, base * 0.75):.2f}pt;"
                           f" line-height:1.2; margin:0;}}")
                 _insert_one_htmlbox(page, en_rect, _html_escape(p["text"]),
                                     en_css, f"render p{i}/en", warnings,
                                     opacity=0.6, archive=arch)
             continue
-        _insert_one_htmlbox(page, rect, txt, css,
+        _insert_one_htmlbox(page, rect, _html_escape(txt), css,
                             f"render p{i}{('[' + tag_extra + ']') if tag_extra else ''}",
                             warnings, archive=arch)
 
@@ -531,18 +589,19 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
 def _insert_one_htmlbox(page, rect: "pymupdf.Rect", text: str, css: str,
                         tag: str, warnings: list[str],
                         opacity: float = 1.0,
-                        archive: "pymupdf.Archive | None" = None) -> None:
+                        archive: "pymupdf.Archive | None" = None,
+                        scale_low: float = 0.5) -> None:
     """单段 insert_htmlbox + 溢出告警（spare_height < 0 = 缩到 scale_low 仍装不下）。
 
     archive 必须随 @font-face 一起传入（v0.5.0 大测试实测教训：漏传时
     MuPDF 报 cannot locate font，引擎静默回退内置字体——中文能出但字体
-    不受 typography 控制）。
+    不受 typography 控制）。scale_low：单元格窄格传 0.3 允许更深缩放。
     """
     if not text.strip():
         return
     try:
         spare, scale = page.insert_htmlbox(
-            rect, f"<p>{text}</p>", css=css, scale_low=0.5,
+            rect, f"<p>{text}</p>", css=css, scale_low=scale_low,
             opacity=opacity, overlay=True, archive=archive)
     except Exception as e:
         warnings.append(f"{tag}: htmlbox failed ({e})")

@@ -20,6 +20,8 @@ v0.4.3:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -35,11 +37,78 @@ from .events import EventSink
 from .extract import page_has_text_layer
 from .glossary import Glossary
 from .layout import layout_page
-from .langs import output_tag
+from .langs import is_rtl, lang_info, output_tag
 from .llm import TranslationClient
 from .render import _clean_zh_text, _draw_para, _wrap_cjk, crop_formula_pixmaps, find_cjk_font, render_page
 
 _VERBOSE_TS = False
+
+# ---- v0.5.1: 版面结果落盘缓存（段落级断点续跑）----
+# 版面启发式变更时 bump 此版本号（旧缓存 key 不同自动失效）
+_LAYOUT_CACHE_VER = 2
+
+
+def _layout_cache_encode(o):
+    """layout 结构 → JSON 可序列化（pymupdf.Rect → 标记 dict）。"""
+    if isinstance(o, pymupdf.Rect):
+        return {"__rect__": [o.x0, o.y0, o.x1, o.y1]}
+    if isinstance(o, dict):
+        return {k: _layout_cache_encode(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_layout_cache_encode(v) for v in o]
+    return o
+
+
+def _layout_cache_decode(o):
+    """JSON → layout 结构（标记 dict → pymupdf.Rect）。"""
+    if isinstance(o, dict):
+        if set(o.keys()) == {"__rect__"} and len(o["__rect__"]) == 4:
+            return pymupdf.Rect(o["__rect__"])
+        return {k: _layout_cache_decode(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_layout_cache_decode(v) for v in o]
+    return o
+
+
+def _layout_cache_path(out_dir: Path, src: Path, engine: str) -> Path | None:
+    """版面缓存文件路径：key = 输入路径+大小+mtime+引擎+缓存版本。
+
+    输入文件被替换（大小/mtime 变化）或引擎切换时 key 变化，天然失效。
+    """
+    try:
+        st = src.stat()
+        key = hashlib.md5(f"{src}|{st.st_size}|{int(st.st_mtime)}|"
+                          f"{engine}|{_LAYOUT_CACHE_VER}".encode("utf-8")) \
+            .hexdigest()[:16]
+        return out_dir / ".layout_cache" / f"{key}.json"
+    except OSError:
+        return None
+
+
+def _load_layout_cache(path: Path | None) -> list[dict] | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        layouts = _layout_cache_decode(data)
+        if isinstance(layouts, list) and layouts \
+                and all(isinstance(l, dict) and "paragraphs" in l
+                        for l in layouts):
+            return layouts
+        return None
+    except Exception:
+        return None       # 坏缓存按 miss 处理，走正常布局
+
+
+def _save_layout_cache(path: Path | None, layouts: list[dict]) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_layout_cache_encode(layouts),
+                                   ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass              # 缓存写失败不影响主流程
 
 # ---- 布局并行 worker（模块级函数：Windows spawn 要求可 pickle 引用）----
 _LAYOUT_DOC: "pymupdf.Document | None" = None
@@ -127,6 +196,10 @@ def _split_proportional(dst: str, ratio: float) -> tuple[str, str]:
 
     v0.4.2: 单字符译文守卫——len(dst)==1 时 range(1,1) 为空，
     min() 直接 ValueError（极端短译文整篇崩溃）。
+
+    v0.5.1 修复:边界惩罚原为 dst[i]（B 段首字符）在标点集内记 0 分——
+    偏好在'，'前切分，B 段以标点开头（避头尾违例，下页段首悬挂逗号）。
+    正确语义是 A 段末字符（dst[i-1]）落在边界集时该切点更优。
     """
     if ratio <= 0.0:
         return "", dst
@@ -137,7 +210,7 @@ def _split_proportional(dst: str, ratio: float) -> tuple[str, str]:
     target = len(dst) * ratio
     best = min(range(1, len(dst)), key=lambda i: (
         abs(i - target)
-        + (0 if i >= len(dst) or dst[i] in " ，。；：、）】 " else 5)))
+        + (0 if dst[i - 1] in " ，。；：、）】" else 5)))
     return dst[:best].rstrip(), dst[best:].lstrip()
 
 
@@ -156,14 +229,22 @@ def _log(msg: str) -> None:
 
 def _append_ocr_pages(doc, ocr_units: list[tuple[int, str]],
                       translations: list[str], font_path: str,
-                      warnings: list[str]) -> int:
+                      warnings: list[str], renderer: str = "writer",
+                      lang: str = "zh") -> int:
     """v0.4.3: OCR 译文附录页——插在对应扫描页之后。
 
     从高页号往低插（先插高位不影响低位索引）。单页放不下时截断并告警。
+    v0.5.1: renderer=htmlbox 时译文体走 insert_htmlbox（RTL/天城文整形；
+    标头行保持 TextWriter——纯 ASCII 无整形需求）。
     """
     font = pymupdf.Font(fontfile=font_path)
     added = 0
     pairs = sorted(zip(ocr_units, translations), key=lambda x: -x[0][0])
+    from .render import _build_font_archive, _insert_one_htmlbox
+    arch, font_css = _build_font_archive(font_path, None) \
+        if renderer == "htmlbox" else (None, "")
+    family = "ptbody, serif" if font_path else "serif"
+    d = "direction:rtl;" if is_rtl(lang) else ""
     for (pno, src), dst in pairs:
         text = _clean_zh_text(dst if dst and dst.strip() else src)
         doc.insert_page(pno + 1)
@@ -174,17 +255,27 @@ def _append_ocr_pages(doc, ocr_units: list[tuple[int, str]],
         tw.append(pymupdf.Point(42.0, y), f"[OCR · p.{pno + 1}]",
                   font=font, fontsize=10.5)
         y += 16.0
-        clipped = False
-        for ln in _wrap_cjk(text, font, fs, page.rect.width - 84.0):
-            if y > page.rect.height - 42.0:
-                clipped = True
-                break
-            tw.append(pymupdf.Point(42.0, y), ln, font=font, fontsize=fs)
-            y += fs * 1.5
+        if renderer == "htmlbox":
+            body_rect = pymupdf.Rect(42.0, y, page.rect.width - 42.0,
+                                     page.rect.height - 42.0)
+            css = (font_css +
+                   f" p {{font-family:{family}; font-size:{fs}pt;"
+                   f" line-height:1.5; margin:0; text-align:left;{d}}}")
+            _insert_one_htmlbox(page, body_rect, text, css,
+                                f"ocr-appendix p{pno + 1}", warnings,
+                                archive=arch)
+        else:
+            clipped = False
+            for ln in _wrap_cjk(text, font, fs, page.rect.width - 84.0):
+                if y > page.rect.height - 42.0:
+                    clipped = True
+                    break
+                tw.append(pymupdf.Point(42.0, y), ln, font=font, fontsize=fs)
+                y += fs * 1.5
+            if clipped:
+                warnings.append(
+                    f"OCR appendix p.{pno + 1}: text truncated (page full)")
         tw.write_text(page)
-        if clipped:
-            warnings.append(
-                f"OCR appendix p.{pno + 1}: text truncated (page full)")
         added += 1
     return added
 
@@ -249,12 +340,14 @@ def _page_graphics_rects(page) -> list["pymupdf.Rect"]:
 
 def _apply_ocr_inplace(doc, pno: int, blocks: list[tuple["pymupdf.Rect", str]],
                        translations: list[str], font_path: str,
-                       warnings: list[str]) -> int:
+                       warnings: list[str], renderer: str = "writer",
+                       lang: str = "zh") -> int:
     """白块覆盖 + 译文原位回灌（PDFMathTranslate 式，任务 2-4）。
 
     每块：与页内图形（子图/矢量线）重叠超 30% 面积 → 跳过保留原像素
     （白块会误伤插图）；否则白矩形盖掉原文、译文按块 bbox 试排回灌。
     返回成功回贴的块数。
+    v0.5.1: renderer=htmlbox 时译文走 insert_htmlbox（RTL/天城文整形）。
     """
     page = doc[pno]
     font = pymupdf.Font(fontfile=font_path)
@@ -262,6 +355,11 @@ def _apply_ocr_inplace(doc, pno: int, blocks: list[tuple["pymupdf.Rect", str]],
     applied = 0
     heights = sorted(r.height for r, _ in blocks)
     med_h = heights[len(heights) // 2] if heights else 10.0
+    from .render import _build_font_archive, _insert_one_htmlbox
+    arch, font_css = _build_font_archive(font_path, None) \
+        if renderer == "htmlbox" else (None, "")
+    family = "ptbody, serif" if font_path else "serif"
+    d = "direction:rtl;" if is_rtl(lang) else ""
     for (bbox, src), dst in zip(blocks, translations):
         rect = pymupdf.Rect(bbox)
         g_inter = 0.0
@@ -278,8 +376,17 @@ def _apply_ocr_inplace(doc, pno: int, blocks: list[tuple["pymupdf.Rect", str]],
         if not text.strip():
             continue
         page.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
-        tw = pymupdf.TextWriter(page.rect)
         base = max(6.5, min(12.0, med_h * 0.85))
+        if renderer == "htmlbox":
+            css = (font_css +
+                   f" p {{font-family:{family}; font-size:{base:.2f}pt;"
+                   f" line-height:1.3; margin:0; text-align:left;{d}}}")
+            _insert_one_htmlbox(page, rect, text, css,
+                                f"ocr-inplace p{pno + 1}", warnings,
+                                archive=arch)
+            applied += 1
+            continue
+        tw = pymupdf.TextWriter(page.rect)
         _draw_para(tw, rect, text, font, base, 0, warnings,
                    f"ocr-inplace p{pno + 1}", lh_factor=1.3)
         tw.write_text(page)
@@ -306,6 +413,18 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     tgt_lang = (cfg.io.target_lang or "zh").strip() or "zh"
     out_path = out_dir / output_pdf_name(src.stem, tgt_lang,
                                          cfg.features.bilingual)
+    all_warnings: list[str] = []
+
+    # v0.5.1: 渲染器选择 + RTL/天城文强制 htmlbox（writer 逐字排印无
+    # shaping/bidi，阿拉伯语/希伯来语/天城文输出不可读——自动切换并告警）
+    renderer = (getattr(cfg.features, "renderer", "htmlbox") or "htmlbox").strip()
+    info = lang_info(tgt_lang)
+    if renderer == "writer" and (info.rtl or info.script == "indic"):
+        w = (f"target language {tgt_lang} ({info.native}) requires the "
+             f"htmlbox renderer for shaping/bidi; switched writer -> htmlbox")
+        _log(f"WARNING: {w}")
+        all_warnings.append(w)
+        renderer = "htmlbox"
 
     font_path = find_cjk_font(cfg.fonts.get("cjk"), lang=tgt_lang)
     glossary = Glossary.load(cfg.glossary_file) if cfg.glossary_file else None
@@ -317,7 +436,6 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     doc = pymupdf.open(src)
     n_pages = len(doc)
     total_calls = 0
-    all_warnings: list[str] = []
     n_paras = 0
     if control:
         control.checkpoint()   # 开工前最后一刻取消（排队即取消场景）
@@ -341,7 +459,9 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             _log(f"typography: body={os.path.basename(typo.body_path) or '(builtin)'}, "
                  f"heading={os.path.basename(typo.heading_path) or '(builtin)'}")
             # 字形覆盖率校验（选到的字体缺目标语言字符 → 豆腐块预警）
-            from .langs import coverage_warnings, lang_info
+            # （lang_info 在模块顶部导入；此处再导入会把整个函数的
+            #  lang_info 变成局部名，上方引用直接 UnboundLocalError）
+            from .langs import coverage_warnings
             for w in coverage_warnings(typo.f_body, tgt_lang):
                 _log(f"WARNING: {w}")
                 all_warnings.append(w)
@@ -355,12 +475,28 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             typo = None
 
     # ---- v0.4.3: 布局 + 裁公式（多进程并行，故障自动回退串行）----
+    # v0.5.1: 版面结果落盘缓存（段落级断点续跑）——同一输入重跑时跳过
+    # 布局阶段直达翻译；公式位图不落盘（裁图相对便宜，加载后重裁）
     layout_engine = (getattr(cfg.performance, "layout_engine", "heuristic")
                      or "heuristic").strip()
     workers = _resolve_layout_workers(cfg, n_pages)
     page_layouts: list[dict] = []
     page_pixmaps: list[dict[int, bytes]] = []
-    if workers > 1:
+    lc_path = _layout_cache_path(out_dir, src, layout_engine) \
+        if getattr(cfg.performance, "layout_cache", True) else None
+    if lc_path is not None:
+        cached = _load_layout_cache(lc_path)
+        if cached is not None and len(cached) == n_pages:
+            page_layouts = cached
+            _log(f"layout: cache hit ({lc_path.name}), skipping layout "
+                 f"for {n_pages} page(s)")
+            sink.emit("layout_cache_hit", pages=n_pages)
+            sink.progress(done=n_pages, total=n_pages, unit="page")
+            for pno in range(n_pages):
+                page_pixmaps.append(
+                    crop_formula_pixmaps(doc, pno, page_layouts[pno]["formulas"])
+                    if page_layouts[pno].get("formulas") else {})
+    if not page_layouts and workers > 1:
         fd, layout_tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
         os.close(fd)
         layout_tmp = Path(layout_tmp_name)
@@ -389,8 +525,17 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             page_layouts.append(lay)
             page_pixmaps.append(pixmaps)
             sink.page_done(pno, n_pages)
-    if page_layouts and page_layouts[0].get("layout_engine") == \
-            "pymupdf-layout-fallback":
+    if lc_path is not None and page_layouts and \
+            len(page_layouts) == n_pages and \
+            not any(p for p in page_pixmaps if p is None):
+        # 布局完成（非缓存命中路径）→ 落盘供断点续跑
+        _save_layout_cache(lc_path, page_layouts)
+    # v0.5.1: 全部页 fallback 才告警——pymupdf-layout 已装且正常运行时，
+    # 纯文本页（GNN 检不出图/表/公式区）按页回退启发式属正常行为，
+    # 只看第 0 页会在"首页恰好纯文本"时误报"未安装"
+    if page_layouts and layout_engine == "pymupdf-layout" and all(
+            l.get("layout_engine") == "pymupdf-layout-fallback"
+            for l in page_layouts):
         w = ("performance.layout_engine='pymupdf-layout' but package not "
              "installed/failed; heuristic fallback in use "
              "(pip install pymupdf-layout)")
@@ -512,13 +657,23 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     cell_texts: dict[tuple[int, int], str] = {}   # v0.2.3: (pno, ci) → 译文
     if client is not None:
         # v0.2.3: 合并组拼成翻译单元（组内段落用 \n 连接送译）
+        # v0.5.1: 跨页连字符合并——前段尾 '-' + 后段小写开头 = 同词被
+        # 页边界切断（LaTeX 排版常见），去连字符直连送译；否则 LLM 会把
+        # 'instrumen-\ntation' 当两个残词，译文断句不自然
+        def _join_group(parts: list[str]) -> str:
+            if len(parts) == 2:
+                a, b = parts[0].rstrip(), parts[1].lstrip()
+                if a.endswith("-") and b[:1].islower():
+                    return a[:-1] + b
+            return "\n".join(parts)
+
         unit_texts: list[str] = []
         for g in merge_groups:
             parts = []
             for fi in g:
                 pno, pi = pending[fi]
                 parts.append(page_layouts[pno]["paragraphs"][pi]["text"])
-            unit_texts.append("\n".join(parts))
+            unit_texts.append(_join_group(parts))
         # v0.2.3: 表格单元格并入同一翻译队列（同一批协议，省调用次数）
         cell_flat: list[str] = []
         for pno, ci in cell_pending:
@@ -606,9 +761,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     if control:
         control.checkpoint()
     sink.stage("render")
-    renderer = (getattr(cfg.features, "renderer", "writer") or "writer").strip()
-    if renderer == "htmlbox":
-        _log("renderer: htmlbox (experimental insert_htmlbox engine)")
+    if renderer == "writer":
+        _log("renderer: writer (legacy TextWriter engine)")
     for pno in range(len(doc)):
         if control:
             control.checkpoint()
@@ -626,7 +780,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                     warnings=all_warnings,
                     typography=typo,
                     cell_texts=page_cell_texts,
-                    renderer=renderer)
+                    renderer=renderer,
+                    lang=tgt_lang)
 
     # ---- OCR 译文落页（appendix 插页 / inplace 原位回贴）----
     ocr_pages_added = 0
@@ -641,7 +796,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 ocr_inplace_blocks += _apply_ocr_inplace(
                     doc, jb["pno"], jb["blocks"],
                     ocr_translations[consumed:consumed + n],
-                    font_path, all_warnings)
+                    font_path, all_warnings,
+                    renderer=renderer, lang=tgt_lang)
                 consumed += n
             else:
                 appendix_pairs.append((jb["pno"], jb["text"]))
@@ -649,7 +805,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 consumed += 1
         if appendix_pairs:
             ocr_pages_added = _append_ocr_pages(
-                doc, appendix_pairs, appendix_texts, font_path, all_warnings)
+                doc, appendix_pairs, appendix_texts, font_path, all_warnings,
+                renderer=renderer, lang=tgt_lang)
             _log(f"ocr: {ocr_pages_added} appendix page(s) inserted")
         if ocr_inplace_blocks:
             _log(f"ocr: {ocr_inplace_blocks} block(s) pasted in-place")
@@ -664,6 +821,22 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         if cache:
             cache.close()
 
+    # ---- 缓存统计（v0.5.1: 按文档维度的节省报表）----
+    cache_hits = getattr(tc, "cache_hits", 0) if client is not None else 0
+    cache_saved_calls = 0
+    if cache_hits:
+        bs = max(1, int(getattr(cfg.llm, "batch_size", 6) or 6))
+        cache_saved_calls = -(-cache_hits // bs)   # ceil：命中的段折算批次数
+    cache_entries = 0
+    if cache is not None:
+        try:
+            cache_entries = cache.count()
+        except Exception:
+            pass
+    if cache_hits:
+        _log(f"cache: {cache_hits} segment hit(s), ~{cache_saved_calls} "
+             f"call(s) saved, {cache_entries} entr(y|ies) total")
+
     stats = {
         "pages": n_pages,
         "paragraphs": n_paras,
@@ -672,12 +845,19 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         "output": str(out_path),
         "ocr_pages": ocr_pages_added,
         "ocr_inplace_blocks": ocr_inplace_blocks,
+        "cache_hits": cache_hits,
+        "cache_saved_calls": cache_saved_calls,
+        "cache_entries": cache_entries,
     }
     sink.emit("done", output=str(out_path), pages=n_pages,
               paragraphs=n_paras, calls=total_calls,
               ocr_pages=ocr_pages_added,
               ocr_inplace_blocks=ocr_inplace_blocks,
+              cache_hits=cache_hits,
+              cache_saved_calls=cache_saved_calls,
+              cache_entries=cache_entries,
               elapsed=round(time.time() - t0, 1))
     _log(f"done: {n_paras} paras, {total_calls} LLM calls, "
+         f"{cache_hits} cache hits, "
          f"{len(all_warnings)} warnings, {time.time() - t0:.1f}s")
     return stats

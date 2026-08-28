@@ -2,10 +2,10 @@
 io:
   input: "paper.pdf"                # 待翻译 PDF 路径
   output_dir: "out"                 # 输出目录，生成 <文件名>-<目标语言>.pdf
-  # 源/目标语言（v0.4.2 支持 12 种，输出排版按目标语言自动选字体）：
+  # 源/目标语言（v0.5.1 支持 15 种，输出排版按目标语言自动选字体）：
   #   zh 简体中文 | en 英文 | ja 日语 | ko 韩语
   #   de 德语 | fr 法语 | es 西语 | it 意语 | pt 葡语 | tr 土语 | vi 越南语
-  #   ru 俄语
+  #   ru 俄语 | ar 阿拉伯语(RTL) | he 希伯来语(RTL) | hi 印地语(天城文)
   source_lang: en                   # 版面识别启发式针对英文文献优化
   target_lang: zh
 
@@ -48,6 +48,9 @@ performance:
   layout_engine: heuristic          # v0.5.0 版面引擎：heuristic=内置启发式（默认）；
                                     # pymupdf-layout=GNN 版面检测（需 pip install
                                     # pymupdf-layout，未装自动回退启发式并告警）
+  layout_cache: true                # v0.5.1 版面结果落盘缓存（段落级断点续跑）：
+                                    # 同一输入重跑跳过布局直达翻译（配合翻译
+                                    # 缓存只剩增量段）；输入/引擎变化自动失效
 
 features:
   watermark_removal: true           # 三层水印移除
@@ -55,9 +58,10 @@ features:
   glossary_lock: true               # 术语一致性校验
   translation_cache: true           # SQLite 缓存，二次运行零调用
   bilingual: false                  # true=双语对照模式
-  renderer: writer                  # v0.5.0 渲染器：writer=TextWriter 逐字排印
-                                    # （稳定默认）；htmlbox=insert_htmlbox HTML+CSS
-                                    # 引擎（实验性，自带两端对齐/复杂文字整形）
+  renderer: htmlbox                 # v0.5.1 渲染器：htmlbox=insert_htmlbox
+                                    # HTML+CSS 排版引擎（默认，自带两端对齐/
+                                    # 复杂文字整形，支持阿拉伯语等 RTL）；
+                                    # writer=TextWriter 逐字排印（遗留路径）
 
 glossary_file: ""                   # 术语表 YAML 路径（可选）
 

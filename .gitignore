@@ -26,3 +26,6 @@ ui_config.yaml
 .ui_run_config*
 .ui_ctl_*
 .ui_glossary_merged.yaml
+
+# v0.5.0 任务持久化库
+.ui_jobs.db

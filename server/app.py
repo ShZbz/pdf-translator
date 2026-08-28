@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -72,8 +72,16 @@ def translate(req: TranslateReq) -> dict:
     run_cfg.write_text(yaml.safe_dump(cfg_data, allow_unicode=True),
                        encoding="utf-8")
 
-    result = manager.submit(str(run_cfg))
+    out_dir = cfg_data["io"]["output_dir"]
+    result = manager.submit(str(run_cfg), input_path=str(src),
+                            output_dir=out_dir)
     if not result.get("ok"):
+        # v0.5.1 修复：队列满 409 时任务未创建，临时运行配置没人清理
+        # （Job._cleanup_files 只在任务终态时触发）——这里兜底删除
+        try:
+            run_cfg.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise HTTPException(409, result.get("error", "submit failed"))
     return result
 
@@ -150,23 +158,44 @@ def job_action(job_id: str, action: str) -> dict:
     return job.snapshot()
 
 
-# ---------- SSE 实时流（v0.5.0: 任务 2-5）----------
+# ---------- SSE 实时流（v0.5.0: 任务 2-5；v0.5.1: Last-Event-ID 续传）----------
 @app.get("/api/jobs/current/stream")
-async def job_stream():
+async def job_stream(last_event_id: str | None = Header(
+        default=None, alias="Last-Event-ID")):
     """当前任务/队列的服务端推送事件流。
 
-    帧格式 `data: {json}\n\n`：
+    帧格式 `id: <seq>\\ndata: {json}\\n\\n`：
     - {"kind":"state", ...}   全量状态（连接建立首发 + 队列推进时）
     - {"kind":"job_event", "event":..., "job":...}  任务事件（进度/阶段/警告）
     每 15s 发一行 `: ping` 心跳防中间层断连。事件泵线程 → SimpleQueue →
     本协程 0.25s 间隔取帧（无第三方依赖的线程→异步io 桥）。
+
+    v0.5.1: 浏览器 EventSource 断线自动重连时携带 Last-Event-ID 请求头，
+    本端从有界事件日志（JobManager._event_log，1000 条环形）补发错过
+    的帧再接续实时流——网络闪断/标签页休眠不再丢进度与警告。
     """
     q = manager.subscribe()
+    replay: list[tuple[int, dict]] = []
+    if last_event_id and isinstance(last_event_id, str):
+        try:
+            replay = manager.events_after(int(last_event_id))
+        except ValueError:
+            replay = []
 
     async def gen():
         try:
-            snap = manager.current_snapshot()
-            yield f"data: {json.dumps({'kind': 'state', **snap}, ensure_ascii=False)}\n\n"
+            if not replay:
+                snap = manager.current_snapshot()
+                yield (f"id: {manager._event_seq}\n"
+                       f"data: {json.dumps({'kind': 'state', **snap}, ensure_ascii=False)}\n\n")
+            for eid, payload in replay:
+                yield (f"id: {eid}\n"
+                       f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
+            if replay:
+                # 重放后补一帧全量状态对齐（客户端可能错过 state 类帧）
+                s = manager.current_snapshot()
+                yield (f"id: {manager._event_seq}\n"
+                       f"data: {json.dumps({'kind': 'state', **s}, ensure_ascii=False)}\n\n")
             last_beat = time.monotonic()
             while True:
                 try:
@@ -177,9 +206,11 @@ async def job_stream():
                     if payload.get("kind") == "manager":
                         # 队列推进/新提交 → 补发全量状态
                         s = manager.current_snapshot()
-                        yield f"data: {json.dumps({'kind': 'state', **s}, ensure_ascii=False)}\n\n"
+                        yield (f"id: {payload.get('eid', manager._event_seq)}\n"
+                               f"data: {json.dumps({'kind': 'state', **s}, ensure_ascii=False)}\n\n")
                     else:
-                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        yield (f"id: {payload.get('eid', 0)}\n"
+                               f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
                     continue
                 now = time.monotonic()
                 if now - last_beat >= 15.0:
@@ -245,11 +276,33 @@ class ValidateReq(BaseModel):
     base_url: str = ""
     model: str
     target_lang: str = "zh"
+    # v0.5.1: 与翻译任务共用超时/重试参数（旧版写死 timeout=15、单次不重试
+    # ——UI 配的「请求超时/重试次数」对连通性测试不生效，慢模型误报失败）
+    timeout: float = 0.0
+    max_retries: int = 0
+
+
+def _stored_llm_timeout_retry() -> tuple[float, int]:
+    """存储配置里的超时/重试（缺省 120s / 2 次，与 LLMConfig 默认一致）。"""
+    llm = _stored_llm()
+    try:
+        timeout = float(llm.get("timeout") or 120.0)
+    except (TypeError, ValueError):
+        timeout = 120.0
+    try:
+        retries = max(1, int(llm.get("max_retries") or 2))
+    except (TypeError, ValueError):
+        retries = 2
+    return timeout, retries
 
 
 @app.post("/api/validate-key")
 def validate_key(req: ValidateReq):
-    """发一条最小翻译请求验证连通性。key 打码时用存储的旧值。"""
+    """发一条最小翻译请求验证连通性。key 打码时用存储的旧值。
+
+    v0.5.1: 请求参数 > 存储的 ui_config llm 段 > 默认值，与翻译任务
+    行为一致（慢模型带思维链时 15s 必超时，误判 key 无效）。
+    """
     from translator.config import PRESETS
     from translator.langs import prompt_lang_name
     p = PRESETS.get(req.provider, {})
@@ -264,27 +317,36 @@ def validate_key(req: ValidateReq):
                 UI_CONFIG_PATH.read_text(encoding="utf-8")).get("llm", {})
             api_key = stored.get("api_key", "")
 
-    try:
-        from openai import OpenAI
-        client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop",
-                        timeout=15.0)
-        t0 = time.time()
-        resp = client.chat.completions.create(
-            model=req.model,
-            messages=[
-                {"role": "system",
-                 "content": f"Translate to {prompt_lang_name(req.target_lang)}. "
-                            f"Output only the translation."},
-                {"role": "user", "content": "Hello."},
-            ],
-            max_tokens=50,
-        )
-        sample = resp.choices[0].message.content or ""
-        return {"ok": True, "latency": round(time.time() - t0, 1),
-                "sample": sample[:60]}
-    except Exception as e:
-        return JSONResponse(status_code=200,
-                            content={"ok": False, "error": str(e)[:300]})
+    st_timeout, st_retries = _stored_llm_timeout_retry()
+    timeout = max(5.0, float(req.timeout or 0) or st_timeout)
+    max_retries = max(1, int(req.max_retries or 0) or st_retries)
+
+    from openai import OpenAI
+    client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop",
+                    timeout=timeout)
+    t0 = time.time()
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=req.model,
+                messages=[
+                    {"role": "system",
+                     "content": f"Translate to {prompt_lang_name(req.target_lang)}. "
+                                f"Output only the translation."},
+                    {"role": "user", "content": "Hello."},
+                ],
+                max_tokens=50,
+            )
+            sample = resp.choices[0].message.content or ""
+            return {"ok": True, latency: round(time.time() - t0, 1),
+                    "sample": sample[:60]}
+        except Exception as e:
+            last_err = str(e)[:300]
+            if attempt < max_retries:
+                time.sleep(min(2.0 * attempt, 5.0))
+    return JSONResponse(status_code=200,
+                        content={"ok": False, "error": last_err})
 
 
 # ---------- 术语表批量导入 ----------
