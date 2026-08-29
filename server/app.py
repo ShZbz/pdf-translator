@@ -14,6 +14,8 @@
 - GET  /api/config           → 读 UI 配置（key 打码）
 - PUT  /api/config           → 写 UI 配置
 - POST /api/validate-key     → 测试 provider 连通性
+- POST /api/glossary/save    → 校验并保存合并文本，路径供配置引用
+- GET  /api/glossary/status  → 术语表加载状态（存在性+校验+条目数，v0.5.2）
 - GET  /api/browse?path=     → 服务端目录浏览（浏览器拿不到真实路径）
 """
 from __future__ import annotations
@@ -401,6 +403,28 @@ def glossary_save(req: GlossarySaveReq):
         dump_merged(merged), encoding="utf-8")
     return {"ok": True, "path": str(GLOSSARY_MERGED_PATH),
             "term_count": len(merged)}
+
+
+@app.get("/api/glossary/status")
+def glossary_status(path: str = "") -> dict:
+    """v0.5.2: 术语表文件加载状态，供 UI 行内显示「已加载 · N 条术语」。
+
+    只做本地校验不发请求；路径为空/文件缺失时 exists=false（不报错，
+    属于「未设置」而非异常）。条目数与 /api/glossary/preview 同源
+    （validate_text），含 warning 不影响 ok。
+    """
+    raw = path.strip()
+    p = Path(raw).expanduser() if raw else None
+    if p is None or not p.is_file():
+        return {"exists": False, "ok": False, "term_count": 0}
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {"exists": True, "ok": False, "term_count": 0}
+    merged, issues = validate_text(text)
+    errors = [i for i in issues if i["kind"] == "error"]
+    return {"exists": True, "ok": merged is not None and not errors,
+            "term_count": len(merged) if merged is not None else 0}
 
 
 # ---------- 目录浏览 ----------

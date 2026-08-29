@@ -35,11 +35,15 @@ from .config import Config
 from .control import JobControl, JobCancelled
 from .events import EventSink
 from .extract import page_has_text_layer
+from .fit import FitConfig, compute_style_factors, estimate_char_budget
 from .glossary import Glossary
 from .layout import layout_page
 from .langs import is_rtl, lang_info, output_tag
 from .llm import TranslationClient
-from .render import _clean_zh_text, _draw_para, _wrap_cjk, crop_formula_pixmaps, find_cjk_font, render_page
+from .render import _build_font_archive, _clean_zh_text, _draw_para, \
+    _html_escape, _insert_one_htmlbox, _wrap_cjk, cell_spec_css, \
+    collect_cell_specs, collect_para_specs, crop_formula_pixmaps, \
+    find_cjk_font, render_page, spec_css
 
 _VERBOSE_TS = False
 
@@ -208,9 +212,14 @@ def _split_proportional(dst: str, ratio: float) -> tuple[str, str]:
     if len(dst) < 2:
         return "", dst
     target = len(dst) * ratio
+    # v0.6.1: 连词边界优先——跨页拆分落点在长中文串中间时，优先切在
+    # 且/和/或/与 等连词前（B 段以连词开头读起来自然），次选标点后；
+    # 纯字中断点重罚（实测 paper3 p1 末尾"且人"悬字根因）
+    conj = set("且和或与并而但及又以")
     best = min(range(1, len(dst)), key=lambda i: (
         abs(i - target)
-        + (0 if dst[i - 1] in " ，。；：、）】" else 5)))
+        + (0 if dst[i - 1] in " ，。；：、）】" else
+           (2 if dst[i] in conj else 6))))
     return dst[:best].rstrip(), dst[best:].lstrip()
 
 
@@ -218,6 +227,54 @@ def output_pdf_name(stem: str, tgt_lang: str, bilingual: bool) -> str:
     """输出文件名：{stem}[-bilingual]-{语言标记}.pdf（zh→-Zh 旧版兼容）。"""
     suffix = "-bilingual" if bilingual else ""
     return f"{stem}{suffix}-{output_tag(tgt_lang)}.pdf"
+
+
+def _unit_char_budgets(merge_groups: list[list[int]], pending: list,
+                       page_layouts: list[dict], cell_pending: list,
+                       typo, font_path: str, tgt_lang: str,
+                       n_cells: int, n_ocr: int) -> list["int | None"]:
+    """v0.6.0 任务 E：每个翻译单元的目标框字符预算（与 all_flat 对齐）。
+
+    段落按样式基准字号/行高/原始 bbox 估；跨页合并单元 = 两框预算之和；
+    单元格按格 bbox（基准 8pt/1.25 行高）；OCR 单元无框约束（None）。
+    估算只求量级正确——提示词带 15% 容差，渲染阶梯兜底。
+    """
+    from .langs import lang_info as _lang_info
+    from .typography import line_height_factor
+    cjk = _lang_info(tgt_lang).script == "cjk"
+    font = None
+    if not cjk and font_path:
+        try:
+            font = pymupdf.Font(fontfile=font_path)
+        except Exception:
+            font = None
+    budgets: list[int | None] = []
+    for g in merge_groups:
+        total = 0
+        for fi in g:
+            pno, pi = pending[fi]
+            p = page_layouts[pno]["paragraphs"][pi]
+            base = p.get("size") or 10.0
+            lh = 1.32
+            if typo is not None:
+                try:
+                    style = typo.resolve(p, None)
+                    base = max(style.size, 6.5)
+                    lh = line_height_factor(style.kind)
+                except Exception:
+                    pass
+            total += estimate_char_budget(pymupdf.Rect(p["bbox"]), base, lh,
+                                          font, cjk)
+        budgets.append(total if total > 0 else None)
+    for pno, ci in cell_pending:
+        cell = page_layouts[pno]["tables_cells"][ci]
+        b = estimate_char_budget(pymupdf.Rect(cell["bbox"]), 8.0, 1.25,
+                                 font, cjk)
+        budgets.append(b if b > 0 else None)
+    budgets.extend([None] * n_ocr)
+    if len(budgets) != len(merge_groups) + n_cells + n_ocr:
+        return None          # 内部不变量破坏：预算禁用（重问交渲染阶梯）
+    return budgets
 
 
 def _log(msg: str) -> None:
@@ -261,7 +318,8 @@ def _append_ocr_pages(doc, ocr_units: list[tuple[int, str]],
             css = (font_css +
                    f" p {{font-family:{family}; font-size:{fs}pt;"
                    f" line-height:1.5; margin:0; text-align:left;{d}}}")
-            _insert_one_htmlbox(page, body_rect, text, css,
+            _insert_one_htmlbox(page, body_rect,
+                                f"<p>{_html_escape(text)}</p>", css,
                                 f"ocr-appendix p{pno + 1}", warnings,
                                 archive=arch)
         else:
@@ -381,7 +439,8 @@ def _apply_ocr_inplace(doc, pno: int, blocks: list[tuple["pymupdf.Rect", str]],
             css = (font_css +
                    f" p {{font-family:{family}; font-size:{base:.2f}pt;"
                    f" line-height:1.3; margin:0; text-align:left;{d}}}")
-            _insert_one_htmlbox(page, rect, text, css,
+            _insert_one_htmlbox(page, rect,
+                                f"<p>{_html_escape(text)}</p>", css,
                                 f"ocr-inplace p{pno + 1}", warnings,
                                 archive=arch)
             applied += 1
@@ -425,6 +484,17 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         _log(f"WARNING: {w}")
         all_warnings.append(w)
         renderer = "htmlbox"
+
+    # v0.6.0: 排版自适配（fit.mode 缺省 auto——旧配置无 fit 段即生效；
+    # off=回到 v0.5.1 元素级引擎缩放行为）
+    fit_cfg = cfg.fit if cfg.fit is not None else FitConfig()
+    if renderer != "htmlbox" and fit_cfg.mode == "auto":
+        _log("fit: renderer != htmlbox, typography auto-fit disabled")
+        fit_cfg = FitConfig(mode="off")
+    elif fit_cfg.mode == "auto":
+        _log(f"fit: mode=auto (expand={fit_cfg.expand_lines} "
+             f"lead={fit_cfg.lead_steps} tracking={fit_cfg.tracking} "
+             f"min_scale={fit_cfg.min_scale} boost={fit_cfg.body_boost})")
 
     font_path = find_cjk_font(cfg.fonts.get("cjk"), lang=tgt_lang)
     glossary = Glossary.load(cfg.glossary_file) if cfg.glossary_file else None
@@ -716,7 +786,25 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         if control:
             control.checkpoint()
         sink.stage("translate")
-        translated_flat, total_calls = tc.translate_paragraphs(all_flat, cache=cache)
+        # v0.6.0 任务 E：源头控长——翻译前把每段目标框字符预算喂给 LLM，
+        # 超预算译文单段带强约束重译一次（重问上限 = max_llm_calls 的 10%）
+        unit_budgets = None
+        if fit_cfg.mode == "auto":
+            try:
+                unit_budgets = _unit_char_budgets(
+                    merge_groups, pending, page_layouts, cell_pending, typo,
+                    font_path, tgt_lang, len(cell_flat), len(ocr_flat))
+                if unit_budgets is not None:
+                    n_bud = sum(1 for b in unit_budgets if b)
+                    _log(f"fit: char budgets for {n_bud}/{len(unit_budgets)} "
+                         f"unit(s)")
+                else:
+                    _log("fit: budget length mismatch; budgets disabled")
+            except Exception as e:
+                _log(f"fit: budget estimation failed ({e}); disabled")
+                unit_budgets = None
+        translated_flat, total_calls = tc.translate_paragraphs(
+            all_flat, cache=cache, budgets=unit_budgets)
         all_warnings.extend(tc.warnings)
         cell_translations = translated_flat[len(merge_groups):
                                             len(merge_groups) + len(cell_flat)]
@@ -763,6 +851,62 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     sink.stage("render")
     if renderer == "writer":
         _log("renderer: writer (legacy TextWriter engine)")
+
+    # ---- v0.6.0 任务 B/C/D：两遍式排版自适配（测量 pass，在渲染前）----
+    # 遍历全部页/段收集渲染规格（与渲染 pass 同一函数产出），按样式类
+    # 算统一因子——同类元素字号永远一致（DTP 改样式表不改文本框）。
+    # 版面缓存不受影响：测量发生在渲染期，不写入 layout 输出。
+    fit_factors: dict[str, dict] | None = None
+    para_specs_by_page: dict[int, list[dict]] = {}
+    cell_specs_by_page: dict[int, list[dict]] = {}
+    doc_arch = doc_font_css = None
+    if fit_cfg.mode == "auto":
+        doc_arch, doc_font_css = _build_font_archive(
+            font_path, typo.heading_path if typo else None)
+        groups: dict[str, list[dict]] = {}
+        for pno in range(n_pages):
+            lay = page_layouts[pno]
+            paras_ = lay["paragraphs"]
+            page_texts_ = texts_by_page.get(pno) or [None] * len(paras_)
+            tmap_ = {i: page_texts_[i] for i in range(len(paras_))}
+            formula_rects_ = [pymupdf.Rect(f["bbox"])
+                              for f in lay.get("formulas", [])]
+            para_specs_by_page[pno] = collect_para_specs(
+                paras_, tmap_, typo, cfg.features.bilingual, formula_rects_,
+                tgt_lang, layout=lay, fit_cfg=fit_cfg,
+                page_h=doc[pno].rect.height)
+            page_cell_map = {ci: cell_texts.get((pno, ci))
+                             for ci in range(len(lay.get("tables_cells", [])))}
+            cell_specs_by_page[pno] = collect_cell_specs(
+                lay.get("tables_cells") or [], page_cell_map,
+                lay.get("tables"), font_path, tgt_lang)
+            for s in para_specs_by_page[pno]:
+                groups.setdefault(s["cls"], []).append(s)
+            for s in cell_specs_by_page[pno]:
+                if s.get("cls"):
+                    groups.setdefault(s["cls"], []).append(s)
+
+        def _spec_css_factory(spec: dict, factor: float, lead: float,
+                              tracking: float) -> str:
+            if spec.get("kind") == "cell":
+                return cell_spec_css(spec, doc_font_css)
+            return spec_css(spec, doc_font_css, lead, tracking,
+                            factor=factor)
+
+        _t_fit = time.time()
+        fit_warns: list[str] = []
+        fit_factors = compute_style_factors(
+            groups, fit_cfg, _spec_css_factory, doc_arch,
+            warnings=fit_warns, log=lambda m: _log(f"fit: {m}"))
+        all_warnings.extend(fit_warns)
+        _log("fit pass: {} unit(s) in {:.1f}s; factors: {}".format(
+            sum(len(v) for v in groups.values()), time.time() - _t_fit,
+            ", ".join(f"{k}x{v['factor']:.2f}"
+                      + (f"@lead{v['lead']:.2f}" if abs(v["lead"] - 1.0) > 0.005 else "")
+                      for k, v in sorted(fit_factors.items()))))
+        sink.emit("fit_pass", factors={k: round(v["factor"], 3)
+                                       for k, v in fit_factors.items()})
+
     for pno in range(len(doc)):
         if control:
             control.checkpoint()
@@ -781,7 +925,13 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                     typography=typo,
                     cell_texts=page_cell_texts,
                     renderer=renderer,
-                    lang=tgt_lang)
+                    lang=tgt_lang,
+                    para_specs=para_specs_by_page.get(pno),
+                    cell_specs=cell_specs_by_page.get(pno),
+                    factors=fit_factors,
+                    fit_cfg=fit_cfg if fit_cfg.mode == "auto" else None,
+                    archive=doc_arch,
+                    font_css=doc_font_css)
 
     # ---- OCR 译文落页（appendix 插页 / inplace 原位回贴）----
     ocr_pages_added = 0

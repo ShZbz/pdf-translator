@@ -20,6 +20,29 @@ from .control import JobCancelled
 _FORMULA_RE = re.compile(r"\[FORMULA_(\d+)\]")
 
 
+def _budget_rule(batch: dict[str, str],
+                 budgets: "list[int | None] | None",
+                 batch_idx: list[int]) -> str:
+    """本批每 id 字符预算 → prompt 规则行（v0.6.0 任务 E）。
+
+    batch 的 id 是批内序号（1..n），budgets 按 paras 全局索引对齐——
+    用 batch_idx 映射。无任何预算时返回空串（prompt 不变）。
+    """
+    if not budgets:
+        return ""
+    parts = []
+    for j in batch_idx:
+        b = budgets[j] if j < len(budgets) else None
+        if b and b > 0:
+            parts.append(f"id {j + 1} <= {b}")
+    if not parts:
+        return ""
+    return ("Length limits (characters in the target language, HARD): "
+            + ", ".join(parts)
+            + ". Each translation MUST fit its limit; compress wording "
+              "(keep every technical fact, unit and citation) if needed.")
+
+
 class TranslationClient:
     def __init__(self, client, model: str, temperature: float = 0.0,
                  glossary_prompt: str = "", src_lang: str = "en",
@@ -79,7 +102,7 @@ class TranslationClient:
         self._batches_ok = 0                   # 成功批计数（缓存命中不计）
 
     # ---- prompt 构造 ----
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, budget_rule: str = "") -> str:
         from .langs import prompt_lang_name
         rules = [
             f"You are a professional academic translator from "
@@ -93,6 +116,10 @@ class TranslationClient:
             "Transcribe leftover LaTeX-ish math markup by meaning (e.g. Mn$_{3-x}$Sn -> Mn₃₋ₓSn); never copy $, _{}, ^{} literally.",
             "Do not alter numbers, units, citations ([22], Fig. 3), or symbols like ρxy, µΩ-cm.",
         ]
+        if budget_rule:
+            # v0.6.0 任务 E：源头控长——每 id 的目标框字符预算（排版框
+            # 装不下的译文会在渲染层被压缩，不如在翻译时就说清楚）
+            rules.append(budget_rule)
         if self.glossary_prompt:
             rules.append(self.glossary_prompt)
         return "\n".join(rules)
@@ -168,11 +195,13 @@ class TranslationClient:
         return False
 
     def _ask(self, batch: dict[str, str], attempt: int = 1,
-             prev_fail_transport: bool = False) -> dict[str, str] | None:
+             prev_fail_transport: bool = False,
+             budget_rule: str = "") -> dict[str, str] | None:
         """单次调用（线程内执行），返回译文 map；失败返回 None。
 
         退避语义（v0.1.2 沿袭）:仅传输层失败(429/网络)重试前退避;
         内容校验失败(JSON 坏/key 错/占位符丢)不等待直接重试。
+        budget_rule: v0.6.0 每 id 字符预算规则（拼进 system prompt）。
         """
         with self._lock:
             # 预算按成功响应计（v0.1.2 沿袭，有单测锁定）：429 等失败
@@ -200,7 +229,8 @@ class TranslationClient:
                     temperature=self.temperature,
                     timeout=self.timeout,
                     messages=[
-                        {"role": "system", "content": self._system_prompt()},
+                        {"role": "system",
+                         "content": self._system_prompt(budget_rule)},
                         {"role": "user", "content": user},
                     ],
                 )
@@ -251,7 +281,9 @@ class TranslationClient:
 
     # ---- 单批完整流程（worker 入口）----
     def _guarded_batch(self, batch_idx: list[int],
-                       paras: list[str]) -> tuple[list[int], dict[int, str] | None, str]:
+                       paras: list[str],
+                       budgets: "list[int | None] | None" = None
+                       ) -> tuple[list[int], dict[int, str] | None, str]:
         """并发模式下的 worker 包装：取消/暂停检查点 + 异常隔离。
 
         取消时返回 None（已发车的批自然跑完，未发车的批放弃——
@@ -263,7 +295,7 @@ class TranslationClient:
         try:
             if self.control is not None:
                 self.control.checkpoint()
-            return self._process_batch(batch_idx, paras)
+            return self._process_batch(batch_idx, paras, budgets=budgets)
         except JobCancelled:
             with self._lock:
                 self._stop_spawning = True
@@ -275,9 +307,16 @@ class TranslationClient:
             return batch_idx, None, self.model
 
     def _process_batch(self, batch_idx: list[int],
-                       paras: list[str]) -> tuple[list[int], dict[int, str] | None, str]:
-        """返回 (batch_idx, {全局段索引: 译文} 或 None=失败, 本批模型)。"""
+                       paras: list[str],
+                       budgets: list["int | None"] | None = None
+                       ) -> tuple[list[int], dict[int, str] | None, str]:
+        """返回 (batch_idx, {全局段索引: 译文} 或 None=失败, 本批模型)。
+
+        budgets: v0.6.0 与 paras 对齐的每段字符预算（None=不限），
+        拼进本批 system prompt（协议 JSON 形状不变，_parse 不动）。
+        """
         batch = {str(j + 1): paras[j] for j in batch_idx}
+        budget_rule = _budget_rule(batch, budgets, batch_idx)
         got = None
         prev_fail_transport = False
         model_used = self.model   # v0.5.1: 本批模型快照（fallback 切换防串 key）
@@ -287,7 +326,8 @@ class TranslationClient:
         attempt = 1
         while attempt <= self.max_retries:
             got = self._ask(batch, attempt=attempt,
-                            prev_fail_transport=prev_fail_transport)
+                            prev_fail_transport=prev_fail_transport,
+                            budget_rule=budget_rule)
             if got is not None and all(
                     self.formula_counts_ok(batch[k], got[k]) for k in batch):
                 model_used = self.model
@@ -348,21 +388,39 @@ class TranslationClient:
 
     # ---- 批量入口（并发版）----
     def translate_paragraphs(self, paras: list[str],
-                             cache=None) -> tuple[list[str], int]:
+                             cache=None,
+                             budgets: "list[int | None] | None" = None
+                             ) -> tuple[list[str], int]:
         """翻译段落数组，返回 (译文数组, 实际调用次数)。
 
         并发策略:缓存命中先行;未命中批进线程池（max_workers 上限）;
         触顶后未发车的批直接保留原文。
+        budgets: v0.6.0 每段目标框字符预算（None/空=不限）。批 prompt
+        带 HARD 上限；译后软校验 len > budget×1.15 的段单段重问一次
+        （每文档上限 = max_llm_calls 的 10% 防风暴，超限接受交渲染阶梯）。
         """
         results: list[str | None] = [None] * len(paras)
+        budgets = list(budgets) if budgets else None
+        if budgets is not None and len(budgets) != len(paras):
+            self._warn(f"budgets length mismatch ({len(budgets)} vs "
+                       f"{len(paras)}); budgets ignored")
+            budgets = None
 
         # 1) 缓存先行（串行,快）
+        # v0.6.0: 预算档重译结果 key 加 |#b{N} 后缀——先查预算档（此前
+        # 超预算重译过的短版），再查主缓存（旧命中译文仍有效，只是
+        # 可能超长触发渲染阶梯）
         miss = []
         for i, t in enumerate(paras):
             if cache is not None:
-                hit = cache.get(cache.make_key(
+                key = cache.make_key(
                     "openai-compat", self.model,
-                    self.src_lang, self.tgt_lang, t))
+                    self.src_lang, self.tgt_lang, t)
+                hit = None
+                if budgets and budgets[i]:
+                    hit = cache.get(f"{key}|#b{budgets[i]}")
+                if hit is None:
+                    hit = cache.get(key)
                 if hit is not None:
                     results[i] = hit
                     self.cache_hits += 1
@@ -382,7 +440,7 @@ class TranslationClient:
         n_workers = min(self.max_workers, len(batches))
         if n_workers > 1:
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = [pool.submit(self._guarded_batch, b, paras)
+                futures = [pool.submit(self._guarded_batch, b, paras, budgets)
                            for b in batches]
                 for fut in futures:
                     batch_idx, out, model_used = fut.result()
@@ -402,7 +460,8 @@ class TranslationClient:
                 # v0.5.0: 串行路径与并发路径同走 _guarded_batch——旧版直接调
                 # _process_batch，worker 内意外异常（如极端内容的序列化失败）
                 # 会炸掉整个任务；并发路径本就有隔离，两路径行为对齐
-                batch_idx, out, model_used = self._guarded_batch(b, paras)
+                batch_idx, out, model_used = self._guarded_batch(b, paras,
+                                                                 budgets)
                 if out is None:
                     continue
                 for j, dst in out.items():
@@ -413,7 +472,11 @@ class TranslationClient:
                             self.src_lang, self.tgt_lang, paras[j]),
                             paras[j], dst)
 
-        # 3) 触顶未翻译段警告
+        # 3) v0.6.0 任务 E：超预算软校验 → 单段强约束重问（上限防风暴）
+        if budgets:
+            self._reask_over_budget(paras, results, budgets, cache)
+
+        # 4) 触顶未翻译段警告
         with self._lock:
             remaining = sum(1 for i in miss if results[i] is None)
             if remaining and self.api_ok_calls >= self.max_llm_calls:
@@ -423,3 +486,59 @@ class TranslationClient:
 
         final = [(r if r is not None else t) for r, t in zip(results, paras)]
         return final, self.calls_used
+
+    def _reask_over_budget(self, paras: list[str],
+                           results: list["str | None"],
+                           budgets: list["int | None"], cache) -> None:
+        """超预算段单段重问一次（len(dst) > budget×1.15 触发）。
+
+        每文档上限 max(1, max_llm_calls//10)；预算槽位走 _ask 的常规
+        记账（触顶自动放弃）。重问结果通过校验才采纳（公式数一致），
+        存预算档缓存 key（|#b{N} 后缀）；仍超限则接受并告警（渲染阶梯兜底）。
+        """
+        cap = max(1, self.max_llm_calls // 10)
+        asked = 0
+        for i, b in enumerate(budgets):
+            if asked >= cap:
+                break
+            dst = results[i]
+            if not b or b <= 0 or dst is None or len(dst) <= b * 1.15:
+                continue
+            # 源文自身已超预算（数字单元格/机构名等不可压缩内容）——
+            # 重问不可能更短，直接交渲染阶梯（实测 paper3 表 I 数字格）
+            if len(paras[i]) > b * 1.15:
+                continue
+            if self._stop_spawning:
+                break
+            asked += 1
+            over = len(dst) - b
+            rule = (f"Length limit (HARD): id 1 <= {b} characters. The "
+                    f"previous attempt was {over} characters over; compress "
+                    f"the translation (keep every technical fact, unit and "
+                    f"citation) to fit.")
+            got = self._ask({"1": paras[i]}, attempt=1, budget_rule=rule)
+            if got is None or "1" not in got:
+                self._warn(f"budget re-ask #{i} failed; kept over-limit "
+                           f"translation ({len(dst)}/{b} chars), renderer "
+                           f"ladder will compress")
+                continue
+            if not self.formula_counts_ok(paras[i], got["1"]):
+                self._warn(f"budget re-ask #{i}: formula placeholders "
+                           f"mismatch; kept original translation")
+                continue
+            if len(got["1"]) < len(dst):
+                results[i] = got["1"]
+                if len(got["1"]) > b * 1.15:
+                    self._warn(f"budget re-ask #{i} still {len(got['1'])}/{b}"
+                               f" chars; accepted, renderer ladder will "
+                               f"compress")
+                if cache is not None:
+                    key = cache.make_key(
+                        "openai-compat", self.model,
+                        self.src_lang, self.tgt_lang, paras[i])
+                    cache.put(f"{key}|#b{b}", paras[i], got["1"])
+            else:
+                self._warn(f"budget re-ask #{i} produced no shorter "
+                           f"translation; kept over-limit original "
+                           f"({len(dst)}/{b} chars), renderer ladder will "
+                           f"compress")

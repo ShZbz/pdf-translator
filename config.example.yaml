@@ -14,7 +14,7 @@ llm:
   provider: deepseek                # deepseek / zhipu / gemini / siliconflow / openai / ollama / lmstudio
   api_key: ""                       # 留空则读环境变量 DEEPSEEK_API_KEY 等
   base_url: ""                      # 留空用 preset 默认；自建 endpoint 填这里
-  model: "deepseek-chat"
+  model: "deepseek-v4-flash"
   fallback_model: ""                # 备用链，如 "glm-4.7-flash" 或 "m2, m3"
 
   # ---- 翻译质量 ----
@@ -62,6 +62,18 @@ features:
                                     # HTML+CSS 排版引擎（默认，自带两端对齐/
                                     # 复杂文字整形，支持阿拉伯语等 RTL）；
                                     # writer=TextWriter 逐字排印（遗留路径）
+
+# ---- 排版自适配（v0.6.0，仅 htmlbox 渲染器生效）----
+fit:
+  mode: auto                        # auto=两遍式渲染+降级阶梯（默认）；
+                                    # off=关闭（回到 v0.5.1 元素级缩放行为）
+  expand_lines: 1.0                 # 段落向下扩框上限（基准行高倍数；
+                                    # 下探不越同栏下邻元素，参考文献不扩框）
+  lead_steps: [0.95, 0.92]          # 行距降级阶梯（字号收缩前先微压行距）
+  tracking: 0.995                   # 字距系数（阶梯最深一级生效；1=关闭）
+  min_scale: 0.78                   # 样式类字号统一下限（标题类不缩字号）
+  body_boost: 1.05                  # 收缩方向正文微升上限（EN→ZH 低填充
+                                    # 文档微升字号提升可读性；1=关闭）
 
 glossary_file: ""                   # 术语表 YAML 路径（可选）
 

@@ -131,17 +131,21 @@ def is_heading(block: dict, body_size: float | None = None) -> bool:
 
     粗体: bold 字体名(CMBX/Bold/-B)字符占比 >= 60%
     大字号: 主字号 > body_size * 1.15（body_size 缺省时仅看粗体）
+    v0.6.0: 粗体路径加长度守卫（≤200 字符）——IEEE 摘要/Index Terms
+    整块粗斜体（NimbusRomNo9L-MediItal 置 bold 位），旧判据把 700 字符的
+    Abstract 整块判成 heading（样式与类因子全错，实测 paper3 p1）。
     """
     spans = block.get("spans") or []
     if not spans:
         return False
     total = sum(max(len(s["text"]), 1) for s in spans)
+    n_chars = len((block.get("text") or "").strip())
     bold_c = sum(
         max(len(s["text"]), 1) for s in spans
         if re.search(r"(CMBX|Bold|-B$|Hei|SimHei|MT-B)", s.get("font", ""), re.I)
         or (s.get("flags", 0) & 16)   # bit 4: bold
     )
-    if total and bold_c / total >= 0.6:
+    if total and n_chars <= 200 and bold_c / total >= 0.6:
         return True
     size = dominant_size(block)
     return bool(body_size and size > body_size * 1.15)

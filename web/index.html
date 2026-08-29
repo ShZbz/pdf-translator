@@ -188,13 +188,47 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
 .pane.active { display:block; animation:paneIn .3s var(--spring) both; }
 @keyframes paneIn { from{opacity:0; transform:translateX(10px);} to{opacity:1; transform:none;} }
 .set-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:13px; }
-.set-row label { font-size:13.5px; flex:none; }
-.set-row .hint { font-size:11px; color:var(--text-dim); display:block; margin-top:2px; }
+/* v0.5.2: 标签占满左列、控件固定宽贴右——开关/下拉/输入框右侧对齐 */
+.set-row > label:not(.switch) { font-size:13.5px; flex:1; min-width:0; }
 .set-row input[type=text], .set-row input[type=password], .set-row select {
-  width:210px; padding:8px 11px; font-size:13px; color:var(--text);
+  width:230px; flex:none; padding:8px 11px; font-size:13px; color:var(--text);
   background:rgba(127,127,127,0.12); border:0.8px solid var(--glass-border);
   border-radius:9px; outline:none;
 }
+/* v0.5.2: 说明文字改为标题旁问号图标，悬停/点按浮层显示（替代常显 hint） */
+.tip {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:15px; height:15px; margin-left:6px; border-radius:50%;
+  background:rgba(127,127,127,0.16); border:0.8px solid var(--glass-border);
+  font-size:10px; line-height:1; color:var(--text-dim);
+  cursor:help; user-select:none; flex:none; vertical-align:1px;
+  transition:color .2s, border-color .2s, background .2s;
+}
+.tip:hover { color:var(--text); border-color:var(--accent); background:rgba(74,144,217,0.25); }
+#uiTip {
+  position:fixed; z-index:300; max-width:300px; padding:8px 11px;
+  font-size:12px; line-height:1.65; color:var(--text); text-align:left;
+  background:rgba(30,30,34,0.97); border:0.8px solid var(--glass-border);
+  border-radius:10px; box-shadow:0 8px 28px rgba(0,0,0,0.45);
+  opacity:0; transform:translateY(3px); pointer-events:none;
+  transition:opacity .18s, transform .18s;
+}
+#uiTip.show { opacity:1; transform:none; }
+[data-theme="light"] #uiTip { background:rgba(252,252,254,0.98); box-shadow:0 8px 28px rgba(0,0,0,0.18); }
+/* v0.5.2: 术语表行——输入框 + 加载状态 + 管理入口，控件列与其它行同宽右对齐 */
+.glz-col { width:230px; flex:none; display:flex; flex-direction:column; gap:5px; }
+.glz-statusline { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+#glzStatus { font-size:11.5px; color:var(--text-dim); min-width:0;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#glzStatus.ok { color:#7ed88f; }
+#glzStatus.bad { color:#ff9a8b; }
+/* v0.5.2: 已加载术语表来源清单（翻译时实际合并生效的文件），点按 chip 显示完整路径 */
+.glz-loaded { display:flex; flex-wrap:wrap; gap:5px; }
+.glz-loaded:empty { display:none; }
+.glz-loaded .chip { cursor:help; }
+.glz-loaded .chip .st { font-size:11px; color:#7ed88f; flex:none; }
+.glz-loaded .chip.unloaded { opacity:.8; }
+.glz-loaded .chip.unloaded .st { color:var(--text-dim); }
 /* v0.4.3: 下拉弹出选项显式配色——部分浏览器不给 option 继承
    color-scheme，白底弹出列表 + 浅色文字仍然看不清；双保险 */
 .set-row select option { background:#2b2b30; color:#f5f5f7; }
@@ -403,9 +437,9 @@ body.dragging::after {
   </div>
 </div>
 
-<!-- 设置模态 -->
+<!-- 设置模态（v0.5.2: 加宽到 640 缓解布局挤压） -->
 <div class="modal-backdrop" id="settingsBackdrop"></div>
-<div class="modal" id="settingsModal">
+<div class="modal" id="settingsModal" style="width:min(640px,calc(100vw - 36px))">
   <div class="modal-head">
     <h2>设置</h2>
     <button class="modal-close" id="closeSettings">关闭 ✕</button>
@@ -422,17 +456,13 @@ body.dragging::after {
     <div class="pane active" id="pane-model">
       <div class="set-row"><label>Provider</label>
         <select id="cfg-provider"></select></div>
-      <div class="set-row"><label>模型名
-        <span class="hint">如 deepseek-chat / glm-4.7-flash</span></label>
+      <div class="set-row"><label>模型名<span class="tip" data-tip="如 deepseek-v4-flash / glm-4.7-flash">?</span></label>
         <input type="text" id="cfg-model"></div>
-      <div class="set-row"><label>API Key
-        <span class="hint">仅存本地 ui_config.yaml，不出本机</span></label>
+      <div class="set-row"><label>API Key<span class="tip" data-tip="仅存本地 ui_config.yaml，不出本机">?</span></label>
         <input type="password" id="cfg-key" placeholder="••••••••"></div>
-      <div class="set-row"><label>备用模型链
-        <span class="hint">主模型日配额耗尽自动切换，逗号分隔</span></label>
+      <div class="set-row"><label>备用模型链<span class="tip" data-tip="主模型日配额耗尽自动切换，逗号分隔">?</span></label>
         <input type="text" id="cfg-fallback" placeholder="可选"></div>
-      <div class="set-row"><label>自定义 Base URL
-        <span class="hint">留空用 provider 默认；自建 endpoint 填这里</span></label>
+      <div class="set-row"><label>自定义 Base URL<span class="tip" data-tip="留空用 provider 默认；自建 endpoint 填这里">?</span></label>
         <input type="text" id="cfg-baseurl" placeholder="可选"></div>
       <button class="btn-test" id="btnTestKey">测试连通性</button>
       <div class="test-result" id="testResult"></div>
@@ -440,68 +470,65 @@ body.dragging::after {
 
     <!-- 翻译 -->
     <div class="pane" id="pane-trans">
-      <div class="set-row"><label>源语言
-        <span class="hint">版面识别启发式针对英文文献优化</span></label>
+      <div class="set-row"><label>源语言<span class="tip" data-tip="版面识别启发式针对英文文献优化">?</span></label>
         <select id="cfg-srclang"></select></div>
       <div class="set-row"><label>目标语言</label>
         <select id="cfg-tgtlang"></select></div>
-      <div class="set-row" style="align-items:flex-start;"><label>术语表 (YAML)
-        <span class="hint">锁定专业术语一致性</span></label>
-        <div style="display:flex;flex-direction:column;gap:4px;max-width:60%;">
+      <div class="set-row" style="align-items:flex-start;">
+        <label style="padding-top:8px;">术语表 (YAML)<span class="tip" data-tip="锁定专业术语一致性">?</span></label>
+        <div class="glz-col">
           <input type="text" id="cfg-glossary" placeholder="路径，可空">
-          <button type="button" id="btnGlossaryManage" style="align-self:flex-end;
-            padding:3px 10px;font-size:12px;border-radius:8px;cursor:pointer;
-            background:rgba(74,144,217,.12);border:0.8px solid var(--glass-border);color:var(--text);">
-            批量导入/管理 ⚙
-          </button>
+          <div class="glz-loaded" id="glzLoaded"></div>
+          <div class="glz-statusline">
+            <span id="glzStatus"></span>
+            <button type="button" id="btnGlossaryManage" style="padding:3px 10px;font-size:12px;border-radius:8px;cursor:pointer;
+              background:rgba(74,144,217,.12);border:0.8px solid var(--glass-border);color:var(--text);flex:none;">
+              批量导入/管理 ⚙
+            </button>
+          </div>
         </div></div>
-      <div class="set-row"><label>期刊排版
-        <span class="hint">按目标语言选字体：中文宋体/黑体，日韩相应字体，西文 Times 系</span></label>
+      <div class="set-row"><label>期刊排版<span class="tip" data-tip="按目标语言选字体：中文宋体/黑体，日韩相应字体，西文 Times 系">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-formatting" checked><span class="slider"></span></label></div>
-      <div class="set-row"><label>水印移除
-        <span class="hint">仅文字层水印（出版社声明类）；扫描图片型水印无法移除</span></label>
+      <div class="set-row"><label>水印移除<span class="tip" data-tip="仅文字层水印（出版社声明类）；扫描图片型水印无法移除">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-watermark" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>双语对照模式</label>
         <label class="switch"><input type="checkbox" id="cfg-bilingual"><span class="slider"></span></label></div>
-      <div class="set-row"><label>扫描页译文呈现
-        <span class="hint">附录页=译文插附加页（稳）；原位回贴=白块覆盖原位回灌（v0.5.0 实验性，观感更好）</span></label>
-        <select id="cfg-ocrmode" style="width:160px;">
+      <div class="set-row"><label>扫描页译文呈现<span class="tip" data-tip="附录页=译文插附加页（稳）；原位回贴=白块覆盖原位回灌（v0.5.0 实验性，观感更好）">?</span></label>
+        <select id="cfg-ocrmode">
           <option value="appendix">附录页（默认）</option>
           <option value="inplace">原位回贴（实验）</option>
         </select></div>
-      <div class="set-row"><label>渲染引擎
-        <span class="hint">htmlbox=HTML+CSS 排版引擎（v0.5.1 起默认，自带两端对齐/复杂文字整形，支持阿拉伯语等 RTL）；writer=逐字排印（遗留路径）</span></label>
-        <select id="cfg-renderer" style="width:170px;">
+      <div class="set-row"><label>渲染引擎<span class="tip" data-tip="htmlbox=HTML+CSS 排版引擎（v0.5.1 起默认，自带两端对齐/复杂文字整形，支持阿拉伯语等 RTL）；writer=逐字排印（遗留路径）">?</span></label>
+        <select id="cfg-renderer">
           <option value="htmlbox">insert_htmlbox（默认）</option>
           <option value="writer">TextWriter（遗留）</option>
         </select></div>
+      <div class="set-row"><label>排版自适配<span class="tip" data-tip="v0.6.0：两遍式渲染——先测量全文按样式类（正文/图注/文献/表格）算统一字号因子再重排回灌，同类字号永远一致。膨胀方向自动走 扩框→微压行距→类级缩字 阶梯；收缩方向低填充文档微升字号。off=回到逐段独立缩放（字号可能大小不一）">?</span></label>
+        <select id="cfg-fitmode">
+          <option value="auto">自动（默认）</option>
+          <option value="off">关闭（遗留）</option>
+        </select></div>
+      <div class="set-row"><label>源头控长<span class="tip" data-tip="翻译时把每段目标框的字符预算告知模型，超长段自动带强约束重译一次——从上游减少溢出；随「排版自适配」自动开启">?</span></label>
+        <span style="opacity:.7;font-size:12px;align-self:center;">随排版自适配自动开启</span></div>
     </div>
 
     <!-- 性能 -->
     <div class="pane" id="pane-perf">
-      <div class="set-row"><label>并发数
-        <span class="hint">免费档建议 1</span></label>
+      <div class="set-row"><label>并发数<span class="tip" data-tip="免费档建议 1">?</span></label>
         <input type="text" id="cfg-workers" value="3"></div>
-      <div class="set-row"><label>批大小
-        <span class="hint">每批段落数上限（v0.4.3 起另有字符预算）</span></label>
+      <div class="set-row"><label>批大小<span class="tip" data-tip="每批段落数上限（v0.4.3 起另有字符预算）">?</span></label>
         <input type="text" id="cfg-batchsize" value="6"></div>
-      <div class="set-row"><label>批字符预算
-        <span class="hint">~3000 字符/批，长短段不混批；0=仅按段数；设置配额后可留默认自动换算</span></label>
+      <div class="set-row"><label>批字符预算<span class="tip" data-tip="~3000 字符/批，长短段不混批；0=仅按段数；设置配额后可留默认自动换算">?</span></label>
         <input type="text" id="cfg-batchchars" value="3000"></div>
-      <div class="set-row"><label>Provider 配额 RPM
-        <span class="hint">每分钟请求上限；设置后自动换算调用间隔与批预算（v0.5.0，显式配置优先）</span></label>
+      <div class="set-row"><label>Provider 配额 RPM<span class="tip" data-tip="每分钟请求上限；设置后自动换算调用间隔与批预算（v0.5.0，显式配置优先）">?</span></label>
         <input type="text" id="cfg-rpm" value="0" inputmode="numeric"></div>
-      <div class="set-row"><label>Provider 配额 TPM
-        <span class="hint">每分钟 token 上限；与 RPM 同时设置时自动换算批字符预算</span></label>
+      <div class="set-row"><label>Provider 配额 TPM<span class="tip" data-tip="每分钟 token 上限；与 RPM 同时设置时自动换算批字符预算">?</span></label>
         <input type="text" id="cfg-tpm" value="0" inputmode="numeric"></div>
-      <div class="set-row"><label>布局并行数
-        <span class="hint">版面分析进程数；0=自动，1=串行</span></label>
+      <div class="set-row"><label>布局并行数<span class="tip" data-tip="版面分析进程数；0=自动，1=串行">?</span></label>
         <input type="text" id="cfg-layoutworkers" value="0"></div>
-      <div class="set-row"><label>调用间隔 (秒)
-        <span class="hint">限流严调大</span></label>
+      <div class="set-row"><label>调用间隔 (秒)<span class="tip" data-tip="限流严调大">?</span></label>
         <input type="text" id="cfg-interval" value="2"></div>
-      <div class="set-row"><label>调用上限
-        <span class="hint">单文档防跑飞</span></label>
+      <div class="set-row"><label>调用上限<span class="tip" data-tip="单文档防跑飞">?</span></label>
         <input type="text" id="cfg-maxcalls" value="40"></div>
       <div class="set-row"><label>重试次数</label>
         <input type="text" id="cfg-retries" value="2"></div>
@@ -509,26 +536,20 @@ body.dragging::after {
 
     <!-- 高级 -->
     <div class="pane" id="pane-adv">
-      <div class="set-row"><label>翻译缓存
-        <span class="hint">二次运行零调用</span></label>
+      <div class="set-row"><label>翻译缓存<span class="tip" data-tip="二次运行零调用">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-cache" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>术语锁定校验</label>
         <label class="switch"><input type="checkbox" id="cfg-glosslock" checked><span class="slider"></span></label></div>
       <hr style="border:none;border-top:0.8px solid var(--glass-border);margin:14px 0 16px;">
-      <div class="set-row"><label>Temperature
-        <span class="hint">默认 0 · 建议 0–0.5 固定风格</span></label>
+      <div class="set-row"><label>Temperature<span class="tip" data-tip="默认 0 · 建议 0–0.5 固定风格">?</span></label>
         <input type="text" id="cfg-temperature" value="0" inputmode="decimal"></div>
-      <div class="set-row"><label>请求超时 (秒)
-        <span class="hint">默认 120 · 慢模型调大至 180–300</span></label>
+      <div class="set-row"><label>请求超时 (秒)<span class="tip" data-tip="默认 120 · 慢模型调大至 180–300">?</span></label>
         <input type="text" id="cfg-timeout" value="120" inputmode="decimal"></div>
-      <div class="set-row"><label>传输重试退避起点 (秒)
-        <span class="hint">默认 8 · 建议 5–15</span></label>
+      <div class="set-row"><label>传输重试退避起点 (秒)<span class="tip" data-tip="默认 8 · 建议 5–15">?</span></label>
         <input type="text" id="cfg-backoffbase" value="8" inputmode="decimal"></div>
-      <div class="set-row"><label>退避上限 (秒)
-        <span class="hint">默认 30 · 建议 20–60</span></label>
+      <div class="set-row"><label>退避上限 (秒)<span class="tip" data-tip="默认 30 · 建议 20–60">?</span></label>
         <input type="text" id="cfg-backoffcap" value="30" inputmode="decimal"></div>
-      <div class="set-row"><label>限流等待封顶 (秒)
-        <span class="hint">默认 60 · 建议 30–120</span></label>
+      <div class="set-row"><label>限流等待封顶 (秒)<span class="tip" data-tip="默认 60 · 建议 30–120">?</span></label>
         <input type="text" id="cfg-retrycaps" value="60" inputmode="decimal"></div>
       <div class="save-float"><button id="btnSaveCfg">保存设置</button></div>
     </div>
@@ -632,6 +653,7 @@ async function loadConfig() {
     $('cfg-watermark').checked = (CFG.features||{}).watermark_removal !== false;
     $('cfg-bilingual').checked = !!(CFG.features||{}).bilingual;
     $('cfg-renderer').value = (CFG.features||{}).renderer || 'htmlbox';
+    $('cfg-fitmode').value = (CFG.fit||{}).mode || 'auto';
     $('cfg-ocrmode').value = (CFG.ocr||{}).mode || 'appendix';
     $('cfg-cache').checked = (CFG.features||{}).translation_cache !== false;
     $('cfg-glosslock').checked = (CFG.features||{}).glossary_lock !== false;
@@ -650,6 +672,11 @@ async function loadConfig() {
     $('cfg-backoffbase').value = llm.backoff_base ?? 8;
     $('cfg-backoffcap').value = llm.backoff_cap ?? 30;
     $('cfg-retrycaps').value = llm.retry_delay_cap ?? 60;
+    // v0.5.2: 批量导入的来源文件清单随配置持久化——翻译时加载的是合并文件，
+    // 这里回显「哪几个文件被合并进来了」；路径为空时清单无意义，一并清掉
+    glzSources = Array.isArray(CFG.glossary_sources) && CFG.glossary_file
+      ? CFG.glossary_sources : [];
+    refreshGlossaryStatus();   // v0.5.2: 配置载入后刷新术语表「已加载」状态
   } catch(e) { console.warn('loadConfig', e); }
 }
 
@@ -685,7 +712,9 @@ function collectConfig() {
       bilingual: $('cfg-bilingual').checked,
       renderer: $('cfg-renderer').value || 'htmlbox',
     },
+    fit: { mode: $('cfg-fitmode').value || 'auto' },
     glossary_file: $('cfg-glossary').value.trim(),
+    glossary_sources: glzSources.slice(),   // v0.5.2: 合并来源清单（批量导入记忆）
     performance: {
       layout_workers: num($('cfg-layoutworkers').value, 0),
       cache_max_entries: (CFG.performance || {}).cache_max_entries ?? 50000,
@@ -721,7 +750,7 @@ $('btnTestKey').onclick = async () => {
   const cfgNow = collectConfig().llm;
   try {
     const r = await api('/api/validate-key', {method:'POST', body: JSON.stringify({
-      provider: cfgNow.provider, model: cfgNow.model || 'deepseek-chat',
+      provider: cfgNow.provider, model: cfgNow.model || 'deepseek-v4-flash',
       api_key: cfgNow.api_key, base_url: cfgNow.base_url,
       target_lang: $('cfg-tgtlang').value,
       // v0.5.1: 与翻译任务共用超时/重试（慢模型 15s 必超时误报 key 无效）
@@ -739,7 +768,7 @@ $('btnTestKey').onclick = async () => {
 
 /* ---------- 设置模态开关 ---------- */
 function openModal(m, b) { m.classList.add('show'); b.classList.add('show'); }
-function closeModal(m, b) { m.classList.remove('show'); b.classList.remove('show'); }
+function closeModal(m, b) { m.classList.remove('show'); b.classList.remove('show'); hideUiTip(); }
 $('btnSettings').onclick = () => openModal($('settingsModal'), $('settingsBackdrop'));
 $('closeSettings').onclick = () => closeModal($('settingsModal'), $('settingsBackdrop'));
 $('settingsBackdrop').onclick = () => closeModal($('settingsModal'), $('settingsBackdrop'));
@@ -753,17 +782,67 @@ document.querySelectorAll('.tab-bar button').forEach(btn => {
   };
 });
 
+/* ---------- v0.5.2: 问号/chip 通用 tooltip ----------
+   带 data-tip 的元素（设置项问号、已加载术语表 chip）悬停或点按时
+   浮动显示说明，光标移开/点击其它位置/滚动即消失。
+   浮层挂在 body 上按视口坐标定位（模态有 overflow 裁剪，不能放行内）。 */
+const uiTip = document.createElement('div');
+uiTip.id = 'uiTip';
+uiTip.setAttribute('role', 'tooltip');
+document.body.appendChild(uiTip);
+
+function showUiTip(el) {
+  const text = el.dataset.tip;
+  if (!text) return;
+  uiTip.textContent = text;
+  uiTip.classList.add('show');
+  const r = el.getBoundingClientRect();
+  const tw = uiTip.offsetWidth, th = uiTip.offsetHeight;
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+  let top = r.bottom + 8;
+  if (top + th > window.innerHeight - 8) top = Math.max(8, r.top - th - 8);
+  uiTip.style.left = left + 'px';
+  uiTip.style.top = top + 'px';
+}
+function hideUiTip() { uiTip.classList.remove('show'); }
+
+document.addEventListener('mouseover', e => {
+  const el = e.target.closest && e.target.closest('[data-tip]');
+  if (el) showUiTip(el);
+});
+document.addEventListener('mouseout', e => {
+  if (e.target.closest && e.target.closest('[data-tip]')) hideUiTip();
+});
+document.addEventListener('click', e => {
+  const el = e.target.closest && e.target.closest('[data-tip]');
+  if (el) showUiTip(el);   // 触屏无 hover，点按同样显示
+  else hideUiTip();        // 点击浮层外任意位置关闭
+});
+document.addEventListener('scroll', hideUiTip, true);   // 捕获阶段覆盖模态内滚动
+
 /* ---------- 文件浏览器 ---------- */
 let browseTarget = null;   // 'input' | 'output' | 'glossary'
 let browseSel = null;
 let browseChecked = new Set();   // glossary 模式多选
+// v0.5.2: 术语表「添加文件/目录」记住上次选择的目录（localStorage 持久，跨会话）；
+// 记录的目录被移动/删除时回退服务端默认起点（/mnt/c/Users → 用户主目录）
+const GLZ_LAST_DIR_KEY = 'glzLastDir';
+
+function glzLastDir() {
+  try { return localStorage.getItem(GLZ_LAST_DIR_KEY) || ''; }
+  catch(e) { return ''; }
+}
+
 function openBrowse(target) {
   browseTarget = target; browseSel = null; browseChecked.clear();
   $('browseSelect').textContent = target === 'output' ? '选定此目录'
     : target === 'glossary' ? '加入术语表（勾选项）' : '选定此文件';
   openModal($('browseModal'), $('browseBackdrop'));
-  browseTo($('inputPath').value && target==='input' ? parentOf($('inputPath').value)
-          : $('outputDir').value && target==='output' ? $('outputDir').value : '');
+  const start = target === 'input' && $('inputPath').value ? parentOf($('inputPath').value)
+    : target === 'output' && $('outputDir').value ? $('outputDir').value
+    : target === 'glossary' ? glzLastDir() : '';
+  browseTo(start).then(ok => { if (!ok && start) browseTo(''); });
 }
 function parentOf(p) { const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')); return i > 0 ? p.slice(0, i) : ''; }
 $('browseInput').onclick = () => openBrowse('input');
@@ -773,6 +852,7 @@ $('browseBackdrop').onclick = () => closeModal($('browseModal'), $('browseBackdr
 $('browseCancelBtn').onclick = () => closeModal($('browseModal'), $('browseBackdrop'));
 
 async function browseTo(path) {
+  // v0.5.2: 返回是否成功——打开时记忆目录失效需感知并回退默认起点
   try {
     const d = await api('/api/browse?path=' + encodeURIComponent(path));
     $('browseCur').value = d.path;
@@ -810,15 +890,19 @@ async function browseTo(path) {
       it.ondblclick = () => { if (e.dir) browseTo(d.path + '/' + e.name); };
       list.appendChild(it);
     });
-  } catch(err) { toast(err.message, true); }
+    return true;
+  } catch(err) { toast(err.message, true); return false; }
 }
 $('browseUp').onclick = () => browseTo(parentOf($('browseCur').value));
 $('browseSelect').onclick = () => {
   if (browseTarget === 'glossary') {
     if (!browseChecked.size) { toast('先勾选术语表文件', true); return; }
     browseChecked.forEach(p => { if (!glzPaths.includes(p)) glzPaths.push(p); });
+    try { localStorage.setItem(GLZ_LAST_DIR_KEY, $('browseCur').value); } catch(e) {}
     renderGlzChips();
     closeModal($('browseModal'), $('browseBackdrop'));
+    // v0.5.2 修复：旧版加入文件后不重开管理弹窗，用户看不到刚加的文件
+    openModal($('glossaryModal'), $('glossaryBackdrop'));
     glzPreview();
     return;
   }
@@ -851,7 +935,9 @@ function renderGlzChips() {
 
 async function openGlossaryManager() {
   const existing = $('cfg-glossary').value.trim();
-  glzPaths = existing ? [existing] : [];
+  // v0.5.2: 之前批量保存过（来源清单在）→ 回显全部来源文件，
+  // 用户能看到上次加了哪几份、继续追加；否则退回单文件模式
+  glzPaths = existing ? (glzSources.length ? [...glzSources] : [existing]) : [];
   glzContent = '';
   $('glossaryBox').value = '';
   $('glzIssues').innerHTML = '';
@@ -896,6 +982,8 @@ async function glzSave() {
   } catch(e) { toast('保存请求失败: ' + e.message, true); return; }
   if (d.ok) {
     $('cfg-glossary').value = d.path;
+    glzSources = [...glzPaths];   // v0.5.2: 记住合并来源，供清单展示与下次回显
+    refreshGlossaryStatus();   // v0.5.2: 保存后立即显示「已加载」
     toast(`已保存：${d.term_count} 条术语`);
     closeModal($('glossaryModal'), $('glossaryBackdrop'));
   } else if (d.issues) {
@@ -919,6 +1007,68 @@ $('glzCancelBtn').onclick = () => closeModal($('glossaryModal'), $('glossaryBack
 $('btnGlzAdd').onclick = () => { closeModal($('glossaryModal'), $('glossaryBackdrop')); openBrowse('glossary'); };
 $('btnGlzPreview').onclick = glzPreview;
 $('glzSaveBtn').onclick = glzSave;
+
+/* ---------- v0.5.2: 术语表加载状态 ----------
+   路径非空时向服务端查询存在性/校验/条目数，行内显示「已加载 · N 条术语」；
+   文件缺失或校验不过则红字提示——此前 UI 无法知晓术语表是否真的加载。
+   同时在输入框下方列出翻译时会加载的术语表来源文件（批量导入可一次
+   合并多份，合并结果存为单一文件，来源清单随配置持久化，点 chip 显示完整路径）。 */
+let glzStatusTimer = null;
+let glzSources = [];   // 批量导入的来源文件路径（顺序=合并顺序，后者覆盖）
+
+function activeGlossaryFiles() {
+  // 手动改过路径（glzSources 被清）→ 单文件模式，清单就是当前路径
+  const cur = $('cfg-glossary').value.trim();
+  return glzSources.length ? glzSources.slice() : (cur ? [cur] : []);
+}
+
+function renderGlzLoaded(loaded) {
+  const host = $('glzLoaded'); host.innerHTML = '';
+  activeGlossaryFiles().forEach(fp => {
+    const c = document.createElement('span');
+    c.className = 'chip' + (loaded ? '' : ' unloaded');
+    c.dataset.tip = fp;                       // 点按/悬停显示完整路径
+    const b = document.createElement('b');
+    b.textContent = fp.split(/[\\/]/).pop().replace(/\.(yaml|yml|json)$/i, '');
+    const st = document.createElement('span');
+    st.className = 'st';
+    st.textContent = loaded ? '已加载' : '未加载';
+    c.append(b, st);
+    host.appendChild(c);
+  });
+}
+
+async function refreshGlossaryStatus() {
+  const el = $('glzStatus');
+  const p = $('cfg-glossary').value.trim();
+  if (!p) {
+    el.textContent = ''; el.className = '';
+    renderGlzLoaded(false);
+    return;
+  }
+  el.textContent = '检查中…'; el.className = '';
+  try {
+    const d = await api('/api/glossary/status?path=' + encodeURIComponent(p));
+    const ok = d.exists && d.ok;
+    if (!d.exists) { el.textContent = '⚠ 文件不存在'; el.className = 'bad'; }
+    else if (!d.ok) { el.textContent = `⚠ 校验未通过（${d.term_count} 条可用）`; el.className = 'bad'; }
+    else if (!d.term_count) { el.textContent = '✓ 已加载 · 空术语表'; el.className = 'ok'; }
+    else { el.textContent = `✓ 已加载 · ${d.term_count} 条术语`; el.className = 'ok'; }
+    renderGlzLoaded(ok);
+  } catch(e) {
+    // 404 = 服务端进程是旧版（index.html 实时读盘是新的，路由是启动时加载的）
+    el.textContent = /not found|404/i.test(e.message)
+      ? '⚠ 状态接口不可用（服务端为旧进程，请重启 run_ui.py）'
+      : '⚠ ' + e.message;
+    el.className = 'bad';
+    renderGlzLoaded(false);
+  }
+}
+$('cfg-glossary').addEventListener('input', () => {
+  glzSources = [];   // 手动改动路径 → 旧来源清单不再代表将要加载的内容
+  clearTimeout(glzStatusTimer);
+  glzStatusTimer = setTimeout(refreshGlossaryStatus, 400);   // 防每键一查
+});
 
 /* ---------- 翻译流程 ---------- */
 let pollTimer = null;

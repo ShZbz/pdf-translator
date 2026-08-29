@@ -145,6 +145,8 @@ class Config:
     glossary_file: str = ""
     fonts: dict = field(default_factory=lambda: {"cjk": ""})
     ocr: OCRConfig = field(default_factory=OCRConfig)
+    # v0.6.0: 排版自适配（两遍式渲染 + 样式级因子 + 降级阶梯 + 源头控长）
+    fit: "FitConfig | None" = None
 
 
 def load_config(path: str | Path) -> Config:
@@ -167,9 +169,17 @@ def load_config(path: str | Path) -> Config:
     if ocr.mode not in ("appendix", "inplace"):
         raise ValueError(
             f"ocr.mode 必须是 'appendix' 或 'inplace'，当前 {ocr.mode!r}")
+    from .fit import FitConfig
+    fit_cfg = None
+    if "fit" in raw:
+        try:
+            fit_cfg = FitConfig.from_raw(raw.get("fit") or {})
+        except ValueError as e:
+            raise ValueError(f"fit 配置无效: {e}") from e
     cfg = Config(io=io_, llm=llm, features=feat, performance=perf, ocr=ocr,
                  glossary_file=raw.get("glossary_file", ""),
-                 fonts=raw.get("fonts") or {"cjk": ""})
+                 fonts=raw.get("fonts") or {"cjk": ""},
+                 fit=fit_cfg)
     # 硬校验：输入输出路径必填
     if not cfg.io.input:
         raise ValueError("config.io.input is required")

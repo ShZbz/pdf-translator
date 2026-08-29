@@ -8,12 +8,14 @@
 
 ## 功能特性
 
-- **渲染引擎 htmlbox 转正（v0.5.1）**：默认 `htmlbox` 走 pymupdf `insert_htmlbox`（Story 排版引擎）——断行/避头尾/试排降字号交给引擎，自带两端对齐与复杂文字整形（shaping/bidi）；段落与表格单元格全走该路径；`features.renderer: writer` 可切回 TextWriter 逐字排印（遗留路径），两种引擎可逐段对比
-- **RTL 与天城文解锁（v0.5.1）**：阿拉伯语/希伯来语（自动 `direction:rtl`）与印地语（天城文整形）可用，字体链自动探测（Windows Arial/Nirmala，Linux Noto 系）；目标语言为 RTL/天城文时 writer 引擎会自动切换到 htmlbox 并告警
-- **任务持久化**：队列/历史落 SQLite（`.ui_jobs.db`），服务重启自动恢复未完成任务重新排队——配合翻译缓存与**版面缓存**（v0.5.1），重跑只剩增量段；历史跨重启可查（`GET /api/jobs`，含输入路径/警告/缓存统计）
-- **版面缓存·段落级断点续跑（v0.5.1）**：版面结果按输入文件（路径+大小+mtime+引擎）落盘缓存，同一输入重跑跳过布局阶段直达翻译（`performance.layout_cache`，默认开）
-- **UI 实时推送**：SSE 端点 `/api/jobs/current/stream` 事件流（进度/阶段/警告），EventSource 优先，断线自动重连携带 `Last-Event-ID` 续传（v0.5.1，服务端有界事件日志按 id 补发错过的帧），浏览器不支持时自动回退轮询
-- **任务历史面板（v0.5.1）**：UI 左下角时钟按钮打开历史列表（最近 50 条）——重跑（沿用历史输入/输出 + 当前配置）、打开输出 PDF、展开查看警告与缓存节省统计
+- **渲染引擎 htmlbox 转正**：默认 `htmlbox` 走 pymupdf `insert_htmlbox`（Story 排版引擎）——断行/避头尾/试排降字号交给引擎，自带两端对齐与复杂文字整形（shaping/bidi）；段落与表格单元格全走该路径；`features.renderer: writer` 可切回 TextWriter 逐字排印（遗留路径），两种引擎可逐段对比
+- **排版自适配**：两遍式渲染——先测量全文每段"能装下的最大字号因子"，按样式类（正文/图注/文献条目/表格）各取统一因子再重排回灌，同类元素字号永远一致（对齐 InDesign/Trados 式 DTP 流程：改样式表，不改单个文本框）。译文膨胀方向（如 ZH→EN，溢出段占比≥30%）自动走 降级阶梯：整段重排（Story 引擎）→ 向下扩框（≤1 行高，不越下邻元素/页底）→ 微压行距/字距 → 类级字号收缩（下限 0.78，标题类不缩）；孤立溢出（占比<30%，如 EN→ZH 收缩方向）绝不陪绑全类缩字——正文反向填充：字号微升 ×1.05 + 行距吃掉框底空白（段间距不增反降）。装不下必告警不静默，极端兜底保证必出字。`fit.mode: off` 可关闭
+- **源头控长**：翻译前按每段目标框实测字宽估算字符预算，随 prompt 告知模型（HARD 上限）；超预算 15% 的译文单段带强约束重译一次（每文档上限 = 调用上限的 10%），预算档结果独立缓存——从上游消灭一大半溢出，尤其表格单元格/图注这类不可越界的硬约束场景
+- **RTL 与天城文解锁**：阿拉伯语/希伯来语（自动 `direction:rtl`）与印地语（天城文整形）可用，字体链自动探测（Windows Arial/Nirmala，Linux Noto 系）；目标语言为 RTL/天城文时 writer 引擎会自动切换到 htmlbox 并告警
+- **任务持久化**：队列/历史落 SQLite（`.ui_jobs.db`），服务重启自动恢复未完成任务重新排队——配合翻译缓存与**版面缓存**，重跑只剩增量段；历史跨重启可查（`GET /api/jobs`，含输入路径/警告/缓存统计）
+- **版面缓存·段落级断点续跑**：版面结果按输入文件（路径+大小+mtime+引擎）落盘缓存，同一输入重跑跳过布局阶段直达翻译（`performance.layout_cache`，默认开）
+- **UI 实时推送**：SSE 端点 `/api/jobs/current/stream` 事件流（进度/阶段/警告），EventSource 优先，断线自动重连携带 `Last-Event-ID` 续传（服务端有界事件日志按 id 补发错过的帧），浏览器不支持时自动回退轮询
+- **任务历史面板**：UI 左下角时钟按钮打开历史列表（最近 50 条）——重跑（沿用历史输入/输出 + 当前配置）、打开输出 PDF、展开查看警告与缓存节省统计
 - **LLM 配额自适应**：`llm.rpm_limit`/`llm.tpm_limit` 填入 provider 配额后自动换算调用间隔（60/RPM）与批字符预算（TPM/RPM × 3.2 字符/token × 0.8 安全系数），显式写出的配置项优先
 - **任务队列**：UI/API 忙时提交自动入队接力执行，任务终态归档 history（`GET /api/jobs` 可查）
 - **批字符预算组批**：LLM 组批按 ~3000 字符/批贪心装填（`batch_char_budget`），长短段不混批，降低长批超时失败率；`batch_size` 为每批段数上限
@@ -88,7 +90,7 @@ io:
 llm:
   provider: deepseek           # 见下方 Provider 配置
   api_key: ""                  # 留空则从环境变量读取
-  model: "deepseek-chat"
+  model: "deepseek-v4-flash"
 features:
   translation_cache: true      # 二次运行零调用
 fonts:
@@ -126,7 +128,7 @@ python -m translator.cli -c myconfig.yaml
 
 | provider | base_url | 环境变量 | 推荐模型 |
 |---|---|---|---|
-| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` |
 | `zhipu` | `https://open.bigmodel.cn/api/paas/v4` | `ZHIPU_API_KEY` | `glm-4.7-flash`（免费）/ `glm-4-plus` |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `gemini-2.5-flash` |
 | `siliconflow` | `https://api.siliconflow.cn/v1` | `SILICONFLOW_API_KEY` | 各家开源模型 |
@@ -179,7 +181,7 @@ performance:               # 本地性能
     min_call_interval: 6   # 拉大间隔
     timeout: 180           # 该模型带思维链，响应慢
   ```
-  代价是单文档耗时 10 分钟以上且仍可能部分降级。**日常使用推荐 deepseek-chat**。
+  代价是单文档耗时 10 分钟以上且仍可能部分降级。**日常使用推荐 deepseek-v4-flash**。
 - **Gemini API（免费 tier）**：`gemini-2.5-flash` 等模型的日配额按模型独立计数，耗尽的报错含 `PerDay quotaId`，此时可用 `fallback_model: "gemini-2.5-flash-lite"` 自动切换。但**预付费余额归零**时报 `RESOURCE_EXHAUSTED: Your prepayment credits are depleted`——这是账户级的，所有模型一起不可用，换模型无效，只能充值或换 provider。
 - **本地模型**（Ollama/LM Studio）：零成本无限流，`base_url` 指向本地端口即可；注意上下文窗口 ≥8k、指令遵循能力会影响 batch JSON 协议的成功率，失败段落自动降级保留原文。
 
@@ -227,7 +229,7 @@ Weyl semimetal: 外尔半金属
 python -m pytest tests/ -q
 ```
 
-126 个单测覆盖核心逻辑：批字符预算组批、缓存容量淘汰与命中统计、单元格原文回灌与 htmlbox 单元格回灌、扫描页 OCR（附录/原位）、布局并行与串行一致性、任务队列/history 归档/重启恢复/历史字段迁移、SSE 端点帧契约与 Last-Event-ID 重放、配额自适应换算、htmlbox/ writer 双渲染路径与 RTL 样张、OCR 行分组/图形避让/原位回贴、pymupdf-layout 适配层（1.28.x 五元组 + 未装回退）、provider 参数透传、跨页断句拆分（含边界标点与连字符合并）、公式编号剥离、Algorithm 框判定、三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行、服务端目录浏览与输出预览、key 回填等。
+157 个单测覆盖核心逻辑：批字符预算组批、缓存容量淘汰与命中统计、单元格原文回灌与 htmlbox 单元格回灌、扫描页 OCR（附录/原位）、布局并行与串行一致性、任务队列/history 归档/重启恢复/历史字段迁移、SSE 端点帧契约与 Last-Event-ID 重放、配额自适应换算、htmlbox/ writer 双渲染路径与 RTL 样张、排版自适配（测量基座/样式级因子/降级阶梯/扩框零重叠/微升/丢段兜底）、源头控长（预算规则/单段重问/预算档缓存）、small caps 节标题与整块粗体摘要的样式回归、OCR 行分组/图形避让/原位回贴、pymupdf-layout 适配层（1.28.x 五元组 + 未装回退）、provider 参数透传、跨页断句拆分（含边界标点与连字符合并）、公式编号剥离、Algorithm 框判定、三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行、服务端目录浏览与输出预览、key 回填等。
 测试不需要网络和 API key。
 
 ## 项目结构
@@ -237,6 +239,7 @@ translator/
   cli.py         # 命令行入口
   pipeline.py    # 主流程编排（布局→裁图→排队→翻译→回灌；并行布局/OCR、配额自适应、OCR 原位回贴、双渲染引擎、版面缓存断点续跑、缓存节省报表）
   render.py      # 渲染回灌（redaction/重排/公式回贴；htmlbox 默认 + writer 遗留双引擎，RTL direction 支持）
+  fit.py        # 排版自适配：测量基座（Story 同源）+ 样式级全局因子 + 降级阶梯 + 字符预算
   extract.py     # 文本块提取（扫描页检测 page_has_text_layer）
   layout.py      # 版面分析（双栏/公式区/三线表/图注/页眉脚/Algorithm框；pymupdf-layout 外部引擎适配层）
   refsplit.py    # 参考文献条目重切
@@ -276,6 +279,3 @@ glossary-physics-example.yaml  # 物理/量子材料术语表示例
 ## 版本历史
 
 各版本变更见 GitHub Releases：<https://github.com/ShZbz/pdf-translator/releases>
----
-
-*软件按「现状」提供，仅供学习与科研用途。*
