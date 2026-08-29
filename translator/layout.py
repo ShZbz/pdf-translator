@@ -33,6 +33,17 @@ _MERGE_CAP_CHARS = 500
 # 小块（标题/作者/单位级）严格字号阈值：字号差 >0.25pt 即不并
 _SMALL_BLOCK_CHARS = 120
 _REFS_HEADING_RE = re.compile(r"REFERENCES[\s.:]*$", re.I)
+# v0.7.1 任务 1.5: 列表项判定（编号/项目符号前缀模式）。
+# 仅产出元数据 is_list_item——faithful 模式渲染不动（决策记 PLAN.md：
+# 语义 <ol>/<ul> 列表化随 P3 reflow 落地，faithful 下 marker 位置可能
+# 被引擎移动，保真优先）。排除 ref 条目（"[1] ..." 是文献编号非列表）。
+_LIST_MARKER_RE = re.compile(
+    r"^\s*(?:"
+    r"[\(\[（【]?(?:\d{1,2}|[ivxIVX]{1,4}|[a-hA-H])[\)\]）】][\s.、：]"
+    r"|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫]"
+    r"|[•·◦‣▪●▸‧]\s"
+    r"|\d{1,2}[.)]\s+\S"
+    r")")
 
 
 def detect_columns(page, blocks: list[dict]) -> str:
@@ -468,6 +479,10 @@ def merge_paragraphs(blocks: list[dict]) -> list[dict]:
             p = dict(b)
             p["is_caption"] = cap
             p["is_ref"] = is_ref_entry
+            # v0.7.1 任务 1.5: 列表项元数据（ref 条目排除——"[1] " 是
+            # 文献编号；caption 排除）。faithful 渲染不用，P3 reflow 用
+            p["is_list_item"] = (not cap and not is_ref_entry
+                                 and bool(_LIST_MARKER_RE.match(txt_head)))
             # v0.2.3: Algorithm caption 行（'Algorithm 1: ...' 纯标题块）
             # 标记为 is_alg_caption——翻译它（中文期刊惯例），渲染层按
             # caption 风格处理；伪代码主体仍由 _is_algorithm_block verbatim
@@ -629,9 +644,13 @@ def _column_anchor_split(bands: list[dict]) -> None:
             x1_count[c] = x1_count.get(c, 0) + 1
     right_anchors = sorted(c for c, n in x1_count.items()
                            if n >= need and all(abs(c - a) > 4 for a in anchors))
-    band["col_groups"] = None
-    band["conf"] = 0.4
+    # v0.7.1 修复：此处原为 `band["col_groups"] = None`——band 是上一循环
+    # 残留变量（bands 为空时 NameError；早退路径只有末带拿到默认值）。
+    # 默认值本就是兜底语义（调用方 .get 缺省 None/0.4），显式落带内循环。
     if len(anchors) < 2:
+        for b0 in bands:
+            b0["col_groups"] = None
+            b0["conf"] = 0.4
         return
 
     def _assign(band: dict) -> "tuple[dict[int, list], list] | None":

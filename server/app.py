@@ -247,7 +247,22 @@ def get_config() -> dict:
         del masked["api_key"]
     else:
         masked["has_key"] = False
-    return {"config": {**raw, "llm": masked}}
+    # v0.7.1: 首启向导触发条件——ui_config.yaml 不存在即向导模式
+    return {"config": {**raw, "llm": masked},
+            "first_run": not UI_CONFIG_PATH.exists()}
+
+
+@app.get("/api/presets")
+def presets() -> dict:
+    """v0.7.1: provider 预设 + 档位调优参数（首启向导下拉/预填数据源）。
+
+    单一来源 translator.config：PRESETS（base_url/env）、PROVIDER_TUNING
+    （按档位自动写入的整组推荐参数）、RECOMMENDED_MODELS（推荐模型预填）。
+    """
+    from translator.config import (PRESETS, PROVIDER_TUNING,
+                                   RECOMMENDED_MODELS)
+    return {"providers": PRESETS, "tuning": PROVIDER_TUNING,
+            "recommended_model": RECOMMENDED_MODELS}
 
 
 class ConfigReq(BaseModel):
@@ -341,7 +356,9 @@ def validate_key(req: ValidateReq):
                 max_tokens=50,
             )
             sample = resp.choices[0].message.content or ""
-            return {"ok": True, latency: round(time.time() - t0, 1),
+            # v0.7.1 修复：latency 键此前缺引号（裸名）→ NameError 被
+            # except 吞掉，API 成功也回 ok=False——连通性测试恒失败
+            return {"ok": True, "latency": round(time.time() - t0, 1),
                     "sample": sample[:60]}
         except Exception as e:
             last_err = str(e)[:300]

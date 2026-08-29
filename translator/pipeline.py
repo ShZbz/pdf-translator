@@ -30,7 +30,6 @@ from pathlib import Path
 
 import pymupdf
 
-from .cache import TranslationCache
 from .config import Config
 from .control import JobControl, JobCancelled
 from .events import EventSink
@@ -74,21 +73,6 @@ def _layout_cache_decode(o):
     return o
 
 
-def _layout_cache_path(out_dir: Path, src: Path, engine: str) -> Path | None:
-    """版面缓存文件路径：key = 输入路径+大小+mtime+引擎+缓存版本。
-
-    输入文件被替换（大小/mtime 变化）或引擎切换时 key 变化，天然失效。
-    """
-    try:
-        st = src.stat()
-        key = hashlib.md5(f"{src}|{st.st_size}|{int(st.st_mtime)}|"
-                          f"{engine}|{_LAYOUT_CACHE_VER}".encode("utf-8")) \
-            .hexdigest()[:16]
-        return out_dir / ".layout_cache" / f"{key}.json"
-    except OSError:
-        return None
-
-
 def _load_layout_cache(path: Path | None) -> list[dict] | None:
     if path is None or not path.is_file():
         return None
@@ -102,17 +86,6 @@ def _load_layout_cache(path: Path | None) -> list[dict] | None:
         return None
     except Exception:
         return None       # 坏缓存按 miss 处理，走正常布局
-
-
-def _save_layout_cache(path: Path | None, layouts: list[dict]) -> None:
-    if path is None:
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(_layout_cache_encode(layouts),
-                                   ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass              # 缓存写失败不影响主流程
 
 # ---- 布局并行 worker（模块级函数：Windows spawn 要求可 pickle 引用）----
 _LAYOUT_DOC: "pymupdf.Document | None" = None
@@ -223,10 +196,14 @@ def _split_proportional(dst: str, ratio: float) -> tuple[str, str]:
     return dst[:best].rstrip(), dst[best:].lstrip()
 
 
-def output_pdf_name(stem: str, tgt_lang: str, bilingual: bool) -> str:
-    """输出文件名：{stem}[-bilingual]-{语言标记}.pdf（zh→-Zh 旧版兼容）。"""
+def output_pdf_name(stem: str, tgt_lang: str, bilingual: bool,
+                    extra: str = "") -> str:
+    """输出文件名：{stem}[-bilingual]{extra}-{语言标记}.pdf（zh→-Zh 旧版兼容）。
+
+    extra：io.pages 子集标记（如 "-p1-2"）——试译输出不覆盖全量输出。
+    """
     suffix = "-bilingual" if bilingual else ""
-    return f"{stem}{suffix}-{output_tag(tgt_lang)}.pdf"
+    return f"{stem}{suffix}{extra}-{output_tag(tgt_lang)}.pdf"
 
 
 def _unit_char_budgets(merge_groups: list[list[int]], pending: list,
@@ -365,7 +342,7 @@ def _group_budget(g: list[int], pending: list, page_layouts: list, typo,
 
 def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
                          glossary, cache, sink, control, fit_cfg,
-                         layout_engine, lc_path, out_dir, all_warnings):
+                         layout_engine, dcache, doc_fp, out_dir, all_warnings):
     """v0.7.0 布局-翻译流水线重叠路径（任务 2-2b）。
 
     布局在后台线程逐页产出（布局线程持有独立打开的 Document——
@@ -396,7 +373,8 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
     layout_tmp = Path(tmp_name)
     q: "_queue.Queue" = _queue.Queue()
 
-    cached = _load_layout_cache(lc_path) if lc_path is not None else None
+    cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER) \
+        if (dcache is not None and doc_fp is not None) else None
     cache_hit = cached is not None and len(cached) == n_pages
 
     def _producer():
@@ -570,9 +548,10 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
         pass
     if err is not None:
         raise err
-    if not cache_hit and lc_path is not None and page_layouts \
-            and len(page_layouts) == n_pages:
-        _save_layout_cache(lc_path, page_layouts)
+    if not cache_hit and dcache is not None and doc_fp is not None \
+            and page_layouts and len(page_layouts) == n_pages:
+        dcache.save_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
+                           Path(cfg.io.input), n_pages, page_layouts)
 
     sink.stage("translate")
     translated, total_calls = streamer.finish()
@@ -1009,8 +988,29 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     out_dir = Path(cfg.io.output_dir or src.parent)
     out_dir.mkdir(parents=True, exist_ok=True)
     tgt_lang = (cfg.io.target_lang or "zh").strip() or "zh"
+    doc = pymupdf.open(src)
+    orig_pages = len(doc)
+    n_pages = orig_pages
+    # ---- v0.7.1: io.pages 页码子集（--quick 试译/抽样）----
+    # doc.select 保留选中页（后续布局/翻译/渲染索引全部一致）；
+    # 输出名带 -p<sel> 标记，试译不覆盖全量输出
+    sel_spec = (getattr(cfg.io, "pages", "") or "").strip()
+    sel_extra = ""
+    if sel_spec:
+        from .config import parse_page_ranges
+        sel_idx = parse_page_ranges(sel_spec, n_pages)
+        if not sel_idx:
+            raise ValueError(
+                f"io.pages 未选中任何有效页（共 {n_pages} 页）: {sel_spec!r}")
+        if len(sel_idx) < n_pages:
+            doc.select(sel_idx)
+            n_pages = len(doc)
+            sel_extra = "-p" + sel_spec.replace(",", "-").replace(" ", "")
+            _log(f"pages: selected {n_pages}/{orig_pages} page(s) "
+                 f"[{sel_spec}]")
     out_path = out_dir / output_pdf_name(src.stem, tgt_lang,
-                                         cfg.features.bilingual)
+                                         cfg.features.bilingual,
+                                         extra=sel_extra)
     all_warnings: list[str] = []
 
     # v0.5.1: 渲染器选择 + RTL/天城文强制 htmlbox（writer 逐字排印无
@@ -1037,13 +1037,29 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
 
     font_path = find_cjk_font(cfg.fonts.get("cjk"), lang=tgt_lang)
     glossary = Glossary.load(cfg.glossary_file) if cfg.glossary_file else None
-    cache = TranslationCache(
-        out_dir / ".translation_cache.db",
-        max_entries=int(getattr(cfg.performance, "cache_max_entries", 0) or 0)
-    ) if cfg.features.translation_cache else None
+    # ---- v0.7.1: 项目级缓存库（翻译缓存 + 文档指纹索引 + 版面缓存）----
+    # 默认随输入文件目录（可写探测失败退输出目录）——同一输入译到不同
+    # 输出目录共享缓存；legacy 迁移仅翻译缓存开启时执行
+    dcache = None
+    doc_fp = None
+    cache = None
+    layout_cache_on = bool(getattr(cfg.performance, "layout_cache", True))
+    if cfg.features.translation_cache or layout_cache_on:
+        from .doccache import DocumentCache, resolve_cache_root
+        croot, csrc = resolve_cache_root(
+            (getattr(cfg.performance, "cache_dir", "") or "").strip(),
+            src, out_dir)
+        dcache = DocumentCache(
+            croot,
+            max_entries=int(getattr(cfg.performance, "cache_max_entries", 0) or 0),
+            legacy_sources=[out_dir / ".translation_cache.db"] \
+                if cfg.features.translation_cache else None,
+            log=_log)
+        _log(f"cache: project store {dcache.path} (root={csrc})")
+        cache = dcache.tc if cfg.features.translation_cache else None
+        if layout_cache_on:
+            doc_fp = dcache.fingerprint(src)
 
-    doc = pymupdf.open(src)
-    n_pages = len(doc)
     total_calls = 0
     n_paras = 0
     if control:
@@ -1089,8 +1105,6 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     workers = _resolve_layout_workers(cfg, n_pages)
     page_layouts: list[dict] = []
     page_pixmaps: list[dict[int, bytes]] = []
-    lc_path = _layout_cache_path(out_dir, src, layout_engine) \
-        if getattr(cfg.performance, "layout_cache", True) else None
 
     # ---- v0.7.0: 布局-翻译流水线重叠（页级流水，任务 2-2b）----
     # 大文档且启发式布局时：布局后台线程逐页产出，主线程页级喂批发车
@@ -1101,8 +1115,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         try:
             state = _translate_streaming(
                 doc, cfg, client, typo, font_path, tgt_lang, glossary,
-                cache, sink, control, fit_cfg, layout_engine, lc_path,
-                out_dir, all_warnings)
+                cache, sink, control, fit_cfg, layout_engine, dcache,
+                doc_fp, out_dir, all_warnings)
         except JobCancelled:
             raise
         except Exception as e:
@@ -1111,18 +1125,18 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             state = None
     if state is None:
         # ---- v0.4.3 布局本体：缓存命中 → 并行 → 串行回退 ----
-        if lc_path is not None:
-            cached = _load_layout_cache(lc_path)
-            if cached is not None and len(cached) == n_pages:
-                page_layouts = cached
-                _log(f"layout: cache hit ({lc_path.name}), skipping layout "
-                     f"for {n_pages} page(s)")
-                sink.emit("layout_cache_hit", pages=n_pages)
-                sink.progress(done=n_pages, total=n_pages, unit="page")
-                for pno in range(n_pages):
-                    page_pixmaps.append(
-                        crop_formula_pixmaps(doc, pno, page_layouts[pno]["formulas"])
-                        if page_layouts[pno].get("formulas") else {})
+        cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER) \
+            if (dcache is not None and doc_fp is not None) else None
+        if cached is not None and len(cached) == n_pages:
+            page_layouts = cached
+            _log(f"layout: cache hit (project store), skipping layout "
+                 f"for {n_pages} page(s)")
+            sink.emit("layout_cache_hit", pages=n_pages)
+            sink.progress(done=n_pages, total=n_pages, unit="page")
+            for pno in range(n_pages):
+                page_pixmaps.append(
+                    crop_formula_pixmaps(doc, pno, page_layouts[pno]["formulas"])
+                    if page_layouts[pno].get("formulas") else {})
         if not page_layouts and workers > 1:
             fd, layout_tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
             os.close(fd)
@@ -1152,11 +1166,12 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 page_layouts.append(lay)
                 page_pixmaps.append(pixmaps)
                 sink.page_done(pno, n_pages)
-        if lc_path is not None and page_layouts and \
+        if dcache is not None and doc_fp is not None and page_layouts and \
                 len(page_layouts) == n_pages and \
                 not any(p for p in page_pixmaps if p is None):
-            # 布局完成（非缓存命中路径）→ 落盘供断点续跑
-            _save_layout_cache(lc_path, page_layouts)
+            # 布局完成（非缓存命中路径）→ 落项目库供断点续跑/跨输出目录复用
+            dcache.save_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
+                               src, n_pages, page_layouts, sel=sel_spec)
         # v0.5.1: 全部页 fallback 才告警——pymupdf-layout 已装且正常运行时，
         # 纯文本页（GNN 检不出图/表/公式区）按页回退启发式属正常行为，
         # 只看第 0 页会在"首页恰好纯文本"时误报"未安装"
@@ -1477,6 +1492,14 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     sink.stage("render")
     if renderer == "writer":
         _log("renderer: writer (legacy TextWriter engine)")
+    # ---- v0.7.1: 页级 Story 接管（任务 2-3 P1）----
+    # render.page_story（auto/on/off）+ 计数（启用率/回退原因汇总日志）
+    page_story_cfg = (getattr(cfg.render, "page_story", "auto") or "auto")
+    if page_story_cfg != "off" and renderer == "htmlbox" \
+            and fit_cfg.mode == "auto":
+        _log(f"page_story: {page_story_cfg} (whole-page story接管, "
+             f"per-page precheck + page-granularity fallback)")
+    story_stats = {"story": 0, "fallback": 0, "reasons": []}
 
     # ---- v0.6.0 任务 B/C/D：两遍式排版自适配（测量 pass，在渲染前）----
     # 遍历全部页/段收集渲染规格（与渲染 pass 同一函数产出），按样式类
@@ -1557,7 +1580,14 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                     factors=fit_factors,
                     fit_cfg=fit_cfg if fit_cfg.mode == "auto" else None,
                     archive=doc_arch,
-                    font_css=doc_font_css)
+                    font_css=doc_font_css,
+                    page_story=page_story_cfg,
+                    story_stats=story_stats)
+    if story_stats["story"] or story_stats["fallback"]:
+        _log(f"page_story: {story_stats['story']} page(s) whole-page story, "
+             f"{story_stats['fallback']} per-paragraph fallback")
+        for r in story_stats["reasons"]:
+            _log(f"page_story: {r}")
 
     # ---- OCR 译文落页（appendix 插页 / inplace 原位回贴 / reconstruct 重建）----
     ocr_pages_added = 0
@@ -1614,7 +1644,10 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         doc.close()
         os.replace(tmp_path, out_path)
     finally:
-        if cache:
+        # v0.7.1: 项目级缓存库统一收口（dcache.close 同时关翻译缓存表）
+        if dcache is not None:
+            dcache.close()
+        elif cache:
             cache.close()
 
     # ---- 缓存统计（v0.5.1: 按文档维度的节省报表）----
@@ -1633,6 +1666,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         "calls": total_calls,
         "warnings": all_warnings,
         "output": str(out_path),
+        "cache_db": (str(dcache.path) if dcache is not None else ""),
         "ocr_pages": ocr_pages_added,
         "ocr_inplace_blocks": ocr_inplace_blocks,
         "cache_hits": cache_hits,

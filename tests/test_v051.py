@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from translator.config import FeatureConfig, LLMConfig, load_config
 from translator.langs import LANGUAGES, is_rtl
 from translator.pipeline import _layout_cache_decode, _layout_cache_encode, \
-    _layout_cache_path, _split_proportional
+    _split_proportional
 from translator.render import render_page
 
 
@@ -222,12 +222,15 @@ def test_layout_cache_roundtrip():
 
 
 def test_layout_cache_key_invalidation(tmp_path):
-    """引擎切换 → key 变化（不同缓存文件）。"""
+    """引擎切换 → layout key 变化（v0.7.1 起在项目库 layouts 表内区分）。"""
+    from translator.doccache import DocumentCache
     src = tmp_path / "a.pdf"
     src.write_bytes(b"%PDF-fake")
-    p1 = _layout_cache_path(tmp_path, src, "heuristic")
-    p2 = _layout_cache_path(tmp_path, src, "pymupdf-layout")
-    assert p1 is not None and p2 is not None and p1 != p2
+    dc = DocumentCache(tmp_path)
+    fp = dc.fingerprint(src)
+    assert dc.layout_key(fp, "heuristic", 2) != \
+        dc.layout_key(fp, "pymupdf-layout", 2)
+    dc.close()
 
 
 def test_layout_cache_hit_skips_layout(tmp_path):
@@ -257,8 +260,8 @@ fonts:
     translate_document(load_config(y), client=None, sink=sink2)
     hits = [e for e in sink2.events if e["kind"] == "layout_cache_hit"]
     assert hits and hits[0]["pages"] == 1
-    # 缓存文件确实落盘
-    assert any(p.is_file() for p in (tmp_path / ".layout_cache").glob("*.json"))
+    # v0.7.1: 缓存落项目级库（DB 内 layouts 表），输入目录下建库
+    assert (tmp_path / ".pdf_translator_cache" / "cache.db").is_file()
 
 
 # ---------- 2-2: pymupdf-layout 实装 ----------

@@ -35,6 +35,32 @@ class JobControl:
         self._state = self.RUNNING
         # Condition 绑定同一把锁：wait() 时自动放锁、返回前重新拿锁
         self._cond = threading.Condition(self._lock)
+        # v0.7.1: 命令总线绑定（EventSink.drain）——checkpoint 在每个
+        # 检查点消费命令通道，命令粒度=检查点粒度（页级循环即页间）
+        self._command_source = None
+
+    # ---- v0.7.1: 命令总线绑定（任务 2-4 预备）----
+    def bind_commands(self, drain: "callable") -> None:
+        """绑定命令源（如 EventSink.drain）；checkpoint 检查点消费。"""
+        self._command_source = drain
+
+    def _apply_commands(self) -> None:
+        """消费命令通道（幂等：与直接调用 pause/resume/cancel 同语义）。"""
+        drain = self._command_source
+        if drain is None:
+            return
+        try:
+            cmds = drain()
+        except Exception:
+            return
+        for c in cmds:
+            cmd = (c.get("cmd") or "").strip().lower()
+            if cmd == "pause":
+                self.pause()
+            elif cmd == "resume":
+                self.resume()
+            elif cmd == "cancel":
+                self.cancel()
 
     # ---- UI 线程侧 ----
     def pause(self) -> bool:
@@ -69,8 +95,9 @@ class JobControl:
             return self._state
 
     def checkpoint(self) -> None:
-        """在检查点调用：paused → 阻塞至恢复；cancelled → 抛 JobCancelled。"""
+        """在检查点调用：先消费命令通道，paused → 阻塞至恢复，cancelled → 抛。"""
         while True:
+            self._apply_commands()
             with self._lock:
                 st = self._state
                 if st == self.RUNNING:

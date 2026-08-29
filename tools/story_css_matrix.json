@@ -1,0 +1,78 @@
+{
+ "page-break-after:always": {
+  "verdict": "可用",
+  "detail": "逐段 after 断框：每段各占其框单页渲染 ids_ok=False per_box=[['a', 'a'], ['b', 'b'], ['c', 'c']]"
+ },
+ "page-break-before:always": {
+  "verdict": "可用",
+  "detail": "BBBB 落位=[(96.39, 'BBBB')]"
+ },
+ "break-after:page": {
+  "verdict": "部分",
+  "detail": "b1=False wrong=True"
+ },
+ "line-height": {
+  "verdict": "可用",
+  "detail": "行距 {1.0: 10.0, 1.5: 15.0, 2.0: 20.0}"
+ },
+ "opacity/颜色alpha": {
+  "verdict": "部分",
+  "detail": "{'opacity属性': '出墨', 'color:rgba': '无墨', 'color:#rrggbbaa': '出墨'}"
+ },
+ "text-align": {
+  "verdict": "可用",
+  "detail": "{'left': 81.24, 'center': 134.56, 'right': 187.89, 'justify': 81.24}"
+ },
+ "margin(block间)": {
+  "verdict": "可用",
+  "detail": "gap0=14.399999999999999 gap1=34.4"
+ },
+ "border": {
+  "verdict": "可用",
+  "detail": "drawings=4"
+ },
+ "ol/ul/li": {
+  "verdict": "可用",
+  "detail": "编号=True 项=True 符号=True texts=1. ﬁrst | 2. second | •  nested-a | •  nested-b"
+ },
+ "table(含colspan)": {
+  "verdict": "可用",
+  "detail": "texts=A1 | B1 | SPANNED 线框drawings=0"
+ },
+ "img(archive)": {
+  "verdict": "可用",
+  "detail": "images=1"
+ },
+ "height(块级定高)": {
+  "verdict": "部分",
+  "detail": "b1=False spill=False"
+ },
+ "direction:rtl": {
+  "verdict": "可用",
+  "detail": "extracted=  ƾ\tﻛﺎﺩﻳﻤﻴﺔ ﺍ Ǆﺘﺮﺟﻤﺔ ﺍ"
+ },
+ "px→pt": {
+  "verdict": "可用",
+  "detail": "pt=20.0 px=20.0 ratio=1.0"
+ },
+ "body margin 跨框": {
+  "verdict": "可用",
+  "detail": "margin0: A@-3.61 B@96.39；margin5: A@1.39 B@96.39；位移 A=5.0 B=0.0（B 在框2：仅首框）"
+ },
+ "falsy mediabox=None": {
+  "verdict": "可用",
+  "detail": "pages=1"
+ },
+ "falsy mediabox=空Rect": {
+  "verdict": "可用",
+  "detail": "pages=1"
+ },
+ "页级Story逐框落位(2栏8段)": {
+  "verdict": "可用",
+  "detail": "box0:OK box1:OK box2:OK box3:OK box4:OK box5:OK box6:OK box7:OK"
+ },
+ "溢出漫延(预检必要性)": {
+  "verdict": "确认",
+  "detail": "box0 溢出漫延直至框耗尽（rectfn 抛 OverflowError 止损）——预检兜底必要"
+ }
+}

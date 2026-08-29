@@ -287,6 +287,17 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
 .rec-row input[type=number] { width:56px; padding:3px 6px; border-radius:7px;
   background:rgba(255,255,255,.05); border:0.8px solid var(--glass-border); color:var(--text); }
 
+/* ---- v0.7.1: 首启向导 ---- */
+.wiz-steps { display:flex; align-items:center; gap:8px; margin:4px 0 20px; }
+.wiz-dot { width:10px; height:10px; border-radius:50%; background:rgba(127,127,127,.3); transition:all .3s var(--spring); }
+.wiz-dot.active { background:var(--accent); box-shadow:0 0 0 4px rgba(74,144,217,.2); }
+.wiz-dot.done { background:#7ed88f; }
+.wiz-line { flex:1; height:1px; background:var(--glass-border); }
+.wiz-step { display:none; }
+.wiz-step.active { display:block; animation:paneIn .3s var(--spring) both; }
+.wiz-hint { font-size:12.5px; color:var(--text-dim); line-height:1.7; margin:10px 0; word-break:break-all; }
+.wiz-hint b { color:var(--text); font-weight:600; }
+
 /* ---- 文件浏览器模态 ---- */
 .browse-path {
   display:flex; gap:8px; margin-bottom:12px; align-items:center;
@@ -388,7 +399,7 @@ body.dragging::after {
 <!-- 主卡片 -->
 <div class="card">
   <h1>PDF 翻译器</h1>
-  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.5.1</div>
+  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.7.1</div>
 
   <div class="field">
     <input type="text" id="inputPath" placeholder="翻译原文件路径 (.pdf)" spellcheck="false">
@@ -517,6 +528,12 @@ body.dragging::after {
         </select></div>
       <div class="set-row"><label>源头控长<span class="tip" data-tip="翻译时把每段目标框的字符预算告知模型，超长段自动带强约束重译一次——从上游减少溢出；随「排版自适配」自动开启">?</span></label>
         <span style="opacity:.7;font-size:12px;align-self:center;">随排版自适配自动开启</span></div>
+      <div class="set-row"><label>页级整页排版<span class="tip" data-tip="v0.7.1：整页段落进单个流式排版引擎逐段落位（页几何冻结），段间基线共享连续网格，消除段间 baseline 抖动。auto=页级预检全过才启用（预检失败的页自动整页回退逐段排版）；on=尽量启用；off=关闭">?</span></label>
+        <select id="cfg-pagestory">
+          <option value="auto">自动（默认）</option>
+          <option value="on">强制开启</option>
+          <option value="off">关闭</option>
+        </select></div>
     </div>
 
     <!-- 性能 -->
@@ -555,6 +572,8 @@ body.dragging::after {
     <div class="pane" id="pane-adv">
       <div class="set-row"><label>翻译缓存<span class="tip" data-tip="二次运行零调用">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-cache" checked><span class="slider"></span></label></div>
+      <div class="set-row"><label>缓存位置<span class="tip" data-tip="v0.7.1 项目级缓存库目录（空=自动：输入文件所在目录，只读时退输出目录）。同一输入译到不同输出目录共享翻译缓存与版面缓存，文档按内容指纹索引——改 1 页只重译 1 页">?</span></label>
+        <input type="text" id="cfg-cachedir" placeholder="自动（输入文件目录）"></div>
       <div class="set-row"><label>术语锁定校验</label>
         <label class="switch"><input type="checkbox" id="cfg-glosslock" checked><span class="slider"></span></label></div>
       <hr style="border:none;border-top:0.8px solid var(--glass-border);margin:14px 0 16px;">
@@ -569,6 +588,41 @@ body.dragging::after {
       <div class="set-row"><label>限流等待封顶 (秒)<span class="tip" data-tip="默认 60 · 建议 30–120">?</span></label>
         <input type="text" id="cfg-retrycaps" value="60" inputmode="decimal"></div>
       <div class="save-float"><button id="btnSaveCfg">保存设置</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- v0.7.1: 首启向导（三步：选 provider → 粘 key 测连通 → 完成） -->
+<div class="modal-backdrop" id="wizBackdrop"></div>
+<div class="modal" id="wizardModal" style="width:min(560px,calc(100vw - 36px))">
+  <div class="modal-head"><h2>欢迎使用 · 三步配置</h2>
+    <button class="modal-close" id="wizSkip">跳过 ›</button></div>
+  <div class="modal-body">
+    <div class="wiz-steps"><span class="wiz-dot active" id="wizd1"></span><span class="wiz-line"></span><span class="wiz-dot" id="wizd2"></span><span class="wiz-line"></span><span class="wiz-dot" id="wizd3"></span></div>
+
+    <div class="wiz-step active" id="wizstep1">
+      <div class="set-row"><label>翻译服务商</label>
+        <select id="wiz-provider"></select></div>
+      <div class="set-row"><label>推荐模型<span class="tip" data-tip="按项目实测收录；未收录的服务商请查其文档自行填写">?</span></label>
+        <input type="text" id="wiz-model" list="wiz-model-list" placeholder="查服务商文档填写">
+        <datalist id="wiz-model-list"></datalist></div>
+      <div class="set-row"><label>自定义 Base URL<span class="tip" data-tip="自建/中转网关填这里，留空用服务商官方地址">?</span></label>
+        <input type="text" id="wiz-baseurl" placeholder="可选"></div>
+      <div class="wiz-hint" id="wiz-envhint"></div>
+      <button class="btn-test" id="wizNext1">下一步 ›</button>
+    </div>
+
+    <div class="wiz-step" id="wizstep2">
+      <div class="set-row"><label>API Key</label>
+        <input type="password" id="wiz-key" placeholder="粘贴 API Key"></div>
+      <button class="btn-test" id="wizTest">测试连通性</button>
+      <div class="test-result" id="wizTestResult"></div>
+      <button class="btn-test" id="wizNext2">下一步 ›</button>
+    </div>
+
+    <div class="wiz-step" id="wizstep3">
+      <div class="wiz-hint" id="wizSummary"></div>
+      <button class="btn-translate" id="wizFinish">完成配置 ✓</button>
     </div>
   </div>
 </div>
@@ -671,6 +725,7 @@ async function loadConfig() {
     $('cfg-bilingual').checked = !!(CFG.features||{}).bilingual;
     $('cfg-renderer').value = (CFG.features||{}).renderer || 'htmlbox';
     $('cfg-fitmode').value = (CFG.fit||{}).mode || 'auto';
+    $('cfg-pagestory').value = (CFG.render||{}).page_story || 'auto';
     $('cfg-ocrmode').value = (CFG.ocr||{}).mode || 'appendix';
     // v0.7.0: OCR 引擎多选（engines 空 = 单引擎 engine）
     const ocrEngines = (CFG.ocr||{}).engines
@@ -679,6 +734,7 @@ async function loadConfig() {
     $('cfg-ocr-rapidocr').checked = ocrEngines.includes('rapidocr');
     $('cfg-ocr-tesseract').checked = ocrEngines.includes('tesseract');
     $('cfg-cache').checked = (CFG.features||{}).translation_cache !== false;
+    $('cfg-cachedir').value = (CFG.performance||{}).cache_dir || '';
     $('cfg-glosslock').checked = (CFG.features||{}).glossary_lock !== false;
     $('cfg-workers').value = llm.max_workers ?? 3;
     $('cfg-batchsize').value = llm.batch_size ?? 6;
@@ -703,36 +759,55 @@ async function loadConfig() {
     glzSources = Array.isArray(CFG.glossary_sources) && CFG.glossary_file
       ? CFG.glossary_sources : [];
     refreshGlossaryStatus();   // v0.5.2: 配置载入后刷新术语表「已加载」状态
+    updateQuotaFields();       // v0.7.1: 载入后同步配额字段的禁用态
+    if (d.first_run) openWizard();   // v0.7.1: 首启向导
   } catch(e) { console.warn('loadConfig', e); }
 }
 
 function collectConfig() {
   const num = (v, d) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
+  // v0.7.1 修复：各段先继承已加载配置再覆盖——旧版整段重建，手改过
+  // ui_config.yaml 的 fonts/layout_engine/layout_cache/min_chars 等键
+  // 会在每次保存设置时被静默重置为默认值
+  const io0 = CFG.io || {}, llm0 = CFG.llm || {}, feat0 = CFG.features || {},
+        perf0 = CFG.performance || {}, ocr0 = CFG.ocr || {}, fit0 = CFG.fit || {},
+        fonts0 = CFG.fonts || {};
+  // v0.7.1 修复：配额自适应解锁——旧版总是显式写出 min_call_interval /
+  // batch_char_budget，config.effective() 的「显式配置优先」规则使
+  // rpm/tpm 自动换算永远不会生效。设置了配额时不再写出对应键
+  // （交给后端按 60/rpm、(tpm/rpm)×3.2×0.8 自动换算），未设置才写表单值
+  const rpm = num($('cfg-rpm').value, 0), tpm = num($('cfg-tpm').value, 0);
+  const { min_call_interval: _omitI, batch_char_budget: _omitB,
+          has_key: _omitK, api_key_masked: _omitM, ...llmKeep } = llm0;
+  // has_key/api_key_masked 是 /api/config 打码响应的展示字段，不回写
+  const llm = {
+    ...llmKeep,
+    provider: $('cfg-provider').value,
+    model: $('cfg-model').value.trim(),
+    api_key: $('cfg-key').value.trim(),   // 打码或空时服务端保留旧值
+    base_url: $('cfg-baseurl').value.trim(),
+    fallback_model: $('cfg-fallback').value.trim(),
+    temperature: num($('cfg-temperature').value, 0),
+    batch_size: num($('cfg-batchsize').value, 6),
+    rpm_limit: rpm,
+    tpm_limit: tpm,
+    max_llm_calls: num($('cfg-maxcalls').value, 40),
+    max_workers: num($('cfg-workers').value, 3),
+    timeout: num($('cfg-timeout').value, 120), max_retries: num($('cfg-retries').value, 2),
+    backoff_base: num($('cfg-backoffbase').value, 8), backoff_cap: num($('cfg-backoffcap').value, 30),
+    retry_delay_cap: num($('cfg-retrycaps').value, 60),
+    stream: $('cfg-stream').checked,          // v0.7.0 流式解码+首包即回
+    sentence_cache: $('cfg-sentcache').checked, // v0.7.0 句子级缓存（模板文本）
+  };
+  if (!(rpm > 0)) llm.min_call_interval = num($('cfg-interval').value, 2);
+  if (!(rpm > 0 && tpm > 0)) llm.batch_char_budget = num($('cfg-batchchars').value, 3000);
   return {
-    io: { input:'', output_dir:'',
+    io: { ...io0, input:'', output_dir:'',
           source_lang:$('cfg-srclang').value || 'en',
           target_lang:$('cfg-tgtlang').value || 'zh' },
-    llm: {
-      provider: $('cfg-provider').value,
-      model: $('cfg-model').value.trim(),
-      api_key: $('cfg-key').value.trim(),   // 打码或空时服务端保留旧值
-      base_url: $('cfg-baseurl').value.trim(),
-      fallback_model: $('cfg-fallback').value.trim(),
-      temperature: num($('cfg-temperature').value, 0),
-      batch_size: num($('cfg-batchsize').value, 6),
-      batch_char_budget: num($('cfg-batchchars').value, 3000),
-      rpm_limit: num($('cfg-rpm').value, 0),
-      tpm_limit: num($('cfg-tpm').value, 0),
-      max_llm_calls: num($('cfg-maxcalls').value, 40),
-      min_call_interval: num($('cfg-interval').value, 2),
-      max_workers: num($('cfg-workers').value, 3),
-      timeout: num($('cfg-timeout').value, 120), max_retries: num($('cfg-retries').value, 2),
-      backoff_base: num($('cfg-backoffbase').value, 8), backoff_cap: num($('cfg-backoffcap').value, 30),
-      retry_delay_cap: num($('cfg-retrycaps').value, 60),
-      stream: $('cfg-stream').checked,          // v0.7.0 流式解码+首包即回
-      sentence_cache: $('cfg-sentcache').checked, // v0.7.0 句子级缓存（模板文本）
-    },
+    llm,
     features: {
+      ...feat0,
       watermark_removal: $('cfg-watermark').checked,
       preserve_formatting: $('cfg-formatting').checked,
       glossary_lock: $('cfg-glosslock').checked,
@@ -740,15 +815,18 @@ function collectConfig() {
       bilingual: $('cfg-bilingual').checked,
       renderer: $('cfg-renderer').value || 'htmlbox',
     },
-    fit: { mode: $('cfg-fitmode').value || 'auto' },
+    fit: { ...fit0, mode: $('cfg-fitmode').value || 'auto' },
+    render: { ...(CFG.render||{}), page_story: $('cfg-pagestory').value || 'auto' },
     glossary_file: $('cfg-glossary').value.trim(),
     glossary_sources: glzSources.slice(),   // v0.5.2: 合并来源清单（批量导入记忆）
     performance: {
+      ...perf0,
       layout_workers: num($('cfg-layoutworkers').value, 0),
-      cache_max_entries: (CFG.performance || {}).cache_max_entries ?? 50000,
+      cache_max_entries: perf0.cache_max_entries ?? 50000,
+      cache_dir: $('cfg-cachedir').value.trim(),
       pipeline_overlap: $('cfg-overlap').value || 'auto',
     },
-    fonts: { cjk: '' },
+    fonts: { ...fonts0, cjk: fonts0.cjk || '' },
     ocr: (() => {
       // v0.7.0: 引擎多选 → engines 列表；主 engine 取首个勾选项
       const engines = [
@@ -756,11 +834,21 @@ function collectConfig() {
         ['cfg-ocr-rapidocr', 'rapidocr'],
         ['cfg-ocr-tesseract', 'tesseract'],
       ].filter(([id]) => $(id).checked).map(([, e]) => e);
-      return { engine: engines[0] || 'paddle', engines,
-               min_chars: 50, mode: $('cfg-ocrmode').value || 'appendix' };
+      return { ...ocr0, engine: engines[0] || 'paddle', engines,
+               min_chars: ocr0.min_chars ?? 50, mode: $('cfg-ocrmode').value || 'appendix' };
     })(),
   };
 }
+
+/* v0.7.1: 配额自适应联动——rpm/tpm 设置时禁用手动间隔/批预算输入
+   （这些值不再写出，由后端自动换算；清零配额即恢复手动模式） */
+function updateQuotaFields() {
+  const rpm = parseFloat($('cfg-rpm').value) || 0;
+  const tpm = parseFloat($('cfg-tpm').value) || 0;
+  $('cfg-interval').disabled = rpm > 0;
+  $('cfg-batchchars').disabled = rpm > 0 && tpm > 0;
+}
+['cfg-rpm', 'cfg-tpm'].forEach(id => $(id).addEventListener('input', updateQuotaFields));
 
 (function initProviders() {
   const sel = $('cfg-provider');
@@ -802,6 +890,147 @@ $('btnTestKey').onclick = async () => {
       el.textContent = `✗ ${r.error}`;
     }
   } catch(e) { el.style.color = '#ff9a8b'; el.textContent = `✗ ${e.message}`; }
+};
+
+/* ---------- v0.7.1: 首启向导 ----------
+   检测 ui_config.yaml 不存在（/api/config first_run=true）即进入：
+   ① 选 provider（推荐模型预填）→ ② 粘 key 一键测连通（实测延迟回填推荐
+   timeout）→ ③ 按 provider 档位自动写入整组调优参数完成。零文档阅读。 */
+let WIZ = null;          // /api/presets 载入的 {providers, tuning, recommended_model}
+let WIZ_STEP = 1;
+let WIZ_LATENCY = null;  // 实测连通延迟秒（推荐 timeout 依据）
+const WIZ_PROVIDERS = ['deepseek','zhipu','gemini','siliconflow','openai','ollama','lmstudio'];
+
+function wizBaseUrl() { return $('wiz-baseurl').value.trim(); }
+
+function wizShow(n) {
+  WIZ_STEP = n;
+  [1,2,3].forEach(i => {
+    $('wizstep' + i).classList.toggle('active', i === n);
+    const d = $('wizd' + i);
+    d.classList.toggle('active', i === n);
+    d.classList.toggle('done', i < n);
+  });
+  if (n === 3) {
+    const p = $('wiz-provider').value;
+    const m = $('wiz-model').value.trim() || '(待填模型名)';
+    const t = wizRecommendTimeout();
+    $('wizSummary').innerHTML =
+      `服务商 <b>${p}</b> · 模型 <b>${m}</b> · Key <b>已保存</b>` +
+      (WIZ_LATENCY != null ? ` · 实测延迟 <b>${WIZ_LATENCY}s</b>` : '') +
+      `<br>完成时将按该档位自动写入推荐调优参数` +
+      (t ? `，请求超时按实测延迟设为 <b>${t}s</b>` : '') +
+      `。<br>之后在 ⚙ 设置里可随时微调。`;
+  }
+}
+
+function wizRecommendTimeout() {
+  if (WIZ_LATENCY == null) return null;
+  return Math.min(300, Math.max(60, Math.round(WIZ_LATENCY * 10 / 5) * 5));
+}
+
+function wizSyncProvider() {
+  const p = $('wiz-provider').value;
+  const recs = (WIZ?.recommended_model || {})[p] || [];
+  const list = $('wiz-model-list');
+  list.innerHTML = '';
+  recs.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m; list.appendChild(o);
+  });
+  const inp = $('wiz-model');
+  const prev = (WIZ?.recommended_model || {})[$('wiz-provider').dataset.prev || ''] || [];
+  if (!inp.value.trim() || prev.includes(inp.value.trim())) {
+    inp.value = recs[0] || '';
+  }
+  $('wiz-provider').dataset.prev = p;
+  const env = (WIZ?.providers || {})[p]?.env;
+  $('wiz-envhint').textContent = env
+    ? `Key 留空时自动读环境变量 ${env}；仅存本机 ui_config.yaml`
+    : '本地服务无需 API Key，直接下一步。';
+}
+
+async function openWizard() {
+  if (!WIZ) {
+    try { WIZ = await api('/api/presets'); }
+    catch(e) { WIZ = {providers:{}, tuning:{}, recommended_model:{}}; }
+  }
+  const sel = $('wiz-provider');
+  if (!sel.options.length) {
+    WIZ_PROVIDERS.forEach(p => {
+      const o = document.createElement('option');
+      o.value = p; o.textContent = p;
+      sel.appendChild(o);
+    });
+  }
+  if (!sel.value) { sel.dataset.prev = ''; sel.value = 'deepseek'; }
+  wizSyncProvider();
+  $('wiz-key').value = '';
+  $('wizTestResult').textContent = '';
+  WIZ_LATENCY = null;
+  wizShow(1);
+  openModal($('wizardModal'), $('wizBackdrop'));
+}
+
+function closeWizard() {
+  closeModal($('wizardModal'), $('wizBackdrop'));
+}
+
+$('wiz-provider').onchange = wizSyncProvider;
+$('wizNext1').onclick = () => {
+  if (!$('wiz-model').value.trim()) {
+    toast('先填模型名（推荐下拉可选）', true); return;
+  }
+  wizShow(2);
+};
+$('wizTest').onclick = async () => {
+  const el = $('wizTestResult');
+  el.textContent = '测试中…'; el.style.color = '';
+  try {
+    const r = await api('/api/validate-key', {method:'POST', body: JSON.stringify({
+      provider: $('wiz-provider').value,
+      model: $('wiz-model').value.trim(),
+      api_key: $('wiz-key').value.trim(),
+      base_url: wizBaseUrl(), target_lang: 'zh',
+      timeout: 120, max_retries: 1,
+    })});
+    if (r.ok) {
+      WIZ_LATENCY = r.latency;
+      el.style.color = '#7ed88f';
+      el.textContent = `✓ 连通正常 · 延迟 ${r.latency}s · 推荐 timeout ${wizRecommendTimeout()}s：${r.sample}`;
+    } else {
+      el.style.color = '#ff9a8b';
+      el.textContent = `✗ ${r.error}（可检查 key/模型名后再测）`;
+    }
+  } catch(e) { el.style.color = '#ff9a8b'; el.textContent = `✗ ${e.message}`; }
+};
+$('wizNext2').onclick = () => wizShow(3);
+$('wizSkip').onclick = async () => {
+  // 跳过：落一份默认空配置，避免每次启动都弹向导
+  try {
+    await api('/api/config', {method:'PUT', body: JSON.stringify({config: collectConfig()})});
+    toast('已跳过向导，稍后可在 ⚙ 设置里配置');
+  } catch(e) { toast(e.message, true); }
+  closeWizard();
+};
+$('wizFinish').onclick = async () => {
+  try {
+    const cfg = collectConfig();               // 以当前 UI 默认为底
+    cfg.llm.provider = $('wiz-provider').value;
+    cfg.llm.model = $('wiz-model').value.trim();
+    cfg.llm.api_key = $('wiz-key').value.trim();
+    cfg.llm.base_url = wizBaseUrl();
+    const t = (WIZ?.tuning || {})[$('wiz-provider').value] || {};
+    for (const [k, v] of Object.entries(t)) {
+      if (k !== 'model') cfg.llm[k] = v;       // 档位调优参数整组写入
+    }
+    const rt = wizRecommendTimeout();
+    if (rt) cfg.llm.timeout = rt;              // 实测延迟回填推荐 timeout
+    await api('/api/config', {method:'PUT', body: JSON.stringify({config: cfg})});
+    toast('配置完成，可以开始翻译了 ✓');
+    closeWizard();
+    loadConfig();
+  } catch(e) { toast(e.message, true); }
 };
 
 /* ---------- 设置模态开关 ---------- */

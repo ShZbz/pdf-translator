@@ -16,13 +16,106 @@ PRESETS: dict[str, dict] = {
     "lmstudio":    {"base_url": "http://localhost:1234/v1", "env": ""},
 }
 
+# v0.7.1: provider 档位调优参数——首启向导/`--quick` 按档位自动写入的整组
+# 推荐值（应用时只填用户未显式配置的键，显式配置永远优先）。
+# model 只预填项目实测过的型号；其余留空由用户按 provider 文档填写。
+PROVIDER_TUNING: dict[str, dict] = {
+    "deepseek":    {"model": "deepseek-v4-flash", "batch_size": 6,
+                    "batch_char_budget": 3000, "max_workers": 3,
+                    "min_call_interval": 0, "max_llm_calls": 40,
+                    "timeout": 120.0},
+    "zhipu":       {"model": "glm-4.7-flash", "batch_size": 4,
+                    "batch_char_budget": 2400, "max_workers": 2,
+                    "min_call_interval": 1.0, "max_llm_calls": 40,
+                    "timeout": 120.0},
+    "gemini":      {"model": "", "batch_size": 4, "batch_char_budget": 2400,
+                    "max_workers": 1, "min_call_interval": 6.0,
+                    "max_llm_calls": 30, "timeout": 180.0},
+    "siliconflow": {"model": "", "batch_size": 4, "batch_char_budget": 2400,
+                    "max_workers": 2, "min_call_interval": 1.0,
+                    "max_llm_calls": 40, "timeout": 120.0},
+    "openai":      {"model": "", "batch_size": 6, "batch_char_budget": 3000,
+                    "max_workers": 3, "min_call_interval": 0,
+                    "max_llm_calls": 40, "timeout": 120.0},
+    "ollama":      {"model": "", "batch_size": 4, "batch_char_budget": 2400,
+                    "max_workers": 1, "min_call_interval": 0,
+                    "max_llm_calls": 40, "timeout": 300.0},
+    "lmstudio":    {"model": "", "batch_size": 4, "batch_char_budget": 2400,
+                    "max_workers": 1, "min_call_interval": 0,
+                    "max_llm_calls": 40, "timeout": 300.0},
+}
+
+# 向导下拉的推荐模型（按项目实测/文档收录，未收录的 provider 留空手填）
+RECOMMENDED_MODELS: dict[str, list[str]] = {
+    "deepseek": ["deepseek-v4-flash"],
+    "zhipu": ["glm-4.7-flash"],
+    "gemini": [], "siliconflow": [], "openai": [],
+    "ollama": [], "lmstudio": [],
+}
+
+
+def apply_provider_tuning(cfg: Config, provider: str | None = None) -> list[str]:
+    """按 provider 档位补齐未显式配置的 llm 键（`--quick`/向导共用）。
+
+    只覆盖「YAML 未显式写出」的键（_explicit 记录）；返回应用的键名列表。
+    """
+    p = provider or cfg.llm.provider
+    tuning = PROVIDER_TUNING.get(p)
+    if not tuning:
+        return []
+    applied = []
+    for k, v in tuning.items():
+        if k in cfg.llm._explicit:
+            continue
+        setattr(cfg.llm, k, v)
+        applied.append(k)
+    return applied
+
+
+def parse_page_ranges(spec: str, n_pages: int) -> list[int]:
+    """页码子集 "1-2,5" → 0-based 页索引（去重升序，越界钳制）。
+
+    空串/全页 → None（不裁剪）。格式错误抛 ValueError（load_config 即报）。
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return []
+    idx: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                raise ValueError(f"io.pages 页码段无效: {part!r}")
+            if lo < 1 or hi < lo:
+                raise ValueError(f"io.pages 页码段无效: {part!r}")
+        else:
+            try:
+                lo = hi = int(part)
+            except ValueError:
+                raise ValueError(f"io.pages 页码无效: {part!r}")
+            if lo < 1:
+                raise ValueError(f"io.pages 页码无效: {part!r}")
+        for p in range(lo, hi + 1):
+            if p <= n_pages:
+                idx.add(p - 1)
+    return sorted(idx)
+
 
 @dataclass
 class IOConfig:
     input: str
-    output_dir: str
+    # v0.7.1: output_dir 改为可选（空=回落输入文件目录——pipeline 既有
+    # 行为；最小配置只需写 input）
+    output_dir: str = ""
     source_lang: str = "en"
     target_lang: str = "zh"
+    # v0.7.1: 页码子集 "1-2,5"（--quick 试译/抽样用；空=全部页）
+    pages: str = ""
 
 
 @dataclass
@@ -142,6 +235,28 @@ class PerformanceConfig:
     #（布局后台线程逐页产出，翻译批随页发车——大文档省整段布局时间）；
     # on=无条件启用；off=关闭（布局全完成才开始翻译）
     pipeline_overlap: str = "auto"
+    # v0.7.1: 项目级缓存库位置（空=自动：输入文件目录，只读时退输出目录）。
+    # 同一输入译到不同输出目录共享翻译缓存/版面缓存；文档按内容指纹索引
+    cache_dir: str = ""
+
+
+@dataclass
+class OutputConfig:
+    """v0.7.1 双模式输出（任务 2-3）：faithful=版面1:1对照（默认）。
+
+    reflow=整文档语义重排（P3 预留，当前配置直接报错防误解）。
+    """
+    mode: str = "faithful"
+
+
+@dataclass
+class RenderConfig:
+    """v0.7.1 渲染微调（任务 2-3 P1）：faithful 模式整页 Story 接管。
+
+    page_story: auto=页级预检全过才启用（默认）；on=强制启用（预检失败
+    仍整页回退）；off=关闭（回到逐段 insert_htmlbox）。
+    """
+    page_story: str = "auto"
 
 
 def _filtered(dc, raw: dict):
@@ -160,6 +275,9 @@ class Config:
     ocr: OCRConfig = field(default_factory=OCRConfig)
     # v0.6.0: 排版自适配（两遍式渲染 + 样式级因子 + 降级阶梯 + 源头控长）
     fit: "FitConfig | None" = None
+    # v0.7.1: 双模式输出 + 渲染微调（任务 2-3）
+    output: OutputConfig = field(default_factory=OutputConfig)
+    render: RenderConfig = field(default_factory=RenderConfig)
 
 
 def load_config(path: str | Path) -> Config:
@@ -201,10 +319,25 @@ def load_config(path: str | Path) -> Config:
             fit_cfg = FitConfig.from_raw(raw.get("fit") or {})
         except ValueError as e:
             raise ValueError(f"fit 配置无效: {e}") from e
+    # ---- v0.7.1: 双模式输出 + 渲染微调（任务 2-3）----
+    out_cfg = _filtered(OutputConfig, raw.get("output", {}))
+    if out_cfg.mode != "faithful":
+        raise ValueError(
+            f"output.mode 必须是 'faithful'（reflow 整文档重排随 P3 提供，"
+            f"当前 {out_cfg.mode!r}）")
+    render_cfg = _filtered(RenderConfig, raw.get("render", {}))
+    ps = render_cfg.page_story
+    if isinstance(ps, bool):          # YAML 1.1 裸 on/off → bool
+        ps = "on" if ps else "off"
+    render_cfg.page_story = (str(ps) or "auto").strip().lower()
+    if render_cfg.page_story not in ("auto", "on", "off"):
+        raise ValueError(
+            f"render.page_story 必须是 'auto'/'on'/'off'，"
+            f"当前 {render_cfg.page_story!r}")
     cfg = Config(io=io_, llm=llm, features=feat, performance=perf, ocr=ocr,
                  glossary_file=raw.get("glossary_file", ""),
                  fonts=raw.get("fonts") or {"cjk": ""},
-                 fit=fit_cfg)
+                 fit=fit_cfg, output=out_cfg, render=render_cfg)
     # 硬校验：输入输出路径必填
     if not cfg.io.input:
         raise ValueError("config.io.input is required")

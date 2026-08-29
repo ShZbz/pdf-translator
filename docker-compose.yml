@@ -1,0 +1,13 @@
+# 用法：docker compose up -d 后浏览器打开 http://localhost:8618
+# 首次进入会弹三步配置向导（选服务商 → 粘 key 测连通 → 完成）。
+# 翻译时输入路径填 /data/xxx.pdf，输出目录填 /data/out。
+services:
+  pdf-translator:
+    build: .
+    image: pdf-translator:latest
+    container_name: pdf-translator
+    ports:
+      - "8618:8618"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

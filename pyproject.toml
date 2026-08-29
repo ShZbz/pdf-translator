@@ -1,6 +1,6 @@
 [project]
 name = "pdf-translator"
-version = "0.7.0"
+version = "0.7.1"
 description = "学术 PDF 整册翻译工具：保留原始版面的 EN→ZH 翻译，附 Liquid Glass Web UI"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,16 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+
+# v0.7.1: 一行命令入口——pipx install pdf-translator（CLI）/
+# uvx --from pdf-translator pdf-translator-ui（UI）
+[project.scripts]
+pdf-translator = "translator.cli:main"
+pdf-translator-ui = "run_ui:main"
+
+[tool.setuptools]
+packages = ["translator", "server"]
+py-modules = ["run_ui"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

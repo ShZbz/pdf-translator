@@ -219,7 +219,9 @@ def render_page(page, layout: dict, translated: list[dict],
                 factors: dict[str, dict] | None = None,
                 fit_cfg=None,
                 archive: "pymupdf.Archive | None" = None,
-                font_css: str | None = None) -> None:
+                font_css: str | None = None,
+                page_story: str = "off",
+                story_stats: dict | None = None) -> None:
     """原地改造一页：redact 全部正文块 → 中文回灌 → display 公式位图回贴。
 
     layout:    layout_page() 输出
@@ -240,6 +242,12 @@ def render_page(page, layout: dict, translated: list[dict],
                （测量 pass 与渲染 pass 必须同一份，框/字号/样式才一致）；
     factors:   {类名: {factor, lead, tracking}} 样式级统一因子；
     archive/font_css: 每文档一次的字体 Archive 复用（None 则本页自建）。
+    page_story:  v0.7.1 render.page_story（auto/on/off）——faithful 模式
+                 整页 Story 接管。auto=页级预检全过才启用；启用条件还要求
+                 htmlbox 引擎 + fit auto + 非双语（双语原文层/fit off/WRITEr
+                 保持原行为，见验收门 d）。
+    story_stats: v0.7.1 页级 Story 计数 {"story", "fallback", "reasons"}
+                 （pipeline 汇总日志用），None 则不计数。
     """
     paras = layout["paragraphs"]
     tmap = {t["index"]: t["text"] for t in translated}
@@ -307,12 +315,24 @@ def render_page(page, layout: dict, translated: list[dict],
                               typography, lang, warn_local,
                               cell_specs=cell_specs, factors=factors,
                               archive=archive, font_css=font_css)
-        _render_paras_htmlbox(page, paras, tmap, font_path, typography,
-                              bilingual, formula_rects, lang, warn_local,
-                              para_specs=para_specs, factors=factors,
-                              fit_cfg=fit_cfg,
-                              archive=archive, font_css=font_css,
-                              layout=layout)
+        # ---- v0.7.1: 页级 Story 接管（任务 2-3 P1）----
+        # 启用条件：render.page_story 启用 + 非双语 + (fit auto 或强制 on)。
+        # 预检/预演任一失败 → 整页回退逐段路径（本函数无墨，回退无痕）。
+        story_done = False
+        if page_story in ("auto", "on") and not bilingual \
+                and para_specs and (fit_cfg is not None
+                                    or page_story == "on"):
+            from .render_story import try_render_page_story
+            story_done = try_render_page_story(
+                page, para_specs, factors, font_css, archive,
+                stats=story_stats)
+        if not story_done:
+            _render_paras_htmlbox(page, paras, tmap, font_path, typography,
+                                  bilingual, formula_rects, lang, warn_local,
+                                  para_specs=para_specs, factors=factors,
+                                  fit_cfg=fit_cfg,
+                                  archive=archive, font_css=font_css,
+                                  layout=layout)
         if formula_pixmaps:
             _paste_formula_pixmaps(page, formula_pixmaps, layout["formulas"])
         return
@@ -525,16 +545,13 @@ def _para_css(font_css: str, family: str, base: float, lh: float,
 
     factor=类字号因子（fit.compute_style_factors 产出）；lead=行距系数；
     tracking=字距系数（<1 时注入 letter-spacing 负值）。
+    v0.7.1: 声明体委托 render_story._para_rule——页级 Story 与逐段路径
+    共用同一声明构造，杜绝两路样式漂移。
     """
-    css = (font_css +
-           f" p {{font-family:{family}; font-size:{base * factor:.2f}pt;"
-           f" line-height:{lh * lead:.3f}; margin:0; text-align:{align};")
-    if indent_em:
-        css += f"text-indent:{indent_em}em;"
-    if tracking < 1.0:
-        css += f"letter-spacing:{tracking - 1.0:.4f};"
-    css += dir_css + "}"
-    return css
+    from .render_story import _para_rule
+    return font_css + " p " + _para_rule(family, base, lh, align, indent_em,
+                                         dir_css, factor=factor, lead=lead,
+                                         tracking=tracking)
 
 
 def _next_below_y(rect: "pymupdf.Rect", col: int, layout: dict,
@@ -783,12 +800,14 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
     - v0.6.0：两遍式排版自适配——spec 由 collect_para_specs 收集
       （测量 pass 与本渲染 pass 共用），类因子 factors 统一同类字号
       /行距/字距；fit 关闭时逐段引擎 scale_low 缩放（v0.5.1 行为）
+    - v0.7.1: 页级 Story 接管在 render_page 层分流（本函数是回退路径）
     - 双语原文层用 opacity 半透明呈现（writer 路径是灰色）
     - typography 样式映射保留：标题用标题字体加粗、caption/ref 小字号、
       CJK 正文首行缩进 2em；ref 条目不扩边不扩框
     - v0.5.1: RTL 目标语言注入 direction:rtl；双语原文层含 CJK 时用
       ptbody 家族（内置 serif 无 CJK 字形会豆腐块）
     """
+    from .render_story import para_factors
     heading_path = typography.heading_path if typography else None
     if archive is None or font_css is None:
         archive, font_css = _build_font_archive(font_path, heading_path)
@@ -799,30 +818,16 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
                            layout=layout or {}, fit_cfg=fit_cfg,
                            page_h=page.rect.height)
     for spec in specs:
-        # fit 开启时用类因子；关闭时 factor=1（引擎 scale_low 兜底=旧行为）。
+        # fit 开启时用类因子；关闭时 (1,1,1)（引擎 scale_low 兜底=旧行为）。
         # v0.6.1: 孤立紧段落带 per-spec override（测量期逐级降级的结果），
-        # 不陪绑全类，也不依赖引擎盲缩
-        if factors is not None:
-            ov = spec.get("_fit_override")
-            if ov is not None:
-                factor = ov.get("factor", 1.0)
-                lead = ov.get("lead", 1.0)
-                track = ov.get("tracking", 1.0)
-            else:
-                f = factors.get(spec["cls"]) or \
-                    {"factor": 1.0, "lead": 1.0, "tracking": 1.0}
-                # 标题类不参与收缩：f 恒 1（扩框/行距已在测量 pass 用尽）
-                factor = f["factor"] if spec["can_shrink"] else 1.0
-                lead = f.get("lead", 1.0)
-                track = f.get("tracking", 1.0)
-            css = _para_css(font_css, spec["family"], spec["base"],
-                            spec["lh"], spec["align"], spec["indent"],
-                            spec["dir_css"], factor=factor,
-                            lead=lead, tracking=track)
-        else:
-            css = _para_css(font_css, spec["family"], spec["base"],
-                            spec["lh"], spec["align"], spec["indent"],
-                            spec["dir_css"])
+        # 不陪绑全类，也不依赖引擎盲缩。
+        # v0.7.1: 因子解析委托 render_story.para_factors——页级 Story
+        # 与本路径共用同一解析，保证两路 CSS 语义一致。
+        factor, lead, track = para_factors(spec, factors)
+        css = _para_css(font_css, spec["family"], spec["base"],
+                        spec["lh"], spec["align"], spec["indent"],
+                        spec["dir_css"], factor=factor,
+                        lead=lead, tracking=track)
         # 双语：上部 60% 译文（spec.rect 已按 60% 切好）；底部原文层
         # 半透明（与公式区重叠则放弃）
         if bilingual and spec["raw_translated"] != spec["src_text"] \
