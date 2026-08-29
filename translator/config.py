@@ -50,6 +50,9 @@ class LLMConfig:
     backoff_base: float = 8.0        # 传输层失败退避基数秒
     backoff_cap: float = 30.0        # 退避上限秒
     retry_delay_cap: float = 60.0    # 429 RetryInfo 建议等待的封顶秒
+    # ---- v0.7.0 速度项 ----
+    stream: bool = True              # 流式解码+首包即回（网关不支持自动退非流式）
+    sentence_cache: bool = True      # 句子级缓存（仅 ref 条目/图注等模板文本）
 
     def resolve(self) -> tuple[str, str]:
         """返回 (base_url, api_key)，preset/env 兜底。
@@ -114,8 +117,14 @@ class OCRConfig:
     engine: str = "paddle"
     min_chars: int = 50
     # v0.5.0: 扫描页译文呈现方式。appendix=附录页（保守默认）；
-    # inplace=白块覆盖+原位回灌（观感更好，与图形重叠的块自动跳过）
+    # inplace=白块覆盖+原位回灌（观感更好，与图形重叠的块自动跳过）；
+    # reconstruct=版面自监督重建（v0.7.0）：区域几何来自 GNN 影子页/
+    # 几何分割（与识别质量解耦），译文原位回灌 + 原文对照附录页
     mode: str = "appendix"
+    # v0.7.0: 多引擎投票（paddle/rapidocr/tesseract 可用子集）。
+    # 空=回落单引擎 engine；多引擎时同行结果按 IoU 对齐投票，
+    # 冲突行取置信度最高并告警
+    engines: list = field(default_factory=list)
 
 
 @dataclass
@@ -129,6 +138,10 @@ class PerformanceConfig:
     # v0.5.1: 版面结果落盘缓存（段落级断点续跑）——同一输入（路径+大小+
     # mtime+引擎）重跑时跳过布局阶段直达翻译（配合翻译缓存只剩增量段）
     layout_cache: bool = True
+    # v0.7.0: 布局-翻译流水线重叠。auto=启发式引擎且页数≥12 时启用
+    #（布局后台线程逐页产出，翻译批随页发车——大文档省整段布局时间）；
+    # on=无条件启用；off=关闭（布局全完成才开始翻译）
+    pipeline_overlap: str = "auto"
 
 
 def _filtered(dc, raw: dict):
@@ -160,15 +173,27 @@ def load_config(path: str | Path) -> Config:
     if feat.renderer not in ("writer", "htmlbox"):
         raise ValueError(
             f"features.renderer 必须是 'writer' 或 'htmlbox'，当前 {feat.renderer!r}")
+    ocr = _filtered(OCRConfig, raw.get("ocr", {}))
+    if ocr.mode not in ("appendix", "inplace", "reconstruct"):
+        raise ValueError(
+            f"ocr.mode 必须是 'appendix' / 'inplace' / 'reconstruct'，"
+            f"当前 {ocr.mode!r}")
+    if not isinstance(ocr.engines, list):
+        raise ValueError(f"ocr.engines 必须是列表，当前 {ocr.engines!r}")
     perf = _filtered(PerformanceConfig, raw.get("performance", {}))
     if perf.layout_engine not in ("heuristic", "pymupdf-layout"):
         raise ValueError(
             "performance.layout_engine 必须是 'heuristic' 或 'pymupdf-layout'，"
             f"当前 {perf.layout_engine!r}")
-    ocr = _filtered(OCRConfig, raw.get("ocr", {}))
-    if ocr.mode not in ("appendix", "inplace"):
+    # YAML 1.1 把裸 on/off 解析成 bool——与 fit.mode 同款归一
+    po = perf.pipeline_overlap
+    if isinstance(po, bool):
+        po = "on" if po else "off"
+    perf.pipeline_overlap = (str(po) or "auto").strip().lower()
+    if perf.pipeline_overlap not in ("auto", "on", "off"):
         raise ValueError(
-            f"ocr.mode 必须是 'appendix' 或 'inplace'，当前 {ocr.mode!r}")
+            "performance.pipeline_overlap 必须是 'auto'/'on'/'off'，"
+            f"当前 {perf.pipeline_overlap!r}")
     from .fit import FitConfig
     fit_cfg = None
     if "fit" in raw:

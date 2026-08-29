@@ -284,6 +284,375 @@ def _log(msg: str) -> None:
     print(f"{ts}[pipeline] {msg}", file=sys.stderr)
 
 
+# ---- v0.7.0: 布局-翻译流水线重叠（页级流水）----
+
+def _overlap_enabled(cfg, client, n_pages: int, layout_engine: str) -> bool:
+    """performance.pipeline_overlap: off/on/auto（默认 auto）。
+
+    auto 启用条件：有 LLM client + 页数 ≥12 + 启发式布局——布局耗时
+    占比足够大才有流水线价值；pymupdf-layout 引擎本身慢 3-6×，走
+    多进程并行布局（workers）+ 顺序翻译更优，不与本特性叠加。
+    显式 on 时无条件启用（client 缺失除外——干跑无翻译可重叠）。
+    """
+    mode = (getattr(cfg.performance, "pipeline_overlap", "auto")
+            or "auto").strip().lower()
+    if mode in ("off", "0", "false", "no"):
+        return False
+    if mode in ("on", "1", "true", "yes"):
+        return client is not None
+    return (client is not None and n_pages >= 12
+            and layout_engine == "heuristic")
+
+
+def _ends_open(txt: str) -> bool:
+    t = txt.rstrip()
+    return bool(t) and t[-1] not in ".:;!?。：；？！\")]'\""
+
+
+def _starts_lower(txt: str) -> bool:
+    t = txt.lstrip()
+    return bool(t) and (t[0].islower() or t[0].isdigit() or t[0] in "([{")
+
+
+def _cross_merge_ok(a: dict, b: dict) -> bool:
+    """跨页断句合并判定（与非流式路径同规则）。"""
+    return (_ends_open(a["text"]) and _starts_lower(b["text"])
+            and not a.get("is_ref") and not b.get("is_ref")
+            and not b.get("is_caption")
+            and len(a["text"]) + len(b["text"]) <= 1200)
+
+
+def _join_group_parts(parts: list[str]) -> str:
+    """跨页连字符合并（与非流式路径同规则）。"""
+    if len(parts) == 2:
+        a, b = parts[0].rstrip(), parts[1].lstrip()
+        if a.endswith("-") and b[:1].islower():
+            return a[:-1] + b
+    return "\n".join(parts)
+
+
+def _budget_font(font_path: str, cjk: bool):
+    """预算估算用字体（拉丁/西里尔目标语言需要实测字宽）。"""
+    if not cjk and font_path:
+        try:
+            return pymupdf.Font(fontfile=font_path)
+        except Exception:
+            return None
+    return None
+
+
+def _group_budget(g: list[int], pending: list, page_layouts: list, typo,
+                  font, cjk: bool) -> "int | None":
+    """单合并组的字符预算（与 _unit_char_budgets 同语义，流式增量用）。"""
+    from .typography import line_height_factor
+    total = 0
+    for fi in g:
+        pno, pi = pending[fi]
+        p = page_layouts[pno]["paragraphs"][pi]
+        base = p.get("size") or 10.0
+        lh = 1.32
+        if typo is not None:
+            try:
+                style = typo.resolve(p, None)
+                base = max(style.size, 6.5)
+                lh = line_height_factor(style.kind)
+            except Exception:
+                pass
+        total += estimate_char_budget(pymupdf.Rect(p["bbox"]), base, lh,
+                                      font, cjk)
+    return total if total > 0 else None
+
+
+def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
+                         glossary, cache, sink, control, fit_cfg,
+                         layout_engine, lc_path, out_dir, all_warnings):
+    """v0.7.0 布局-翻译流水线重叠路径（任务 2-2b）。
+
+    布局在后台线程逐页产出（布局线程持有独立打开的 Document——
+    PyMuPDF 非线程安全，主线程的 doc 只做 OCR 渲染/公式裁图）；
+    主线程每收到一页：收集段/格 → 跨页合并判定（1 页前视）→ 预算 →
+    缓存 → 未命中进 StreamingTranslator 开批——批满即发车，布局继续
+    跑下一页。页 N 布局完 → 该页段落立即进组批队列，50+ 页大文档
+    省整段布局时间（与版面缓存互补：缓存命中时页瞬间产出）。
+
+    返回 dict（与非流式路径同构的下游状态）：
+    page_layouts / page_pixmaps / texts_by_page / cell_texts /
+    ocr_jobs / ocr_translations / n_paras / total_calls / tc
+    """
+    import queue as _queue
+    import threading as _threading
+    from .langs import lang_info as _lang_info
+    from .llm import StreamingTranslator
+    from . import ocr as ocr_mod
+
+    n_pages = len(doc)
+    cjk = _lang_info(tgt_lang).script == "cjk"
+    budget_font = _budget_font(font_path, cjk) if fit_cfg.mode == "auto" else None
+    budgets_on = fit_cfg.mode == "auto"
+
+    # 布局线程的独立 Document（水印清理只发生在主 doc，落盘后重开）
+    fd, tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
+    os.close(fd)
+    layout_tmp = Path(tmp_name)
+    q: "_queue.Queue" = _queue.Queue()
+
+    cached = _load_layout_cache(lc_path) if lc_path is not None else None
+    cache_hit = cached is not None and len(cached) == n_pages
+
+    def _producer():
+        pdoc = None
+        try:
+            doc.save(str(layout_tmp))
+            pdoc = pymupdf.open(str(layout_tmp))
+            for pno in range(n_pages):
+                if control is not None:
+                    control.checkpoint()
+                if cache_hit:
+                    lay = cached[pno]
+                else:
+                    lay = layout_page(pdoc[pno], engine=layout_engine)
+                pixmaps = crop_formula_pixmaps(pdoc, pno, lay["formulas"]) \
+                    if lay.get("formulas") else {}
+                q.put((pno, lay, pixmaps))
+            q.put(None)
+        except BaseException as e:      # JobCancelled/布局异常都交给消费侧
+            q.put(e)
+        finally:
+            if pdoc is not None:
+                try:
+                    pdoc.close()
+                except Exception:
+                    pass
+
+    llm_eff = cfg.llm.effective()
+    if (llm_eff.min_call_interval, llm_eff.batch_char_budget) != \
+            (cfg.llm.min_call_interval, cfg.llm.batch_char_budget):
+        _log(f"llm quota auto: interval={llm_eff.min_call_interval}s, "
+             f"batch_char_budget={llm_eff.batch_char_budget} "
+             f"(rpm={cfg.llm.rpm_limit}, tpm={cfg.llm.tpm_limit})")
+    tc = TranslationClient(
+        client, model=llm_eff.model,
+        temperature=llm_eff.temperature,
+        glossary_prompt=glossary.prompt_block() if glossary else "",
+        src_lang=cfg.io.source_lang, tgt_lang=cfg.io.target_lang,
+        batch_size=llm_eff.batch_size,
+        batch_char_budget=llm_eff.batch_char_budget,
+        max_llm_calls=llm_eff.max_llm_calls,
+        min_call_interval=llm_eff.min_call_interval,
+        max_workers=llm_eff.max_workers,
+        fallback_model=llm_eff.fallback_model,
+        timeout=llm_eff.timeout,
+        max_retries=llm_eff.max_retries,
+        backoff_base=llm_eff.backoff_base,
+        backoff_cap=llm_eff.backoff_cap,
+        retry_delay_cap=llm_eff.retry_delay_cap,
+        sink=sink, control=control,
+        stream=bool(getattr(cfg.llm, "stream", True)),
+        sentence_cache=bool(getattr(cfg.llm, "sentence_cache", True)),
+    )
+    streamer = StreamingTranslator(tc, cache=cache)
+
+    page_layouts: list[dict] = []
+    page_pixmaps: list[dict[int, bytes]] = []
+    pending: list[tuple[int, int]] = []
+    cell_pending: list[tuple[int, int]] = []
+    flat_idx_of: dict[tuple[int, int], int] = {}
+    unit_targets: list = []      # 与 streamer 单元对齐：("para",g)/("cell",..)/("ocr",..)
+    open_group: "list[int] | None" = None
+    n_paras = 0
+    ocr_jobs: list[dict] = []
+    engines_cfg = _resolve_ocr_engines(cfg)
+    engines_avail = [e for e in engines_cfg if ocr_mod.engine_available(e)]
+    ocr_mode = (getattr(cfg.ocr, "mode", "appendix") or "appendix").strip()
+
+    def _emit_para_group(g: list[int]) -> None:
+        parts = [page_layouts[pending[fi][0]]["paragraphs"][pending[fi][1]]["text"]
+                 for fi in g]
+        kind = None
+        if len(g) == 1:
+            para = page_layouts[pending[g[0]][0]]["paragraphs"][pending[g[0]][1]]
+            kind = "ref" if para.get("is_ref") \
+                else "caption" if para.get("is_caption") else None
+        budget = _group_budget(g, pending, page_layouts, typo, budget_font,
+                               cjk) if budgets_on else None
+        unit_targets.append(("para", g))
+        streamer.add_unit(_join_group_parts(parts), budget=budget, kind=kind)
+
+    def _feed_page(pno: int, lay: dict, pixmaps: dict) -> None:
+        nonlocal open_group, n_paras
+        page_layouts.append(lay)
+        page_pixmaps.append(pixmaps)
+        sink.page_done(pno, n_pages)
+        n_paras += len(lay["paragraphs"])
+        # 单元格（v0.7.0 流式：随页进队，批协议不变；低置信格保守不译）
+        for ci, cell in enumerate(lay.get("tables_cells", [])):
+            if not cell.get("text", "").strip():
+                continue
+            if not _cell_translatable(cell):
+                all_warnings.append(
+                    f"table cell p.{pno + 1} kept original (low split "
+                    f"confidence) - manual check suggested")
+                continue
+            cell_pending.append((pno, ci))
+            budget = estimate_char_budget(
+                pymupdf.Rect(cell["bbox"]), 8.0, 1.25, budget_font, cjk
+            ) if budgets_on else None
+            unit_targets.append(("cell", pno, ci))
+            streamer.add_unit(cell["text"], budget=budget or None)
+        # OCR 扫描页（引擎可用时随页提取——与后续页布局重叠）
+        if client is not None and engines_avail \
+                and not page_has_text_layer(doc[pno], cfg.ocr.min_chars):
+            job = _ocr_page_job(doc, pno, cfg, ocr_mode, engines_avail,
+                                all_warnings)
+            if job is None:
+                w = f"OCR page {pno + 1}: no text recognized; kept as-is"
+                _log(f"WARNING: {w}")
+                all_warnings.append(w)
+            else:
+                ocr_jobs.append(job)
+                jidx = len(ocr_jobs) - 1
+                if job["mode"] in ("inplace", "reconstruct"):
+                    for bi, (_r, t) in enumerate(job["blocks"]):
+                        unit_targets.append(("ocr", jidx, bi))
+                        streamer.add_unit(t)
+                else:
+                    unit_targets.append(("ocr", jidx, None))
+                    streamer.add_unit(job["text"])
+        # 段落：先决上一页遗留的跨页合并组，再收本页
+        paras = lay["paragraphs"]
+        skip_fi = None
+        if open_group is not None:
+            fi_prev = open_group[0]
+            prev = page_layouts[pending[fi_prev][0]]["paragraphs"][
+                pending[fi_prev][1]]
+            fi_next = flat_idx_of.get((pno, 0))
+            if fi_next is not None and _cross_merge_ok(prev, paras[0]):
+                _emit_para_group([fi_prev, fi_next])
+                skip_fi = fi_next
+            else:
+                _emit_para_group([fi_prev])
+            open_group = None
+        page_fis = []
+        for i in range(len(paras)):
+            if not paras[i].get("is_verbatim"):
+                flat_idx_of[(pno, i)] = len(pending)
+                pending.append((pno, i))
+                page_fis.append(len(pending) - 1)
+        for fi in page_fis:
+            if fi == skip_fi:
+                continue
+            if fi == page_fis[-1]:
+                open_group = [fi]      # 末段留待下页首段判定
+            else:
+                _emit_para_group([fi])
+
+    t_prod = _threading.Thread(target=_producer, daemon=True)
+    t_prod.start()
+    _log(f"layout: streaming overlap on ({n_pages} page(s), "
+         f"engine={layout_engine})")
+    err: "BaseException | None" = None
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        if isinstance(item, BaseException):
+            err = item
+            break
+        if control is not None:
+            control.checkpoint()
+        _feed_page(*item)
+    if err is None and open_group is not None:
+        _emit_para_group(open_group)
+        open_group = None
+    try:
+        layout_tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if err is not None:
+        raise err
+    if not cache_hit and lc_path is not None and page_layouts \
+            and len(page_layouts) == n_pages:
+        _save_layout_cache(lc_path, page_layouts)
+
+    sink.stage("translate")
+    translated, total_calls = streamer.finish()
+    all_warnings.extend(tc.warnings)
+    if tc.sent_cache_hits:
+        _log(f"cache: {tc.sent_cache_hits} template unit(s) served by "
+             f"sentence-level cache")
+
+    # 分发译文（含 v0.7.0 术语锁确定性修复——与非流式路径同语义）
+    texts_by_page: dict[int, list["str | None"]] = {}
+    cell_texts: dict[tuple[int, int], str] = {}
+    ocr_flat_out: list["str | None"] = []
+    ocr_counts: list[int] = []         # 每 job 的单元数（粘贴阶段按序消费）
+    for job in ocr_jobs:
+        n = len(job["blocks"]) if job["mode"] in ("inplace", "reconstruct") else 1
+        ocr_counts.append(n)
+    ocr_flat_out = [None] * sum(ocr_counts)
+    ocr_cursor = 0
+    gloss_fixed = 0
+    for i, (target, dst) in enumerate(zip(unit_targets, translated)):
+        if target[0] == "para":
+            g = target[1]
+            if glossary is not None and cfg.features.glossary_lock \
+                    and len(g) == 1:
+                fixed, done = glossary.fix_translation(dst)
+                if done:
+                    dst = fixed
+                    gloss_fixed += 1
+            if len(g) == 1:
+                pno, pi = pending[g[0]]
+                texts_by_page.setdefault(
+                    pno, [None] * len(page_layouts[pno]["paragraphs"]))
+                texts_by_page[pno][pi] = dst
+                if glossary is not None and cfg.features.glossary_lock:
+                    bad = glossary.check_translation(dst)
+                    if bad:
+                        pno_, pi_ = pending[g[0]]
+                        all_warnings.append(
+                            f"glossary violation p{pno_ + 1}#{pi_}: {bad}")
+                continue
+            pno_a, pi_a = pending[g[0]]
+            pno_b, pi_b = pending[g[1]]
+            len_a = len(page_layouts[pno_a]["paragraphs"][pi_a]["text"])
+            len_b = len(page_layouts[pno_b]["paragraphs"][pi_b]["text"])
+            part_a, part_b = _split_proportional(
+                dst, len_a / max(len_a + len_b, 1))
+            texts_by_page.setdefault(
+                pno_a, [None] * len(page_layouts[pno_a]["paragraphs"]))
+            texts_by_page.setdefault(
+                pno_b, [None] * len(page_layouts[pno_b]["paragraphs"]))
+            texts_by_page[pno_a][pi_a] = part_a
+            texts_by_page[pno_b][pi_b] = part_b
+        elif target[0] == "cell":
+            _, pno, ci = target
+            cell_texts[(pno, ci)] = dst
+        else:
+            # OCR 单元按喂入序（job 顺序 × 块顺序）线性消费
+            ocr_flat_out[ocr_cursor] = dst
+            ocr_cursor += 1
+    if gloss_fixed:
+        _log(f"glossary: {gloss_fixed} paragraph(s) fixed in place")
+
+    for pno, lay in enumerate(page_layouts):
+        _log(f"page {pno + 1}/{n_pages}: {lay['mode']}-col, "
+             f"{len(lay['paragraphs'])} paras, {len(lay['formulas'])} formulas, "
+             f"{len(lay.get('tables_cells', []))} table cells")
+
+    return {
+        "page_layouts": page_layouts,
+        "page_pixmaps": page_pixmaps,
+        "texts_by_page": texts_by_page,
+        "cell_texts": cell_texts,
+        "ocr_jobs": ocr_jobs,
+        "ocr_translations": ocr_flat_out,
+        "n_paras": n_paras,
+        "total_calls": total_calls,
+        "tc": tc,
+    }
+
+
 def _append_ocr_pages(doc, ocr_units: list[tuple[int, str]],
                       translations: list[str], font_path: str,
                       warnings: list[str], renderer: str = "writer",
@@ -406,6 +775,8 @@ def _apply_ocr_inplace(doc, pno: int, blocks: list[tuple["pymupdf.Rect", str]],
     （白块会误伤插图）；否则白矩形盖掉原文、译文按块 bbox 试排回灌。
     返回成功回贴的块数。
     v0.5.1: renderer=htmlbox 时译文走 insert_htmlbox（RTL/天城文整形）。
+    v0.7.0: reconstruct 模式复用本函数——blocks 换成版面区域
+    （GNN 语义区域/几何分割产出），区域几何与 OCR 识别质量解耦。
     """
     page = doc[pno]
     font = pymupdf.Font(fontfile=font_path)
@@ -451,6 +822,174 @@ def _apply_ocr_inplace(doc, pno: int, blocks: list[tuple["pymupdf.Rect", str]],
         tw.write_text(page)
         applied += 1
     return applied
+
+
+# ---- v0.7.0: OCR 引擎解析 + 版面自监督重建 ----
+
+_CELL_CONF_FLOOR = 0.5     # 切分置信度低于此值的单元格保守不译
+
+
+def _cell_translatable(cell: dict) -> bool:
+    """v0.7.0 置信度分级：conf ≥ 0.5 的格才送译（错切保留原文更安全）。"""
+    conf = cell.get("conf", 1.0)
+    return conf is None or float(conf) >= _CELL_CONF_FLOOR
+
+
+def _resolve_ocr_engines(cfg) -> list[str]:
+    """OCR 引擎清单：ocr.engines 优先，缺省回落单引擎 ocr.engine。"""
+    raw = getattr(cfg.ocr, "engines", None) or []
+    engines = [str(e).strip() for e in raw if str(e or "").strip()]
+    if not engines:
+        e = (getattr(cfg.ocr, "engine", "") or "").strip()
+        engines = [e] if e and e != "none" else []
+    # 去重保序
+    seen, out = set(), []
+    for e in engines:
+        if e not in seen:
+            seen.add(e)
+            out.append(e)
+    return out
+
+
+# GNN 语义区域 → 可译/保留分类（pymupdf-layout kind 字符串）
+_OCR_REGION_SKIP = ("header", "footer")
+_OCR_REGION_PRESERVE = ("table", "fig", "pic", "image", "formul", "equation",
+                        "math")
+
+
+def _blocks_from_gnn_regions(regions: list, lines: list,
+                             page) -> list[tuple["pymupdf.Rect", str]]:
+    """GNN 语义区域 + OCR 行 → 可译区域块 [(rect, text)]。
+
+    行按中心点落区归属；表/图/公式区不产块（保留原像素，区内的
+    图内标注随位图存活——区内的行也标已消费，不再当漏检行复活）；
+    页眉页脚区丢弃（与文字层页同策略）；未落入任何区域的行（GNN
+    漏检）按行聚类兜底成块，宁多译不漏译。
+    """
+    blocks: list[tuple[pymupdf.Rect, str]] = []
+    used = [False] * len(lines)
+
+    def _mark_covered(rrect: pymupdf.Rect) -> None:
+        for i, (lr, _lt) in enumerate(lines):
+            c = pymupdf.Point((lr.x0 + lr.x1) / 2, (lr.y0 + lr.y1) / 2)
+            if rrect.contains(c):
+                used[i] = True
+
+    for rrect, kind in regions:
+        k = str(kind or "").strip().lower()
+        if any(s in k for s in _OCR_REGION_SKIP + _OCR_REGION_PRESERVE):
+            _mark_covered(pymupdf.Rect(rrect))
+            continue
+        br = pymupdf.Rect(rrect)
+        texts = []
+        for i, (lr, lt) in enumerate(lines):
+            c = pymupdf.Point((lr.x0 + lr.x1) / 2, (lr.y0 + lr.y1) / 2)
+            if br.contains(c):
+                texts.append(lt)
+                used[i] = True
+        if texts:
+            blocks.append((br, "\n".join(texts)))
+    if not all(used):
+        leftover = [it for i, it in enumerate(lines) if not used[i]]
+        blocks.extend(_group_ocr_lines(leftover))
+    # 阅读序（y 主序 x 次序）
+    blocks.sort(key=lambda b: (b[0].y0, b[0].x0))
+    return blocks
+
+
+def _ocr_page_job(doc, pno: int, cfg, ocr_mode: str, engines_avail: list[str],
+                  warnings: list[str]) -> "dict | None":
+    """单扫描页 OCR 提取 → 翻译 job（v0.7.0：多引擎投票 + reconstruct）。
+
+    返回 job dict（见调用方）；OCR 引擎全空/识别失败返回 None。
+    """
+    from . import ocr as ocr_mod
+    lines, conflicts = ocr_mod.ocr_page_lines_voted(
+        doc[pno], engines=engines_avail, src_lang=cfg.io.source_lang)
+    if conflicts:
+        warnings.append(
+            f"OCR p.{pno + 1}: {conflicts} line(s) conflicted across "
+            f"engines; picked highest confidence - consider manual check")
+    if not lines:
+        return None
+    page_text = "\n".join(t for _, t in lines)
+    job: dict = {"pno": pno, "mode": ocr_mode, "text": "", "blocks": []}
+    if ocr_mode == "reconstruct":
+        # 版面自监督重建：区域几何来自 GNN（影子页）/几何分割，识别
+        # 文本只负责原文层——认错字不影响版面只影响对照层保真
+        regions = None
+        try:
+            regions = ocr_mod.gnn_regions_for_lines(doc[pno], lines)
+        except Exception:
+            regions = None
+        if regions is not None:
+            blocks = _blocks_from_gnn_regions(regions, lines, doc[pno])
+        else:
+            blocks = ocr_mod.region_blocks_geometry(lines, doc[pno].rect)
+        if blocks and sum(len(t) for _, t in blocks) >= 10:
+            job["blocks"] = blocks
+            job["text"] = page_text      # 原文层（附录对照用）
+            return job
+        # 区域化失败 → 退附录模式
+        job["mode"] = "appendix"
+    if ocr_mode == "inplace":
+        blocks = _group_ocr_lines(lines)
+        if blocks and sum(len(t) for _, t in blocks) >= 10:
+            job["blocks"] = blocks
+            return job
+    # appendix（或区域化失败的兜底）：全文附录——v0.7.0 修复：复用已
+    # 提取的行，不再整页二次 OCR（旧版块化失败会重跑一遍 OCR 翻倍耗时）
+    if page_text and len(page_text.strip()) >= 10:
+        job["mode"] = "appendix"
+        job["text"] = page_text
+        return job
+    return None
+
+
+def _append_ocr_original(doc, pno: int, text: str, font_path: str,
+                         warnings: list[str], renderer: str = "writer",
+                         lang: str = "zh") -> int:
+    """v0.7.0 reconstruct 模式的原文对照附录页：插在扫描页之后。
+
+    与 _append_ocr_pages（译文附录）成对；reconstruct 主页已原位回贴
+    译文，附录页承载 OCR 原文（识别层保真对照——认字错误的查验入口）。
+    """
+    from .render import _build_font_archive, _insert_one_htmlbox
+    font = pymupdf.Font(fontfile=font_path)
+    doc.insert_page(pno + 1)
+    page = doc[pno + 1]
+    tw = pymupdf.TextWriter(page.rect)
+    fs = 9.5
+    y = 42.0 + font.ascender * 10.5
+    tw.append(pymupdf.Point(42.0, y), f"[OCR original · p.{pno + 1}]",
+              font=font, fontsize=10.5)
+    tw.write_text(page)
+    y += 16.0
+    body = _clean_zh_text(text)
+    arch, font_css = _build_font_archive(font_path, None) \
+        if renderer == "htmlbox" else (None, "")
+    family = "ptbody, serif" if font_path else "serif"
+    d = "direction:rtl;" if is_rtl(lang) else ""
+    if renderer == "htmlbox":
+        body_rect = pymupdf.Rect(42.0, y, page.rect.width - 42.0,
+                                 page.rect.height - 42.0)
+        css = (font_css +
+               f" p {{font-family:{family}; font-size:{fs}pt;"
+               f" line-height:1.5; margin:0; text-align:left;{d}}}")
+        _insert_one_htmlbox(page, body_rect,
+                            f"<p>{_html_escape(body)}</p>", css,
+                            f"ocr-original p{pno + 1}", warnings, archive=arch)
+    else:
+        for ln in _wrap_cjk(body, font, fs, page.rect.width - 84.0):
+            if y > page.rect.height - 42.0:
+                warnings.append(
+                    f"OCR original p.{pno + 1}: text truncated (page full)")
+                break
+            tw = pymupdf.TextWriter(page.rect)
+            tw.append(pymupdf.Point(42.0, y), ln, font=font, fontsize=fs)
+            tw.write_text(page)
+            y += fs * 1.5
+    return 1
 
 
 def translate_document(cfg: Config, client=None, verbose: bool = False,
@@ -544,9 +1083,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             _log(f"typography init failed ({e}); fallback to single-font mode")
             typo = None
 
-    # ---- v0.4.3: 布局 + 裁公式（多进程并行，故障自动回退串行）----
-    # v0.5.1: 版面结果落盘缓存（段落级断点续跑）——同一输入重跑时跳过
-    # 布局阶段直达翻译；公式位图不落盘（裁图相对便宜，加载后重裁）
+    # ---- 布局引擎/并行数/版面缓存路径（v0.7.0：两条路径共用）----
     layout_engine = (getattr(cfg.performance, "layout_engine", "heuristic")
                      or "heuristic").strip()
     workers = _resolve_layout_workers(cfg, n_pages)
@@ -554,296 +1091,385 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     page_pixmaps: list[dict[int, bytes]] = []
     lc_path = _layout_cache_path(out_dir, src, layout_engine) \
         if getattr(cfg.performance, "layout_cache", True) else None
-    if lc_path is not None:
-        cached = _load_layout_cache(lc_path)
-        if cached is not None and len(cached) == n_pages:
-            page_layouts = cached
-            _log(f"layout: cache hit ({lc_path.name}), skipping layout "
-                 f"for {n_pages} page(s)")
-            sink.emit("layout_cache_hit", pages=n_pages)
-            sink.progress(done=n_pages, total=n_pages, unit="page")
-            for pno in range(n_pages):
-                page_pixmaps.append(
-                    crop_formula_pixmaps(doc, pno, page_layouts[pno]["formulas"])
-                    if page_layouts[pno].get("formulas") else {})
-    if not page_layouts and workers > 1:
-        fd, layout_tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
-        os.close(fd)
-        layout_tmp = Path(layout_tmp_name)
-        _log(f"layout: {workers} workers (parallel), engine={layout_engine}")
-        got = None
+
+    # ---- v0.7.0: 布局-翻译流水线重叠（页级流水，任务 2-2b）----
+    # 大文档且启发式布局时：布局后台线程逐页产出，主线程页级喂批发车
+    # ——翻译与布局重叠，省整段布局时间。任何故障回退顺序路径
+    # （翻译缓存使重跑只剩增量段）。
+    state = None
+    if _overlap_enabled(cfg, client, n_pages, layout_engine):
         try:
-            got = _layout_parallel(doc, layout_tmp, workers, sink, control,
-                                   n_pages, engine=layout_engine)
-        finally:
+            state = _translate_streaming(
+                doc, cfg, client, typo, font_path, tgt_lang, glossary,
+                cache, sink, control, fit_cfg, layout_engine, lc_path,
+                out_dir, all_warnings)
+        except JobCancelled:
+            raise
+        except Exception as e:
+            _log(f"streaming overlap failed ({e}); "
+                 f"falling back to sequential path")
+            state = None
+    if state is None:
+        # ---- v0.4.3 布局本体：缓存命中 → 并行 → 串行回退 ----
+        if lc_path is not None:
+            cached = _load_layout_cache(lc_path)
+            if cached is not None and len(cached) == n_pages:
+                page_layouts = cached
+                _log(f"layout: cache hit ({lc_path.name}), skipping layout "
+                     f"for {n_pages} page(s)")
+                sink.emit("layout_cache_hit", pages=n_pages)
+                sink.progress(done=n_pages, total=n_pages, unit="page")
+                for pno in range(n_pages):
+                    page_pixmaps.append(
+                        crop_formula_pixmaps(doc, pno, page_layouts[pno]["formulas"])
+                        if page_layouts[pno].get("formulas") else {})
+        if not page_layouts and workers > 1:
+            fd, layout_tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
+            os.close(fd)
+            layout_tmp = Path(layout_tmp_name)
+            _log(f"layout: {workers} workers (parallel), engine={layout_engine}")
+            got = None
             try:
-                layout_tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if got is not None:
-            page_layouts, page_pixmaps = got
-    if not page_layouts:      # 串行路径（workers==1 或并行回退）
-        if workers > 1:
-            sink.warning("parallel layout failed; sequential fallback "
-                         "(progress counter restarts)")
-        for pno in range(n_pages):
-            if control:
-                control.checkpoint()
-            lay = layout_page(doc[pno], engine=layout_engine)
-            pixmaps = crop_formula_pixmaps(doc, pno, lay["formulas"]) \
-                if lay["formulas"] else {}
-            page_layouts.append(lay)
-            page_pixmaps.append(pixmaps)
-            sink.page_done(pno, n_pages)
-    if lc_path is not None and page_layouts and \
-            len(page_layouts) == n_pages and \
-            not any(p for p in page_pixmaps if p is None):
-        # 布局完成（非缓存命中路径）→ 落盘供断点续跑
-        _save_layout_cache(lc_path, page_layouts)
-    # v0.5.1: 全部页 fallback 才告警——pymupdf-layout 已装且正常运行时，
-    # 纯文本页（GNN 检不出图/表/公式区）按页回退启发式属正常行为，
-    # 只看第 0 页会在"首页恰好纯文本"时误报"未安装"
-    if page_layouts and layout_engine == "pymupdf-layout" and all(
-            l.get("layout_engine") == "pymupdf-layout-fallback"
-            for l in page_layouts):
-        w = ("performance.layout_engine='pymupdf-layout' but package not "
-             "installed/failed; heuristic fallback in use "
-             "(pip install pymupdf-layout)")
-        _log(f"WARNING: {w}")
-        all_warnings.append(w)
-
-    pending: list[tuple[int, int]] = []   # (page_no, para_index)
-    cell_pending: list[tuple[int, int]] = []   # v0.2.3: (page_no, cell_index)
-    for pno, lay in enumerate(page_layouts):
-        for i in range(len(lay["paragraphs"])):
-            # v0.2.2: verbatim 段（Algorithm 伪代码框/数学碎片）不进翻译队列,
-            # 渲染时 texts_by_page 缺位 → 原文回灌
-            if not lay["paragraphs"][i].get("is_verbatim"):
-                pending.append((pno, i))
-        # v0.2.3: 表格单元格进翻译队列（用户要求三线表也翻译）——
-        # 之前 cells 只在 layout 里切出但从未送译（"三线表没翻译"根因）
-        for ci, cell in enumerate(lay.get("tables_cells", [])):
-            if cell.get("text", "").strip():
-                cell_pending.append((pno, ci))
-        n_paras += len(lay["paragraphs"])
-        _log(f"page {pno + 1}/{n_pages}: {lay['mode']}-col, "
-             f"{len(lay['paragraphs'])} paras, {len(lay['formulas'])} formulas, "
-             f"{len(lay.get('tables_cells', []))} table cells")
-
-    # ---- OCR：扫描页检测 + 惰性提取（appendix/inplace 两种呈现）----
-    from . import ocr as ocr_mod
-    # ocr_jobs: {pno, mode, text(附录全文), blocks(原位块 [(bbox,text)])}
-    ocr_jobs: list[dict] = []
-    scanned = [p for p in range(n_pages)
-               if not page_has_text_layer(doc[p], cfg.ocr.min_chars)]
-    ocr_mode = (getattr(cfg.ocr, "mode", "appendix") or "appendix").strip()
-    if scanned:
-        pages_fmt = ", ".join(f"p.{p + 1}" for p in scanned)
-        engine = (cfg.ocr.engine or "").strip()
-        if engine in ("", "none"):
-            _log(f"scanned pages ({pages_fmt}): OCR engine disabled, kept as-is")
-        elif not ocr_mod.engine_available(engine):
-            w = (f"scanned pages ({pages_fmt}) but OCR engine '{engine}' "
-                 f"not installed (pip install paddleocr); kept as-is")
-            _log(f"WARNING: {w}")
-            all_warnings.append(w)
-        elif client is None:
-            _log(f"scanned pages ({pages_fmt}): dry-run, OCR skipped")
-        else:
-            for pno in scanned:
+                got = _layout_parallel(doc, layout_tmp, workers, sink, control,
+                                       n_pages, engine=layout_engine)
+            finally:
+                try:
+                    layout_tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if got is not None:
+                page_layouts, page_pixmaps = got
+        if not page_layouts:      # 串行路径（workers==1 或并行回退）
+            if workers > 1:
+                sink.warning("parallel layout failed; sequential fallback "
+                             "(progress counter restarts)")
+            for pno in range(n_pages):
                 if control:
                     control.checkpoint()
-                job: dict = {"pno": pno, "mode": "appendix", "text": "",
-                             "blocks": []}
-                lines = None
-                if ocr_mode == "inplace":
-                    lines = ocr_mod.ocr_page_lines(
-                        doc[pno], engine=engine, src_lang=cfg.io.source_lang)
-                if lines:
-                    blocks = _group_ocr_lines(lines)
-                    if blocks and sum(len(t) for _, t in blocks) >= 10:
-                        job["mode"] = "inplace"
-                        job["blocks"] = blocks
-                        _log(f"page {pno + 1}: scanned, OCR {len(blocks)} "
-                             f"block(s) → in-place paste-back")
-                    else:
-                        lines = None   # 块化失败 → 全文附录兜底
-                if lines is None:
-                    text = ocr_mod.ocr_page_text(
-                        doc[pno], engine=engine, src_lang=cfg.io.source_lang)
-                    if text and len(text.strip()) >= 10:
-                        job["text"] = text
-                        _log(f"page {pno + 1}: scanned, OCR extracted "
-                             f"{len(text)} chars → appendix translation")
-                    else:
+                lay = layout_page(doc[pno], engine=layout_engine)
+                pixmaps = crop_formula_pixmaps(doc, pno, lay["formulas"]) \
+                    if lay["formulas"] else {}
+                page_layouts.append(lay)
+                page_pixmaps.append(pixmaps)
+                sink.page_done(pno, n_pages)
+        if lc_path is not None and page_layouts and \
+                len(page_layouts) == n_pages and \
+                not any(p for p in page_pixmaps if p is None):
+            # 布局完成（非缓存命中路径）→ 落盘供断点续跑
+            _save_layout_cache(lc_path, page_layouts)
+        # v0.5.1: 全部页 fallback 才告警——pymupdf-layout 已装且正常运行时，
+        # 纯文本页（GNN 检不出图/表/公式区）按页回退启发式属正常行为，
+        # 只看第 0 页会在"首页恰好纯文本"时误报"未安装"
+        if page_layouts and layout_engine == "pymupdf-layout" and all(
+                l.get("layout_engine") == "pymupdf-layout-fallback"
+                for l in page_layouts):
+            w = ("performance.layout_engine='pymupdf-layout' but package not "
+                 "installed/failed; heuristic fallback in use "
+                 "(pip install pymupdf-layout)")
+            _log(f"WARNING: {w}")
+            all_warnings.append(w)
+
+        pending: list[tuple[int, int]] = []   # (page_no, para_index)
+        cell_pending: list[tuple[int, int]] = []   # v0.2.3: (page_no, cell_index)
+        for pno, lay in enumerate(page_layouts):
+            for i in range(len(lay["paragraphs"])):
+                # v0.2.2: verbatim 段（Algorithm 伪代码框/数学碎片）不进翻译队列,
+                # 渲染时 texts_by_page 缺位 → 原文回灌
+                if not lay["paragraphs"][i].get("is_verbatim"):
+                    pending.append((pno, i))
+            # v0.2.3: 表格单元格进翻译队列（用户要求三线表也翻译）——
+            # 之前 cells 只在 layout 里切出但从未送译（"三线表没翻译"根因）
+            # v0.7.0: 置信度分级渲染（任务 2-3）——切分置信度极低
+            # （conf<0.5，锚点全对不上的间隙兜底行）的格保留原文
+            # + 警告"建议手动核对"：错切时代价高，宁可不译
+            for ci, cell in enumerate(lay.get("tables_cells", [])):
+                if not cell.get("text", "").strip():
+                    continue
+                if _cell_translatable(cell):
+                    cell_pending.append((pno, ci))
+                else:
+                    all_warnings.append(
+                        f"table cell p.{pno + 1} kept original (low split "
+                        f"confidence) - manual check suggested")
+            n_paras += len(lay["paragraphs"])
+            _log(f"page {pno + 1}/{n_pages}: {lay['mode']}-col, "
+                 f"{len(lay['paragraphs'])} paras, {len(lay['formulas'])} formulas, "
+                 f"{len(lay.get('tables_cells', []))} table cells")
+
+        # ---- OCR：扫描页检测 + 惰性提取（appendix/inplace/reconstruct）----
+        from . import ocr as ocr_mod
+        # ocr_jobs: {pno, mode, text(附录全文/原文对照), blocks(原位块 [(bbox,text)])}
+        ocr_jobs: list[dict] = []
+        scanned = [p for p in range(n_pages)
+                   if not page_has_text_layer(doc[p], cfg.ocr.min_chars)]
+        ocr_mode = (getattr(cfg.ocr, "mode", "appendix") or "appendix").strip()
+        if scanned:
+            pages_fmt = ", ".join(f"p.{p + 1}" for p in scanned)
+            engines_cfg = _resolve_ocr_engines(cfg)
+            engines_avail = [e for e in engines_cfg if ocr_mod.engine_available(e)]
+            missing = [e for e in engines_cfg if e not in engines_avail]
+            if missing:
+                w = (f"OCR engine(s) not installed: {', '.join(missing)} "
+                     f"(pip install paddleocr / rapidocr-onnxruntime / "
+                     f"tesseract); voted on the rest")
+                _log(f"WARNING: {w}")
+                all_warnings.append(w)
+            if not engines_cfg or engines_cfg == [""]:
+                _log(f"scanned pages ({pages_fmt}): OCR engine disabled, kept as-is")
+            elif not engines_avail:
+                w = (f"scanned pages ({pages_fmt}) but no OCR engine installed "
+                     f"(pip install paddleocr); kept as-is")
+                _log(f"WARNING: {w}")
+                all_warnings.append(w)
+            elif client is None:
+                _log(f"scanned pages ({pages_fmt}): dry-run, OCR skipped")
+            else:
+                for pno in scanned:
+                    if control:
+                        control.checkpoint()
+                    job = _ocr_page_job(doc, pno, cfg, ocr_mode,
+                                        engines_avail, all_warnings)
+                    if job is None:
                         w = f"OCR page {pno + 1}: no text recognized; kept as-is"
                         _log(f"WARNING: {w}")
                         all_warnings.append(w)
                         continue
-                ocr_jobs.append(job)
+                    if job["mode"] == "reconstruct":
+                        _log(f"page {pno + 1}: scanned, reconstruct "
+                             f"{len(job['blocks'])} region(s) → in-place + "
+                             f"original appendix")
+                    elif job["mode"] == "inplace":
+                        _log(f"page {pno + 1}: scanned, OCR {len(job['blocks'])} "
+                             f"block(s) → in-place paste-back")
+                    else:
+                        _log(f"page {pno + 1}: scanned, OCR extracted "
+                             f"{len(job['text'])} chars → appendix translation")
+                    ocr_jobs.append(job)
 
-    # ---- v0.2.3: 跨页断句合并 ----
-    # 一句话被分页截断（前半句在 pN 尾、后半句在 pN+1 头）时拆成两段
-    # 分别翻译，读起来断裂（用户实测反馈）。判定：pending 里相邻的
-    # (pN, 末段) 与 (pN+1, 首段)，且前段末尾无句末标点（.:;!?。：；？！）
-    # 且后段以小写字母/数字开头 → 合并为一个翻译单元，译文按原文长度比
-    # 在词边界拆回两段原位。
-    def _ends_open(txt: str) -> bool:
-        t = txt.rstrip()
-        return bool(t) and t[-1] not in ".:;!?。：；？！\")]'\""
+        # ---- v0.2.3: 跨页断句合并 ----
+        # 一句话被分页截断（前半句在 pN 尾、后半句在 pN+1 头）时拆成两段
+        # 分别翻译，读起来断裂（用户实测反馈）。判定：pending 里相邻的
+        # (pN, 末段) 与 (pN+1, 首段)，且前段末尾无句末标点（.:;!?。：；？！）
+        # 且后段以小写字母/数字开头 → 合并为一个翻译单元，译文按原文长度比
+        # 在词边界拆回两段原位。
+        def _ends_open(txt: str) -> bool:
+            t = txt.rstrip()
+            return bool(t) and t[-1] not in ".:;!?。：；？！\")]'\""
 
-    def _starts_lower(txt: str) -> bool:
-        t = txt.lstrip()
-        return bool(t) and (t[0].islower() or t[0].isdigit()
-                            or t[0] in "([{")
+        def _starts_lower(txt: str) -> bool:
+            t = txt.lstrip()
+            return bool(t) and (t[0].islower() or t[0].isdigit()
+                                or t[0] in "([{")
 
-    merge_groups: list[list[int]] = []   # flat 索引组
-    flat_idx_of: dict[tuple[int, int], int] = {}
-    for fi, (pno, pi) in enumerate(pending):
-        flat_idx_of[(pno, pi)] = fi
-    used: set[int] = set()
-    for fi, (pno, pi) in enumerate(pending):
-        if fi in used:
-            continue
-        group = [fi]
-        used.add(fi)
-        # 只在页边界处尝试续接（同页断句由 merge_paragraphs 处理）
-        if pi == len(page_layouts[pno]["paragraphs"]) - 1 and pno + 1 < len(doc):
-            nxt = flat_idx_of.get((pno + 1, 0))
-            if nxt is not None and nxt not in used:
-                a = page_layouts[pno]["paragraphs"][pi]["text"]
-                b = page_layouts[pno + 1]["paragraphs"][0]["text"]
-                if (_ends_open(a) and _starts_lower(b)
-                        and not page_layouts[pno]["paragraphs"][pi].get("is_ref")
-                        and not page_layouts[pno + 1]["paragraphs"][0].get("is_ref")
-                        and not page_layouts[pno + 1]["paragraphs"][0].get("is_caption")
-                        and len(a) + len(b) <= 1200):
-                    group.append(nxt)
-                    used.add(nxt)
-        merge_groups.append(group)
-
-    # ---- 批量翻译（全文档统一排队，摊薄调用次数）----
-    texts_by_page: dict[int, list[str | None]] = {}
-    cell_texts: dict[tuple[int, int], str] = {}   # v0.2.3: (pno, ci) → 译文
-    if client is not None:
-        # v0.2.3: 合并组拼成翻译单元（组内段落用 \n 连接送译）
-        # v0.5.1: 跨页连字符合并——前段尾 '-' + 后段小写开头 = 同词被
-        # 页边界切断（LaTeX 排版常见），去连字符直连送译；否则 LLM 会把
-        # 'instrumen-\ntation' 当两个残词，译文断句不自然
-        def _join_group(parts: list[str]) -> str:
-            if len(parts) == 2:
-                a, b = parts[0].rstrip(), parts[1].lstrip()
-                if a.endswith("-") and b[:1].islower():
-                    return a[:-1] + b
-            return "\n".join(parts)
-
-        unit_texts: list[str] = []
-        for g in merge_groups:
-            parts = []
-            for fi in g:
-                pno, pi = pending[fi]
-                parts.append(page_layouts[pno]["paragraphs"][pi]["text"])
-            unit_texts.append(_join_group(parts))
-        # v0.2.3: 表格单元格并入同一翻译队列（同一批协议，省调用次数）
-        cell_flat: list[str] = []
-        for pno, ci in cell_pending:
-            cell_flat.append(page_layouts[pno]["tables_cells"][ci]["text"])
-        # v0.5.0: OCR 翻译单元——inplace 页按块、appendix 页按整页文本
-        ocr_flat: list[str] = []
-        for jb in ocr_jobs:
-            if jb["mode"] == "inplace":
-                ocr_flat.extend(t for _, t in jb["blocks"])
-            else:
-                ocr_flat.append(jb["text"])
-        all_flat = unit_texts + cell_flat + ocr_flat
-
-        # v0.5.0: llm.effective()——rpm/tpm 配额自动换算 interval/batch
-        # （显式配置优先；dry-run 日志里能看到实际生效值）
-        llm_eff = cfg.llm.effective()
-        if (llm_eff.min_call_interval, llm_eff.batch_char_budget) != \
-                (cfg.llm.min_call_interval, cfg.llm.batch_char_budget):
-            _log(f"llm quota auto: interval={llm_eff.min_call_interval}s, "
-                 f"batch_char_budget={llm_eff.batch_char_budget} "
-                 f"(rpm={cfg.llm.rpm_limit}, tpm={cfg.llm.tpm_limit})")
-        tc = TranslationClient(
-            client, model=llm_eff.model,
-            temperature=llm_eff.temperature,
-            glossary_prompt=glossary.prompt_block() if glossary else "",
-            src_lang=cfg.io.source_lang, tgt_lang=cfg.io.target_lang,
-            batch_size=llm_eff.batch_size,
-            batch_char_budget=llm_eff.batch_char_budget,
-            max_llm_calls=llm_eff.max_llm_calls,
-            min_call_interval=llm_eff.min_call_interval,
-            max_workers=llm_eff.max_workers,
-            fallback_model=llm_eff.fallback_model,
-            timeout=llm_eff.timeout,
-            max_retries=llm_eff.max_retries,
-            backoff_base=llm_eff.backoff_base,
-            backoff_cap=llm_eff.backoff_cap,
-            retry_delay_cap=llm_eff.retry_delay_cap,
-            sink=sink, control=control,
-        )
-        if control:
-            control.checkpoint()
-        sink.stage("translate")
-        # v0.6.0 任务 E：源头控长——翻译前把每段目标框字符预算喂给 LLM，
-        # 超预算译文单段带强约束重译一次（重问上限 = max_llm_calls 的 10%）
-        unit_budgets = None
-        if fit_cfg.mode == "auto":
-            try:
-                unit_budgets = _unit_char_budgets(
-                    merge_groups, pending, page_layouts, cell_pending, typo,
-                    font_path, tgt_lang, len(cell_flat), len(ocr_flat))
-                if unit_budgets is not None:
-                    n_bud = sum(1 for b in unit_budgets if b)
-                    _log(f"fit: char budgets for {n_bud}/{len(unit_budgets)} "
-                         f"unit(s)")
-                else:
-                    _log("fit: budget length mismatch; budgets disabled")
-            except Exception as e:
-                _log(f"fit: budget estimation failed ({e}); disabled")
-                unit_budgets = None
-        translated_flat, total_calls = tc.translate_paragraphs(
-            all_flat, cache=cache, budgets=unit_budgets)
-        all_warnings.extend(tc.warnings)
-        cell_translations = translated_flat[len(merge_groups):
-                                            len(merge_groups) + len(cell_flat)]
-        ocr_translations = translated_flat[len(merge_groups) + len(cell_flat):]
-
-        # D4 译后校验（glossary_lock）——只校验单段单元（合并单元跳过）
-        if glossary and cfg.features.glossary_lock:
-            for gi, g in enumerate(merge_groups):
-                if len(g) != 1:
-                    continue
-                pno, pi = pending[g[0]]
-                bad = glossary.check_translation(translated_flat[gi])
-                if bad:
-                    all_warnings.append(
-                        f"glossary violation p{pno + 1}#{pi}: {bad}")
-
-        # v0.2.3: 合并单元译文按原文长度比例拆回各段原位
-        for gi, g in enumerate(merge_groups):
-            dst = translated_flat[gi]
-            if len(g) == 1:
-                pno, pi = pending[g[0]]
-                texts_by_page.setdefault(
-                    pno, [None] * len(page_layouts[pno]["paragraphs"]))
-                texts_by_page[pno][pi] = dst
+        merge_groups: list[list[int]] = []   # flat 索引组
+        flat_idx_of: dict[tuple[int, int], int] = {}
+        for fi, (pno, pi) in enumerate(pending):
+            flat_idx_of[(pno, pi)] = fi
+        used: set[int] = set()
+        for fi, (pno, pi) in enumerate(pending):
+            if fi in used:
                 continue
-            # 两段组：按原文长度比在词边界切分
-            pno_a, pi_a = pending[g[0]]
-            pno_b, pi_b = pending[g[1]]
-            len_a = len(page_layouts[pno_a]["paragraphs"][pi_a]["text"])
-            len_b = len(page_layouts[pno_b]["paragraphs"][pi_b]["text"])
-            part_a, part_b = _split_proportional(dst, len_a / max(len_a + len_b, 1))
-            texts_by_page.setdefault(
-                pno_a, [None] * len(page_layouts[pno_a]["paragraphs"]))
-            texts_by_page.setdefault(
-                pno_b, [None] * len(page_layouts[pno_b]["paragraphs"]))
-            texts_by_page[pno_a][pi_a] = part_a
-            texts_by_page[pno_b][pi_b] = part_b
-        for ci, dst in enumerate(cell_translations):
-            cell_texts[cell_pending[ci]] = dst
+            group = [fi]
+            used.add(fi)
+            # 只在页边界处尝试续接（同页断句由 merge_paragraphs 处理）
+            if pi == len(page_layouts[pno]["paragraphs"]) - 1 and pno + 1 < len(doc):
+                nxt = flat_idx_of.get((pno + 1, 0))
+                if nxt is not None and nxt not in used:
+                    a = page_layouts[pno]["paragraphs"][pi]["text"]
+                    b = page_layouts[pno + 1]["paragraphs"][0]["text"]
+                    if (_ends_open(a) and _starts_lower(b)
+                            and not page_layouts[pno]["paragraphs"][pi].get("is_ref")
+                            and not page_layouts[pno + 1]["paragraphs"][0].get("is_ref")
+                            and not page_layouts[pno + 1]["paragraphs"][0].get("is_caption")
+                            and len(a) + len(b) <= 1200):
+                        group.append(nxt)
+                        used.add(nxt)
+            merge_groups.append(group)
+
+        # ---- 批量翻译（全文档统一排队，摊薄调用次数）----
+        texts_by_page: dict[int, list[str | None]] = {}
+        cell_texts: dict[tuple[int, int], str] = {}   # v0.2.3: (pno, ci) → 译文
+        if client is not None:
+            # v0.2.3: 合并组拼成翻译单元（组内段落用 \n 连接送译）
+            # v0.5.1: 跨页连字符合并——前段尾 '-' + 后段小写开头 = 同词被
+            # 页边界切断（LaTeX 排版常见），去连字符直连送译；否则 LLM 会把
+            # 'instrumen-\ntation' 当两个残词，译文断句不自然
+            def _join_group(parts: list[str]) -> str:
+                if len(parts) == 2:
+                    a, b = parts[0].rstrip(), parts[1].lstrip()
+                    if a.endswith("-") and b[:1].islower():
+                        return a[:-1] + b
+                return "\n".join(parts)
+
+            unit_texts: list[str] = []
+            unit_kinds: list["str | None"] = []   # v0.7.0 句子级缓存的目标单元
+            for g in merge_groups:
+                parts = []
+                for fi in g:
+                    pno, pi = pending[fi]
+                    para = page_layouts[pno]["paragraphs"][pi]
+                    parts.append(para["text"])
+                unit_texts.append(_join_group(parts))
+                # 模板化文本（ref 条目/图注）启用句级缓存；合并单元/其余不启用
+                if len(g) == 1:
+                    para = page_layouts[pending[g[0]][0]]["paragraphs"][pending[g[0]][1]]
+                    unit_kinds.append("ref" if para.get("is_ref")
+                                      else "caption" if para.get("is_caption")
+                                      else None)
+                else:
+                    unit_kinds.append(None)
+            # v0.2.3: 表格单元格并入同一翻译队列（同一批协议，省调用次数）
+            cell_flat: list[str] = []
+            for pno, ci in cell_pending:
+                cell_flat.append(page_layouts[pno]["tables_cells"][ci]["text"])
+            unit_kinds.extend([None] * len(cell_flat))
+            # v0.5.0: OCR 翻译单元——inplace/reconstruct 页按块、appendix 页按整页文本
+            ocr_flat: list[str] = []
+            for jb in ocr_jobs:
+                if jb["mode"] in ("inplace", "reconstruct"):
+                    ocr_flat.extend(t for _, t in jb["blocks"])
+                else:
+                    ocr_flat.append(jb["text"])
+            unit_kinds.extend([None] * len(ocr_flat))
+            all_flat = unit_texts + cell_flat + ocr_flat
+
+            # v0.5.0: llm.effective()——rpm/tpm 配额自动换算 interval/batch
+            # （显式配置优先；dry-run 日志里能看到实际生效值）
+            llm_eff = cfg.llm.effective()
+            if (llm_eff.min_call_interval, llm_eff.batch_char_budget) != \
+                    (cfg.llm.min_call_interval, cfg.llm.batch_char_budget):
+                _log(f"llm quota auto: interval={llm_eff.min_call_interval}s, "
+                     f"batch_char_budget={llm_eff.batch_char_budget} "
+                     f"(rpm={cfg.llm.rpm_limit}, tpm={cfg.llm.tpm_limit})")
+            tc = TranslationClient(
+                client, model=llm_eff.model,
+                temperature=llm_eff.temperature,
+                glossary_prompt=glossary.prompt_block() if glossary else "",
+                src_lang=cfg.io.source_lang, tgt_lang=cfg.io.target_lang,
+                batch_size=llm_eff.batch_size,
+                batch_char_budget=llm_eff.batch_char_budget,
+                max_llm_calls=llm_eff.max_llm_calls,
+                min_call_interval=llm_eff.min_call_interval,
+                max_workers=llm_eff.max_workers,
+                fallback_model=llm_eff.fallback_model,
+                timeout=llm_eff.timeout,
+                max_retries=llm_eff.max_retries,
+                backoff_base=llm_eff.backoff_base,
+                backoff_cap=llm_eff.backoff_cap,
+                retry_delay_cap=llm_eff.retry_delay_cap,
+                sink=sink, control=control,
+                stream=bool(getattr(cfg.llm, "stream", True)),
+                sentence_cache=bool(getattr(cfg.llm, "sentence_cache", True)),
+            )
+            if control:
+                control.checkpoint()
+            sink.stage("translate")
+            # v0.6.0 任务 E：源头控长——翻译前把每段目标框字符预算喂给 LLM，
+            # 超预算译文单段带强约束重译一次（重问上限 = max_llm_calls 的 10%）
+            unit_budgets = None
+            if fit_cfg.mode == "auto":
+                try:
+                    unit_budgets = _unit_char_budgets(
+                        merge_groups, pending, page_layouts, cell_pending, typo,
+                        font_path, tgt_lang, len(cell_flat), len(ocr_flat))
+                    if unit_budgets is not None:
+                        n_bud = sum(1 for b in unit_budgets if b)
+                        _log(f"fit: char budgets for {n_bud}/{len(unit_budgets)} "
+                             f"unit(s)")
+                    else:
+                        _log("fit: budget length mismatch; budgets disabled")
+                except Exception as e:
+                    _log(f"fit: budget estimation failed ({e}); disabled")
+                    unit_budgets = None
+            translated_flat, total_calls = tc.translate_paragraphs(
+                all_flat, cache=cache, budgets=unit_budgets,
+                unit_kinds=unit_kinds)
+            all_warnings.extend(tc.warnings)
+            if tc.sent_cache_hits:
+                _log(f"cache: {tc.sent_cache_hits} template unit(s) served by "
+                     f"sentence-level cache")
+            cell_translations = translated_flat[len(merge_groups):
+                                                len(merge_groups) + len(cell_flat)]
+            ocr_translations = translated_flat[len(merge_groups) + len(cell_flat):]
+
+            # D4 译后校验（glossary_lock）——只校验单段单元（合并单元跳过）。
+            # v0.7.0: 违例先走确定性修复（源词逐字残留 → 原位替换为目标词，
+            # 零 LLM 调用——替代 logit_bias 类约束解码的跨 provider 方案），
+            # 修复后仍违例才告警
+            if glossary and cfg.features.glossary_lock:
+                n_fixed = 0
+                for gi, g in enumerate(merge_groups):
+                    if len(g) != 1:
+                        continue
+                    pno, pi = pending[g[0]]
+                    fixed, done = glossary.fix_translation(translated_flat[gi])
+                    if done:
+                        translated_flat[gi] = fixed
+                        n_fixed += 1
+                        _log(f"glossary fix p{pno + 1}#{pi}: "
+                             + ", ".join(done))
+                    bad = glossary.check_translation(translated_flat[gi])
+                    if bad:
+                        all_warnings.append(
+                            f"glossary violation p{pno + 1}#{pi}: {bad}")
+                if n_fixed:
+                    _log(f"glossary: {n_fixed} paragraph(s) fixed in place")
+
+            # v0.2.3: 合并单元译文按原文长度比例拆回各段原位
+            for gi, g in enumerate(merge_groups):
+                dst = translated_flat[gi]
+                if len(g) == 1:
+                    pno, pi = pending[g[0]]
+                    texts_by_page.setdefault(
+                        pno, [None] * len(page_layouts[pno]["paragraphs"]))
+                    texts_by_page[pno][pi] = dst
+                    continue
+                # 两段组：按原文长度比在词边界切分
+                pno_a, pi_a = pending[g[0]]
+                pno_b, pi_b = pending[g[1]]
+                len_a = len(page_layouts[pno_a]["paragraphs"][pi_a]["text"])
+                len_b = len(page_layouts[pno_b]["paragraphs"][pi_b]["text"])
+                part_a, part_b = _split_proportional(dst, len_a / max(len_a + len_b, 1))
+                texts_by_page.setdefault(
+                    pno_a, [None] * len(page_layouts[pno_a]["paragraphs"]))
+                texts_by_page.setdefault(
+                    pno_b, [None] * len(page_layouts[pno_b]["paragraphs"]))
+                texts_by_page[pno_a][pi_a] = part_a
+                texts_by_page[pno_b][pi_b] = part_b
+            for ci, dst in enumerate(cell_translations):
+                cell_texts[cell_pending[ci]] = dst
+        state = {
+            "page_layouts": page_layouts,
+            "page_pixmaps": page_pixmaps,
+            "texts_by_page": texts_by_page,
+            "cell_texts": cell_texts,
+            "ocr_jobs": ocr_jobs,
+            "ocr_translations": (ocr_translations if client is not None else []),
+            "n_paras": n_paras,
+            "total_calls": (total_calls if client is not None else 0),
+            "tc": (tc if client is not None else None),
+        }
+    page_layouts = state["page_layouts"]
+    page_pixmaps = state["page_pixmaps"]
+    texts_by_page = state["texts_by_page"]
+    cell_texts = state["cell_texts"]
+    ocr_jobs = state["ocr_jobs"]
+    ocr_translations = state["ocr_translations"]
+    n_paras = state["n_paras"]
+    total_calls = state["total_calls"]
+    tc = state["tc"]
+
+    # ---- v0.7.0: 跨页表延续链接（任务 2-3，两条路径汇合处统一跑）----
+    # 下页顶部表与上页底部表同表头/同列锚 → 同一逻辑表（gid 共享）：
+    # 渲染层同 gid 同 fit 类（跨页字号统一），翻译队列页序相邻天然连续
+    from .layout import link_crosspage_tables
+    try:
+        n_linked = link_crosspage_tables(
+            page_layouts, [doc[pno].rect for pno in range(len(page_layouts))])
+        if n_linked:
+            _log(f"tables: {n_linked} cross-page continuation(s) linked")
+    except Exception as e:
+        _log(f"table continuation link failed ({e}); skipped")
 
     # ---- 渲染回灌 ----
     if control:
@@ -933,15 +1559,18 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                     archive=doc_arch,
                     font_css=doc_font_css)
 
-    # ---- OCR 译文落页（appendix 插页 / inplace 原位回贴）----
+    # ---- OCR 译文落页（appendix 插页 / inplace 原位回贴 / reconstruct 重建）----
     ocr_pages_added = 0
     ocr_inplace_blocks = 0
     if ocr_jobs:
-        appendix_pairs: list[tuple[int, str]] = []
-        appendix_texts: list[str] = []
+        # inserts: (pno, kind, payload)；kind ∈ original（reconstruct 原文
+        # 对照）/ translation（appendix 译文，payload=(src, dst)）
+        # 两遍制：先全部原位回贴（索引不漂移），再按页号降序插页
+        # （先插高位不影响低位索引——与 _append_ocr_pages 同纪律）
+        inserts: list[tuple[int, str, object]] = []
         consumed = 0
         for jb in ocr_jobs:
-            if jb["mode"] == "inplace":
+            if jb["mode"] in ("inplace", "reconstruct"):
                 n = len(jb["blocks"])
                 ocr_inplace_blocks += _apply_ocr_inplace(
                     doc, jb["pno"], jb["blocks"],
@@ -949,19 +1578,36 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                     font_path, all_warnings,
                     renderer=renderer, lang=tgt_lang)
                 consumed += n
+                if jb["mode"] == "reconstruct":
+                    inserts.append((jb["pno"], "original", jb["text"]))
             else:
-                appendix_pairs.append((jb["pno"], jb["text"]))
-                appendix_texts.append(ocr_translations[consumed])
+                inserts.append((jb["pno"], "translation",
+                                (jb["text"], ocr_translations[consumed])))
                 consumed += 1
-        if appendix_pairs:
-            ocr_pages_added = _append_ocr_pages(
-                doc, appendix_pairs, appendix_texts, font_path, all_warnings,
-                renderer=renderer, lang=tgt_lang)
+        for pno, kind, payload in sorted(inserts, key=lambda x: -x[0]):
+            if kind == "original":
+                ocr_pages_added += _append_ocr_original(
+                    doc, pno, payload, font_path, all_warnings,
+                    renderer=renderer, lang=tgt_lang)
+            else:
+                src, dst = payload
+                ocr_pages_added += _append_ocr_pages(
+                    doc, [(pno, src)], [dst], font_path, all_warnings,
+                    renderer=renderer, lang=tgt_lang)
+        if ocr_pages_added:
             _log(f"ocr: {ocr_pages_added} appendix page(s) inserted")
         if ocr_inplace_blocks:
             _log(f"ocr: {ocr_inplace_blocks} block(s) pasted in-place")
 
     # 原子写:先 .tmp 再 rename,中途崩溃不留半成品 PDF
+    # v0.7.0 修复：entries 统计在关库前取——旧版在 finally close 后查
+    # count() 抛异常被吞，"entries total" 恒打印 0
+    cache_entries = 0
+    if cache is not None:
+        try:
+            cache_entries = cache.count()
+        except Exception:
+            pass
     try:
         tmp_path = out_path.with_suffix(".pdf.tmp")
         doc.save(str(tmp_path), garbage=4, deflate=True)
@@ -977,12 +1623,6 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     if cache_hits:
         bs = max(1, int(getattr(cfg.llm, "batch_size", 6) or 6))
         cache_saved_calls = -(-cache_hits // bs)   # ceil：命中的段折算批次数
-    cache_entries = 0
-    if cache is not None:
-        try:
-            cache_entries = cache.count()
-        except Exception:
-            pass
     if cache_hits:
         _log(f"cache: {cache_hits} segment hit(s), ~{cache_saved_calls} "
              f"call(s) saved, {cache_entries} entr(y|ies) total")

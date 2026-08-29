@@ -298,7 +298,7 @@ def render_page(page, layout: dict, translated: list[dict],
         if para_specs is None:
             para_specs = collect_para_specs(
                 paras, tmap, typography, bilingual, formula_rects, lang,
-                layout=layout, fit_cfg=fit_cfg)
+                layout=layout, fit_cfg=fit_cfg, page_h=page.rect.height)
         if cell_specs is None:
             cell_specs = collect_cell_specs(
                 cells, cell_texts or {}, layout.get("tables"),
@@ -311,7 +311,8 @@ def render_page(page, layout: dict, translated: list[dict],
                               bilingual, formula_rects, lang, warn_local,
                               para_specs=para_specs, factors=factors,
                               fit_cfg=fit_cfg,
-                              archive=archive, font_css=font_css)
+                              archive=archive, font_css=font_css,
+                              layout=layout)
         if formula_pixmaps:
             _paste_formula_pixmaps(page, formula_pixmaps, layout["formulas"])
         return
@@ -709,9 +710,14 @@ def collect_cell_specs(cells: list[dict], cell_map: dict,
             if tr.contains(crect):
                 tid = ti
                 break
+        # v0.7.0: fit 类按逻辑表 gid（跨页延续表共享父表 gid——跨页字号
+        # 统一；无 gid 时退页内 tid 保持旧行为）
+        gid = tid
+        if 0 <= tid < len(tables or []):
+            gid = (tables or [])[tid].get("gid", tid)
         specs.append({
             "i": ci, "tag": f"cell{ci}", "kind": "cell",
-            "cls": f"table{tid}" if (tid >= 0 and not nowrap) else None,
+            "cls": f"table{gid}" if (tid >= 0 and not nowrap) else None,
             "rect": crect, "base": c_fs, "family": family, "align": "left",
             "indent": 0, "lh": 1.25, "dir_css": d,
             "html": f"<p>{_html_escape(_clean_zh_text(dst))}</p>",
@@ -768,7 +774,8 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
                           factors: dict[str, dict] | None = None,
                           fit_cfg=None,
                           archive: "pymupdf.Archive | None" = None,
-                          font_css: str = "") -> None:
+                          font_css: str = "",
+                          layout: dict | None = None) -> None:
     """段落回灌的 HTML+CSS 排版引擎路径（v0.5.0 种子，v0.5.1 转默认）。
 
     与 writer 路径的差异：
@@ -788,7 +795,8 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
 
     specs = para_specs if para_specs is not None else \
         collect_para_specs(paras, tmap, typography, bilingual,
-                           formula_rects, lang, layout=layout, fit_cfg=fit_cfg,
+                           formula_rects, lang,
+                           layout=layout or {}, fit_cfg=fit_cfg,
                            page_h=page.rect.height)
     for spec in specs:
         # fit 开启时用类因子；关闭时 factor=1（引擎 scale_low 兜底=旧行为）。

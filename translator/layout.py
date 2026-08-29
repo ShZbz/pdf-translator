@@ -585,10 +585,141 @@ def find_tables(page, detected: list | None = None) -> list[pymupdf.Rect]:
     return dedup
 
 
+def _cluster_positions(vals: list[float], tol: float = 2.0) -> list[list[float]]:
+    """一维坐标聚类（升序，相邻差 ≤tol 归同簇）。"""
+    out: list[list[float]] = []
+    for v in sorted(vals):
+        if out and v - out[-1][-1] <= tol:
+            out[-1].append(v)
+        else:
+            out.append([v])
+    return out
+
+
+def _column_anchor_split(bands: list[dict]) -> None:
+    """v0.7.0 列锚点一致性切分：就地给每个行带写 col_groups + conf。
+
+    算法（任务 2-3，纯本地启发式、无新依赖）：
+    1. 全表行内 line 的 x0 聚类（±2pt 容忍）→ 出现于 ≥30% 行带的簇心
+       为"稳定列锚点"；右对齐数字列补 x1 右锚点（x0 漂移 x1 稳定）
+    2. 每行带：line 按左/右锚点归属（±3pt）；行带锚点签名 == 表锚点数
+       → 完整数据行（conf 0.9）；少于 → 合并单元格/表头行，整带按锚点
+       分组不强行拆（conf 0.7，文本完整性优先）；锚点完全对不上 →
+       旧行为按 x 间隙拆（conf 0.4，渲染层保守策略接管）
+    3. 锚点数 <2（单列表/纯标签列）退旧行为
+    """
+    n_bands = len(bands)
+    # ① 锚点学习
+    x0_by_band = []
+    for band in bands:
+        xs = sorted(it[0].x0 for it in band["items"])
+        x0_by_band.append(xs)
+    pos_count: dict[float, int] = {}
+    for xs in x0_by_band:
+        for x in _cluster_positions(xs):
+            c = round(sum(x) / len(x), 1)
+            pos_count[c] = pos_count.get(c, 0) + 1
+    need = max(2, int(n_bands * 0.3))
+    anchors = sorted(c for c, n in pos_count.items() if n >= need)
+    # 右锚点（数字右对齐列）：x1 的稳定簇，且不与左锚点重合
+    x1_count: dict[float, int] = {}
+    for band in bands:
+        for x in _cluster_positions([it[0].x1 for it in band["items"]]):
+            c = round(sum(x) / len(x), 1)
+            x1_count[c] = x1_count.get(c, 0) + 1
+    right_anchors = sorted(c for c, n in x1_count.items()
+                           if n >= need and all(abs(c - a) > 4 for a in anchors))
+    band["col_groups"] = None
+    band["conf"] = 0.4
+    if len(anchors) < 2:
+        return
+
+    def _assign(band: dict) -> "tuple[dict[int, list], list] | None":
+        """行带 line → 锚点桶。返回 (桶, 落锚失败行) 或 None（对不上）。
+
+        桶键：左锚点命中 = 锚点序号；右锚点命中 = 锚点序号 + 1000
+        （数字右对齐列的虚拟槽位——x0 漂移 x1 稳定，槽位独立计数）。
+        落锚失败行不丢弃——各自成组排在锚点组之后（宁多一格不丢文本）。
+        完全无锚可归（>半数 loose 且一个桶都没命中）才判本带脱离锚点
+        模型，退旧行为；合并表头行（部分命中）仍走锚点+落单行分组。
+        """
+        buckets: dict[int, list] = {}
+        loose: list = []
+        for it in band["items"]:
+            r = it[0]
+            hit = None
+            for ai, a in enumerate(anchors):
+                if abs(r.x0 - a) <= 3.0:
+                    hit = ai
+                    break
+            if hit is None:
+                for ai, a in enumerate(right_anchors):
+                    if abs(r.x1 - a) <= 3.0:
+                        hit = ai + 1000
+                        break
+            if hit is None:
+                loose.append(it)
+                continue
+            buckets.setdefault(hit, []).append(it)
+        if not buckets and len(loose) > len(band["items"]) * 0.5:
+            return None        # 本带完全脱离锚点模型：旧行为兜底
+        return buckets, loose
+
+    # 模态签名：出现最多的桶键集合 = 表的"完整行"形态
+    # （左锚点数+右锚点虚槽一起算——数字右对齐列不亏欠签名）
+    assigns = [_assign(band) for band in bands]
+    sigs: dict[tuple, int] = {}
+    for assigned in assigns:
+        if assigned is not None:
+            sig = tuple(sorted(assigned[0]))
+            sigs[sig] = sigs.get(sig, 0) + 1
+    modal_sig: tuple = ()
+    modal_n = 0
+    for sig, n in sigs.items():
+        if n > modal_n and sig:
+            modal_sig, modal_n = sig, n
+    for band, assigned in zip(bands, assigns):
+        if assigned is None:
+            band["col_groups"] = None       # 旧行为兜底（gap>12 拆）
+            band["conf"] = 0.4
+            continue
+        buckets, loose = assigned
+        groups = [sorted(v, key=lambda it: it[0].x0)
+                  for _, v in sorted(buckets.items())]
+        groups.extend([it] for it in sorted(loose, key=lambda it: it[0].x0))
+        band["col_groups"] = groups
+        band["conf"] = 0.9 if tuple(sorted(buckets)) == modal_sig else 0.7
+    # 无重复签名（没有任何行形态出现 ≥2 次）→ 锚点学习本身不可信，
+    # 全体退旧行为
+    if modal_n < 2:
+        for band in bands:
+            band["col_groups"] = None
+            band["conf"] = 0.4
+
+
+def _band_gap_groups(items2: list) -> list[list]:
+    """旧行为列切分（v0.2.4）：x 间隙 >12pt 或右侧纯数字短串拆列。"""
+    col_groups: list[list] = [[items2[0]]]
+    for it in items2[1:]:
+        prev = col_groups[-1][-1]
+        gap_split = it[0].x0 - prev[0].x1 > 12
+        if not gap_split:
+            it_txt = "".join(s["text"] for s in it[1].get("spans", [])).strip()
+            # 右侧格是独立数字且与左侧有明显 x 错位 → 拆
+            if (it_txt and re.fullmatch(r"[\d.,%]+", it_txt)
+                    and it[0].x0 >= prev[0].x1 - 2):
+                gap_split = True
+        if gap_split:
+            col_groups.append([it])
+        else:
+            col_groups[-1].append(it)
+    return col_groups
+
+
 def table_cells(page, table_bbox: pymupdf.Rect,
                 detected: list | None = None,
                 page_dict: dict | None = None) -> list[dict]:
-    """D3 单元格原子块：返回 {bbox, text} 列表。
+    """D3 单元格原子块：返回 {bbox, text, conf} 列表。
 
     v0.2.3: find_tables 检不出三线表时（启发式兜底圈出的表区），
     按行带切分单元格——用表区内的文字块 y 带分组，每行带内按 x0 排序
@@ -596,6 +727,14 @@ def table_cells(page, table_bbox: pymupdf.Rect,
 
     v0.4.2: detected/page_dict 透传预取结果（旧版每表区各跑一次
     find_tables + 一次全页 get_text("dict")，多表页重复全页分析）。
+
+    v0.7.0: 行带兜底升级为列锚点一致性切分（_column_anchor_split）——
+    逐行 x0/x1 聚类出列锚点集（±2pt 容忍），签名一致的行才按锚点分格；
+    数字右对齐列、合并表头行都能正确处理。每格带 conf 置信度
+    （find_tables=1.0 / 锚点完整行=0.9 / 合并行=0.7 / 间隙兜底=0.4），
+    渲染层按 conf 分级：极低置信格保留原文 + 警告（错切代价高）。
+    GNN 表区（pymupdf-layout）也走本兜底——GNN 给表区 bbox、本地给
+    格切分，各取所长（v0.5.1 实测 GNN 表区边界比启发式干净）。
     """
     cells = []
     try:
@@ -611,12 +750,12 @@ def table_cells(page, table_bbox: pymupdf.Rect,
                 r = pymupdf.Rect(c)
                 txt = page.get_text("text", clip=r).strip()
                 if txt:
-                    cells.append({"bbox": r, "text": txt})
+                    cells.append({"bbox": r, "text": txt, "conf": 1.0})
         if found:
             return cells
     except Exception:
         pass
-    # ---- 三线表行带切分兜底 ----
+    # ---- 三线表/无线表行带切分兜底 ----
     tb = pymupdf.Rect(table_bbox)
     pd = page_dict if page_dict is not None else page.get_text("dict")
     blocks = []
@@ -652,26 +791,15 @@ def table_cells(page, table_bbox: pymupdf.Rect,
                 break
         if not placed:
             bands.append({"bbox": pymupdf.Rect(r), "items": [(r, l)]})
+    # v0.7.0 列锚点一致性切分（失败/不可信自动退旧行为）
+    _column_anchor_split(bands)
     for band in bands:
-        items2 = sorted(band["items"], key=lambda x: x[0].x0)
-        # 同一带内 x 间隙 > 12pt 的拆成独立格（同一行不同列）。
-        # v0.2.4: 数字列右对齐表（paper3 表 I）间隙 467→475 仅 12pt 恰好
-        # 不触发——改为"间隙>12pt 或 右侧是纯数字/短数字串"都拆格，
-        # 防止数字粘进方法名列导致译文回灌后数字错位
-        col_groups: list[list] = [[items2[0]]]
-        for it in items2[1:]:
-            prev = col_groups[-1][-1]
-            gap_split = it[0].x0 - prev[0].x1 > 12
-            if not gap_split:
-                it_txt = "".join(s["text"] for s in it[1].get("spans", [])).strip()
-                # 右侧格是独立数字且与左侧有明显 x 错位 → 拆
-                if (it_txt and re.fullmatch(r"[\d.,%]+", it_txt)
-                        and it[0].x0 >= prev[0].x1 - 2):
-                    gap_split = True
-            if gap_split:
-                col_groups.append([it])
-            else:
-                col_groups[-1].append(it)
+        groups = band.get("col_groups")
+        if groups is not None:
+            col_groups = groups
+        else:
+            items2 = sorted(band["items"], key=lambda x: x[0].x0)
+            col_groups = _band_gap_groups(items2)
         for g in col_groups:
             gr = pymupdf.Rect(g[0][0])
             txts = []
@@ -680,8 +808,77 @@ def table_cells(page, table_bbox: pymupdf.Rect,
                 txts.append("".join(s["text"] for s in l.get("spans", [])))
             txt = " ".join(t for t in txts if t.strip())
             if txt.strip():
-                cells.append({"bbox": gr, "text": txt})
+                cells.append({"bbox": gr, "text": txt,
+                              "conf": band.get("conf", 0.4)})
     return cells
+
+
+def link_crosspage_tables(page_layouts: list[dict],
+                          page_rects: list) -> int:
+    """v0.7.0 跨页表延续检测（任务 2-3）：标记 continued_from + 全局 gid。
+
+    判定：上页底部表区（y0 > 55% 页高）与下页顶部表区（y1 < 45% 页高），
+    且满足其一：
+    - 首行文本相似度 > 0.8（跨页重复表头——LaTeX longtable 默认行为）
+    - 列锚点集一致（首行 x0 聚类 ±2pt 相互命中 ≥70%）
+    标记：下页表 tables_meta 记 continued_from=(pno, idx)，gid 沿用上页表
+    ——渲染层同 gid 同 fit 类（跨页字号统一），翻译队列天然相邻
+    （页序喂入）→ 跨页断行不再截断单元格语义。
+    返回链接对数。
+    """
+    from difflib import SequenceMatcher
+
+    def _first_row_text(t: dict) -> str:
+        cells = t.get("cells") or []
+        return " ".join(c["text"] for c in cells[:6]).strip().lower()
+
+    def _col_anchors(t: dict) -> list[float]:
+        xs = [pymupdf.Rect(c["bbox"]).x0 for c in (t.get("cells") or [])]
+        return [round(sum(cl) / len(cl), 1) for cl in _cluster_positions(xs)]
+
+    def _anchors_match(a: list[float], b: list[float]) -> bool:
+        if not a or not b:
+            return False
+        hit = sum(1 for x in a if any(abs(x - y) <= 2.0 for y in b))
+        return hit >= 0.7 * len(a)
+
+    links = 0
+    gid_next = 0
+    for pno in range(len(page_layouts) - 1):
+        tabs_a = page_layouts[pno].get("tables") or []
+        tabs_b = page_layouts[pno + 1].get("tables") or []
+        if not tabs_a or not tabs_b:
+            continue
+        ph_a = page_rects[pno].height if pno < len(page_rects) else 842.0
+        ph_b = page_rects[pno + 1].height if pno + 1 < len(page_rects) else 842.0
+        # 上页底部表 × 下页顶部表（各取最靠下/最靠上的一张）
+        bot = max(tabs_a, key=lambda t: pymupdf.Rect(t["bbox"]).y0)
+        top = min(tabs_b, key=lambda t: pymupdf.Rect(t["bbox"]).y0)
+        if pymupdf.Rect(bot["bbox"]).y0 < 0.55 * ph_a:
+            continue               # 上页表不在底部：不是跨页延续形态
+        if pymupdf.Rect(top["bbox"]).y1 > 0.45 * ph_b:
+            continue               # 下页表不在顶部
+        ta, tb_ = _first_row_text(bot), _first_row_text(top)
+        sim = SequenceMatcher(None, ta, tb_).ratio() if ta and tb_ else 0.0
+        if sim <= 0.8 and not _anchors_match(_col_anchors(bot),
+                                             _col_anchors(top)):
+            continue
+        i_bot, i_top = tabs_a.index(bot), tabs_b.index(top)
+        if "gid" not in bot:
+            bot["gid"] = gid_next
+            gid_next += 1
+        top["gid"] = bot["gid"]
+        top["continued_from"] = (pno, i_bot)
+        top["continuation_header_sim"] = round(sim, 2)
+        links += 1
+    # 全局 gid 兜底：未链接的表也各领一个（渲染层 fit 类按逻辑表唯一，
+    # 不同页的两个同名 tid 表不再共享类因子）
+    for lay in page_layouts:
+        for t in (lay.get("tables") or []):
+            if "gid" not in t:
+                t["gid"] = gid_next
+                gid_next += 1
+    return links
 
 
 def collect_display_formulas(page, blocks: list[dict]) -> list[dict]:

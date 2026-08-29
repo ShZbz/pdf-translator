@@ -493,11 +493,18 @@ body.dragging::after {
         <label class="switch"><input type="checkbox" id="cfg-watermark" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>双语对照模式</label>
         <label class="switch"><input type="checkbox" id="cfg-bilingual"><span class="slider"></span></label></div>
-      <div class="set-row"><label>扫描页译文呈现<span class="tip" data-tip="附录页=译文插附加页（稳）；原位回贴=白块覆盖原位回灌（v0.5.0 实验性，观感更好）">?</span></label>
+      <div class="set-row"><label>扫描页译文呈现<span class="tip" data-tip="附录页=译文插附加页（稳）；原位回贴=白块覆盖原位回灌（观感更好）；版面重建=区域几何来自 GNN 影子页/几何分割（与 OCR 识别质量解耦），译文按区域回灌+原文对照附录页">?</span></label>
         <select id="cfg-ocrmode">
           <option value="appendix">附录页（默认）</option>
-          <option value="inplace">原位回贴（实验）</option>
+          <option value="inplace">原位回贴</option>
+          <option value="reconstruct">版面重建（v0.7.0）</option>
         </select></div>
+      <div class="set-row"><label>OCR 引擎<span class="tip" data-tip="多引擎投票：可用引擎对同一页各行按 IoU 对齐，一致取一致、冲突取置信度最高并告警。paddle/rapidocr/tesseract 需分别安装；未装的自动跳过">?</span></label>
+        <div style="display:flex;gap:10px;align-self:center;font-size:12px;">
+          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-paddle" checked>paddle</label>
+          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-rapidocr">rapidocr</label>
+          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-tesseract">tesseract</label>
+        </div></div>
       <div class="set-row"><label>渲染引擎<span class="tip" data-tip="htmlbox=HTML+CSS 排版引擎（v0.5.1 起默认，自带两端对齐/复杂文字整形，支持阿拉伯语等 RTL）；writer=逐字排印（遗留路径）">?</span></label>
         <select id="cfg-renderer">
           <option value="htmlbox">insert_htmlbox（默认）</option>
@@ -526,6 +533,16 @@ body.dragging::after {
         <input type="text" id="cfg-tpm" value="0" inputmode="numeric"></div>
       <div class="set-row"><label>布局并行数<span class="tip" data-tip="版面分析进程数；0=自动，1=串行">?</span></label>
         <input type="text" id="cfg-layoutworkers" value="0"></div>
+      <div class="set-row"><label>布局-翻译重叠<span class="tip" data-tip="v0.7.0：大文档布局后台逐页产出、翻译批随页发车（省整段布局时间）。auto=启发式引擎且 ≥12 页自动启用；on=无条件；off=关闭">?</span></label>
+        <select id="cfg-overlap">
+          <option value="auto">自动（默认）</option>
+          <option value="on">始终开启</option>
+          <option value="off">关闭</option>
+        </select></div>
+      <div class="set-row"><label>流式解码<span class="tip" data-tip="stream=True 增量收译文，收齐即断流（省 10-30% 批耗时）；网关不支持自动退非流式">?</span></label>
+        <label class="switch"><input type="checkbox" id="cfg-stream" checked><span class="slider"></span></label></div>
+      <div class="set-row"><label>句子级缓存<span class="tip" data-tip="参考文献/图注等模板文本按句跨文档复用（全命中才免调）；正文句不启用">?</span></label>
+        <label class="switch"><input type="checkbox" id="cfg-sentcache" checked><span class="slider"></span></label></div>
       <div class="set-row"><label>调用间隔 (秒)<span class="tip" data-tip="限流严调大">?</span></label>
         <input type="text" id="cfg-interval" value="2"></div>
       <div class="set-row"><label>调用上限<span class="tip" data-tip="单文档防跑飞">?</span></label>
@@ -655,6 +672,12 @@ async function loadConfig() {
     $('cfg-renderer').value = (CFG.features||{}).renderer || 'htmlbox';
     $('cfg-fitmode').value = (CFG.fit||{}).mode || 'auto';
     $('cfg-ocrmode').value = (CFG.ocr||{}).mode || 'appendix';
+    // v0.7.0: OCR 引擎多选（engines 空 = 单引擎 engine）
+    const ocrEngines = (CFG.ocr||{}).engines
+      || ((CFG.ocr||{}).engine ? [(CFG.ocr||{}).engine] : ['paddle']);
+    $('cfg-ocr-paddle').checked = ocrEngines.includes('paddle');
+    $('cfg-ocr-rapidocr').checked = ocrEngines.includes('rapidocr');
+    $('cfg-ocr-tesseract').checked = ocrEngines.includes('tesseract');
     $('cfg-cache').checked = (CFG.features||{}).translation_cache !== false;
     $('cfg-glosslock').checked = (CFG.features||{}).glossary_lock !== false;
     $('cfg-workers').value = llm.max_workers ?? 3;
@@ -664,6 +687,9 @@ async function loadConfig() {
     $('cfg-tpm').value = llm.tpm_limit ?? 0;
     const perf = CFG.performance || {};
     $('cfg-layoutworkers').value = perf.layout_workers ?? 0;
+    $('cfg-overlap').value = perf.pipeline_overlap || 'auto';
+    $('cfg-stream').checked = ((CFG.llm||{}).stream !== false);
+    $('cfg-sentcache').checked = ((CFG.llm||{}).sentence_cache !== false);
     $('cfg-interval').value = llm.min_call_interval ?? 2;
     $('cfg-maxcalls').value = llm.max_llm_calls ?? 40;
     $('cfg-retries').value = llm.max_retries ?? 2;
@@ -703,6 +729,8 @@ function collectConfig() {
       timeout: num($('cfg-timeout').value, 120), max_retries: num($('cfg-retries').value, 2),
       backoff_base: num($('cfg-backoffbase').value, 8), backoff_cap: num($('cfg-backoffcap').value, 30),
       retry_delay_cap: num($('cfg-retrycaps').value, 60),
+      stream: $('cfg-stream').checked,          // v0.7.0 流式解码+首包即回
+      sentence_cache: $('cfg-sentcache').checked, // v0.7.0 句子级缓存（模板文本）
     },
     features: {
       watermark_removal: $('cfg-watermark').checked,
@@ -718,9 +746,19 @@ function collectConfig() {
     performance: {
       layout_workers: num($('cfg-layoutworkers').value, 0),
       cache_max_entries: (CFG.performance || {}).cache_max_entries ?? 50000,
+      pipeline_overlap: $('cfg-overlap').value || 'auto',
     },
     fonts: { cjk: '' },
-    ocr: { engine: 'paddle', min_chars: 50, mode: $('cfg-ocrmode').value || 'appendix' },
+    ocr: (() => {
+      // v0.7.0: 引擎多选 → engines 列表；主 engine 取首个勾选项
+      const engines = [
+        ['cfg-ocr-paddle', 'paddle'],
+        ['cfg-ocr-rapidocr', 'rapidocr'],
+        ['cfg-ocr-tesseract', 'tesseract'],
+      ].filter(([id]) => $(id).checked).map(([, e]) => e);
+      return { engine: engines[0] || 'paddle', engines,
+               min_chars: 50, mode: $('cfg-ocrmode').value || 'appendix' };
+    })(),
   };
 }
 

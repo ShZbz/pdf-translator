@@ -95,7 +95,7 @@ def test_formula_count_mismatch_keeps_source():
     out, calls = tc.translate_paragraphs(["Spin texture [FORMULA_0] shown."])
     assert calls == 2  # 首调 + 重试一次
     assert out == ["Spin texture [FORMULA_0] shown."]
-    assert any("keep source" in w for w in tc.warnings)
+    assert any("kept source" in w for w in tc.warnings)
 
 
 def test_bad_response_retry_then_keep_source():
@@ -105,7 +105,7 @@ def test_bad_response_retry_then_keep_source():
     out, calls = tc.translate_paragraphs(["Keep me."])
     assert calls == 2
     assert out == ["Keep me."]
-    assert any("keep source" in w for w in tc.warnings)
+    assert any("kept source" in w for w in tc.warnings)
 
 
 class _RateLimitLLM(FakeLLM):
@@ -311,7 +311,7 @@ def test_no_fallback_configured_keeps_source():
                            backoff_base=0.01, backoff_cap=0.02)
     out, _ = tc.translate_paragraphs(["A."])
     assert out == ["A."]
-    assert any("keep source" in w for w in tc.warnings)
+    assert any("kept source" in w for w in tc.warnings)
 
 
 def test_fallback_chain_multi_model():

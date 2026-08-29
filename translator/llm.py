@@ -6,6 +6,15 @@
 - 退避逻辑保留:传输层失败指数退避（在 worker 内做，不阻塞其他批）
 - 结果按 batch 原序回填;触顶后未发车的批直接放弃（不再烧预算）
 - 失败批降级保留原文 + 警告（与串行版语义一致）
+
+v0.7.0:
+- 流式解码 + 首包即回（llm.stream，默认开）：stream=True 增量收 delta，
+  增量 JSON 解析器逐对提交 "id":"译文"——收齐全部 id 即提前断流
+  （不等尾部废话 token），快段不被同批慢尾段阻塞
+- 批内分段重试：内容校验失败不再整批重试——只重问缺失/违例的 id，
+  重试后仍缺的 id 逐段保留原文 + 警告（其余段正常回填）
+- 句子级缓存（模板化文本）：ref 条目/图注按句拆分跨文档复用
+  （全命中才免调；翻译成功且句数对齐时回填句缓存）
 """
 from __future__ import annotations
 
@@ -18,6 +27,16 @@ from concurrent.futures import ThreadPoolExecutor
 from .control import JobCancelled
 
 _FORMULA_RE = re.compile(r"\[FORMULA_(\d+)\]")
+
+# v0.7.0 流式增量解析：顶层 "id": "value" 对（转义感知，值须以 , 或 } 收尾
+# 才算提交——最后一段的完整性只能由闭合符或流结束判定）
+_KV_RE = re.compile(
+    r'"(\d+)"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[,}]')
+
+# 句子级缓存的目标单元（模板化文本：跨文档复用安全；上下文依赖句不启用）
+_TEMPLATE_KINDS = ("ref", "caption")
+# 拉丁句边界（用于模板文本的句拆分；缩写点不当句界由 ≥8 字符下限兜底）
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 def _budget_rule(batch: dict[str, str],
@@ -43,6 +62,43 @@ def _budget_rule(batch: dict[str, str],
               "(keep every technical fact, unit and citation) if needed.")
 
 
+def _parse_pairs(raw: str, want_ids: set[str]) -> "tuple[dict[str, str] | None, set[str]]":
+    """v0.7.0 从（可能不完整的）模型输出提取 "id":"译文" 对。
+
+    返回 (got, missing)：
+    - got=None  输出里一个可解析对都没有（内容失败，调用方按重试处理，
+      不烧预算——与旧版 _parse 全有或全无语义对齐）
+    - got 部分  流式半途/模型漏段：已闭合的对先用，缺失 id 分段重试
+    值须以 , 或 } 闭合才算完整（流式下未闭合的尾段不可信）。
+    非流式完整 JSON 走快路径（整体 json.loads，零正则开销）。
+    """
+    if not raw:
+        return None, set(want_ids)
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, dict) and data \
+                    and all(isinstance(k, str) and isinstance(v, str)
+                            for k, v in data.items()):
+                got = {k: v for k, v in data.items() if k in want_ids}
+                if got and set(got) == set(data):
+                    return got, set(want_ids) - set(got)
+        except json.JSONDecodeError:
+            pass
+    got: dict[str, str] = {}
+    for mm in _KV_RE.finditer(raw):
+        k, v_raw = mm.group(1), mm.group(2)
+        if k in want_ids and k not in got:
+            try:
+                got[k] = json.loads(f'"{v_raw}"')   # 反转义（\" \\n \uXXXX）
+            except json.JSONDecodeError:
+                continue
+    if not got:
+        return None, set(want_ids)
+    return got, set(want_ids) - set(got)
+
+
 class TranslationClient:
     def __init__(self, client, model: str, temperature: float = 0.0,
                  glossary_prompt: str = "", src_lang: str = "en",
@@ -58,7 +114,9 @@ class TranslationClient:
                  backoff_cap: float = 30.0,
                  retry_delay_cap: float = 60.0,
                  sink=None,
-                 control=None):
+                 control=None,
+                 stream: bool = True,
+                 sentence_cache: bool = True):
         self.client = client
         self.model = model
         self.temperature = temperature
@@ -100,6 +158,10 @@ class TranslationClient:
         self.control = control                 # JobControl（None=不可控）
         self._batches_total = 0                # 本文档总批数（进度分母）
         self._batches_ok = 0                   # 成功批计数（缓存命中不计）
+        # v0.7.0: 流式解码 / 句子级缓存开关（llm.stream / llm.sentence_cache）
+        self.stream = bool(stream)
+        self.sentence_cache = bool(sentence_cache)
+        self.sent_cache_hits = 0               # 句子级缓存命中段数（报表用）
 
     # ---- prompt 构造 ----
     def _system_prompt(self, budget_rule: str = "") -> str:
@@ -202,6 +264,10 @@ class TranslationClient:
         退避语义（v0.1.2 沿袭）:仅传输层失败(429/网络)重试前退避;
         内容校验失败(JSON 坏/key 错/占位符丢)不等待直接重试。
         budget_rule: v0.6.0 每 id 字符预算规则（拼进 system prompt）。
+        v0.7.0 流式:stream=True 增量收 delta，_parse_pairs 逐对提交，
+        收齐全部 id 即 break（提前断流，不等尾部 token）——省时省 token；
+        某对值尚未闭合时该 id 不提交，交给重试路径只重问缺失 id。
+        流式通道异常（网关不支持 stream 等）自动退非流式重发一次。
         """
         with self._lock:
             # 预算按成功响应计（v0.1.2 沿袭，有单测锁定）：429 等失败
@@ -223,18 +289,13 @@ class TranslationClient:
             with self._lock:
                 self.calls_used += 1
             user = json.dumps(batch, ensure_ascii=False)
+            messages = [
+                {"role": "system",
+                 "content": self._system_prompt(budget_rule)},
+                {"role": "user", "content": user},
+            ]
             try:
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=self.temperature,
-                    timeout=self.timeout,
-                    messages=[
-                        {"role": "system",
-                         "content": self._system_prompt(budget_rule)},
-                        {"role": "user", "content": user},
-                    ],
-                )
-                raw = resp.choices[0].message.content or ""
+                raw = self._request(messages, want_ids=set(batch))
             except Exception as e:  # 网络/SDK 错误按失败批处理
                 kind = "rate-limited" if self._is_rate_limit_error(e) else "error"
                 self._warn(f"LLM call {kind} (attempt {attempt}): {e}")
@@ -244,7 +305,7 @@ class TranslationClient:
                     self._last_retry_delay = (self._retry_delay_seconds(e)
                                               if kind == "rate-limited" else None)
                 return None
-            parsed = self._parse(raw, set(batch))
+            parsed, _missing = _parse_pairs(raw, set(batch))
             with self._lock:
                 if parsed is not None:
                     self.api_ok_calls += 1
@@ -257,23 +318,58 @@ class TranslationClient:
             with self._lock:
                 self._in_flight -= 1
 
-    @staticmethod
-    def _parse(raw: str, want_ids: set[str]) -> dict[str, str] | None:
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return None
-        try:
-            data = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, dict) or set(data.keys()) != want_ids:
-            return None
-        out: dict[str, str] = {}
-        for k, v in data.items():
-            if not isinstance(v, str):
-                return None
-            out[k] = v
-        return out
+    def _request(self, messages: list[dict],
+                 want_ids: set[str] | None = None) -> str:
+        """一次 HTTP 请求（v0.7.0 流式优先）。
+
+        流式路径增量收 delta，每当缓冲区出现新的已闭合 "id":"…" 对就记账；
+        want_ids 全部收齐即 break——模型爱在 JSON 后面跟的解释性废话
+        一个 token 都不用等（实测省 10-30% 批耗时）。断流点之后所有对
+        已由 , 或 } 闭合，_parse_pairs 必然全量命中。
+        流式通道异常（网关不支持 stream/代理剥离 SSE）自动退非流式重发。
+        """
+        kwargs = dict(model=self.model, temperature=self.temperature,
+                      timeout=self.timeout, messages=messages)
+        if self.stream:
+            stream = None
+            try:
+                buf = ""
+                got: set[str] = set()
+                need = {str(k) for k in want_ids} if want_ids else None
+                stream = self.client.chat.completions.create(
+                    stream=True, **kwargs)
+                if not hasattr(stream, "__iter__"):
+                    # 网关/mock 无视 stream 参数直接回完整响应对象——
+                    # 当非流式结果用（不再二次请求，响应已被本次消耗）
+                    return stream.choices[0].message.content or ""
+                for chunk in stream:
+                    try:
+                        delta = chunk.choices[0].delta.content or ""
+                    except (IndexError, AttributeError):
+                        delta = ""
+                    if not delta:
+                        continue
+                    buf += delta
+                    if need is not None and '"' in delta:
+                        got.update(m.group(1) for m in _KV_RE.finditer(buf))
+                        if need <= got:
+                            break          # 收齐即断流（见 docstring）
+                return buf
+            except Exception as e:
+                # 流式通道不可用（网关不支持/代理剥离 SSE）→ 非流式重发。
+                # 429/配额类语义明确：直接上抛走退避/切链，别浪费一次非流式。
+                if self._is_rate_limit_error(e) or self._is_daily_quota_error(e):
+                    raise
+                self._warn(f"stream failed ({e}); retrying non-stream")
+            finally:
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+        resp = self.client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
 
     @staticmethod
     def formula_counts_ok(src: str, dst: str) -> bool:
@@ -313,11 +409,15 @@ class TranslationClient:
         """返回 (batch_idx, {全局段索引: 译文} 或 None=失败, 本批模型)。
 
         budgets: v0.6.0 与 paras 对齐的每段字符预算（None=不限），
-        拼进本批 system prompt（协议 JSON 形状不变，_parse 不动）。
+        拼进本批 system prompt（协议 JSON 形状不变）。
+        v0.7.0 批内分段重试：响应里已闭合且公式守恒的 id 先收下，
+        只把缺失/违例的 id 打成子批重问（id 保持原编号，budget 规则
+        仍指得对）；重试耗尽后仅缺失段保留原文 + 逐段告警，已成功段
+        正常回填——旧版"一损俱损整批重试/整批丢弃"的成本模型废止。
         """
         batch = {str(j + 1): paras[j] for j in batch_idx}
         budget_rule = _budget_rule(batch, budgets, batch_idx)
-        got = None
+        got: dict[str, str] = {}          # id -> 已验证译文
         prev_fail_transport = False
         model_used = self.model   # v0.5.1: 本批模型快照（fallback 切换防串 key）
         # v0.2.2: while 循环替代 for——链式切换(m1→m2→m3)需要重置 attempt,
@@ -325,14 +425,13 @@ class TranslationClient:
         # v0.2.3: 重试次数上限 max_retries 可配（1=不重试）
         attempt = 1
         while attempt <= self.max_retries:
-            got = self._ask(batch, attempt=attempt,
-                            prev_fail_transport=prev_fail_transport,
-                            budget_rule=budget_rule)
-            if got is not None and all(
-                    self.formula_counts_ok(batch[k], got[k]) for k in batch):
-                model_used = self.model
+            pending = [k for k in batch if k not in got]
+            if not pending:
                 break
-            if got is None and attempt == 1 and self._last_daily_quota:
+            resp = self._ask({k: batch[k] for k in pending}, attempt=attempt,
+                             prev_fail_transport=prev_fail_transport,
+                             budget_rule=budget_rule)
+            if resp is None and attempt == 1 and self._last_daily_quota:
                 # 日配额耗尽:切 fallback 模型后本批立即用新模型重试。
                 # 切换成功则 attempt 重置（新模型配额独立,值得完整重试对）;
                 # 切换失败（未配置/链尽）→ 正常走退避重试路径。
@@ -340,22 +439,31 @@ class TranslationClient:
                     model_used = self.model
                     attempt = 1
                     continue
-            got = None
+            if resp:
+                model_used = self.model
+                for k, v in resp.items():
+                    # 公式守恒的段才收；违例段留在 pending 集下轮重问
+                    if k in batch and self.formula_counts_ok(batch[k], v):
+                        got[k] = v
+            if len(got) == len(batch):
+                break
             # 退避只对传输层失败;内容校验失败直接重试（_last_fail_transport
             # 由 _ask 设置,读回时加锁防并发写竞争——读错也只是退避策略偏差,无害）
             prev_fail_transport = bool(self._last_fail_transport)
             attempt += 1
-        if got is None:
-            ids = ", ".join(f"#{k}:{batch[k][:30]!r}" for k in batch)
+        missing = [k for k in batch if k not in got]
+        if missing:
+            ids = ", ".join(f"#{k}:{batch[k][:30]!r}" for k in missing)
             self._warn(
-                f"batch failed after retry, keep source: [{ids}]")
+                f"segment(s) failed after retry, kept source: [{ids}]")
+        if not got:
             return batch_idx, None, model_used
         with self._lock:
             self._batches_ok += 1
         if self.sink is not None:
             self.sink.batch_done(self._batches_ok, self._batches_total,
                                  self.calls_used)
-        out = {j: got[str(j + 1)] for j in batch_idx}
+        out = {j: got[str(j + 1)] for j in batch_idx if str(j + 1) in got}
         return batch_idx, out, model_used
 
     def _pack_batches(self, miss: list[int],
@@ -387,9 +495,87 @@ class TranslationClient:
         return batches
 
     # ---- 批量入口（并发版）----
+    # ---- v0.7.0 句子级缓存（模板化文本：ref 条目/图注）----
+
+    @staticmethod
+    def _sentence_segments(text: str) -> list[str]:
+        """模板文本的句拆分（拉丁 .?! + CJK 。！？句界）。
+
+        短段（<2 句）无句级增益——主缓存（整段精确匹配）已覆盖；
+        句级缓存的增量价值在"跨文档复用部分重叠文本"。
+        """
+        if not text:
+            return []
+        segs = [s.strip() for s in
+                re.split(r"(?<=[.!?])\s+|(?<=[。！？])", text) if s.strip()]
+        return segs
+
+    def _sentence_key(self, cache, model: str, seg: str) -> str:
+        return cache.make_key("openai-compat", model,
+                              self.src_lang, self.tgt_lang, f"|seg|{seg}")
+
+    def _sentence_cache_get(self, cache, text: str, model: str) -> str | None:
+        """全部句段命中才拼装（部分命中不注入——上下文依赖句半拼危险）。"""
+        segs = self._sentence_segments(text)
+        if len(segs) < 2:
+            return None
+        vals = [cache.get(self._sentence_key(cache, model, s)) for s in segs]
+        if any(v is None for v in vals):
+            return None
+        from .langs import lang_info
+        joiner = "" if lang_info(self.tgt_lang).script == "cjk" else " "
+        return joiner.join(v for v in vals if v)
+
+    def _sentence_cache_put(self, cache, src: str, dst: str, model: str) -> None:
+        """翻译成功且源/译文句数对齐时回填句缓存（错位不存，宁缺毋滥）。"""
+        ss = self._sentence_segments(src)
+        if len(ss) < 2:
+            return
+        ds = self._sentence_segments(dst)
+        if len(ss) != len(ds):
+            return
+        for a, b in zip(ss, ds):
+            cache.put(self._sentence_key(cache, model, a), a, b)
+
+    def _store_cache(self, cache, j: int, paras: list[str], dst: str,
+                     model_used: str, unit_kinds=None) -> None:
+        """批成功段落的主缓存写 + 模板句缓存回填（统一出口）。"""
+        cache.put(cache.make_key(
+            "openai-compat", model_used,
+            self.src_lang, self.tgt_lang, paras[j]), paras[j], dst)
+        if self.sentence_cache and unit_kinds \
+                and j < len(unit_kinds) and unit_kinds[j] in _TEMPLATE_KINDS:
+            self._sentence_cache_put(cache, paras[j], dst, model_used)
+
+    def _cache_first(self, cache, i: int, t: str,
+                     budget: "int | None", kind: "str | None") -> str | None:
+        """缓存先行统一出口：句级（模板文本）→ 预算档 → 主缓存。
+
+        v0.6.0: 预算档重译结果 key 加 |#b{N} 后缀——先查预算档（此前
+        超预算重译过的短版），再查主缓存（旧命中译文仍有效，只是
+        可能超长触发渲染阶梯）
+        命中计数（cache_hits/sent_cache_hits）由调用方累加。
+        """
+        if cache is None:
+            return None
+        if self.sentence_cache and kind in _TEMPLATE_KINDS:
+            hit = self._sentence_cache_get(cache, t, self.model)
+            if hit is not None:
+                self.sent_cache_hits += 1
+                return hit
+        key = cache.make_key("openai-compat", self.model,
+                             self.src_lang, self.tgt_lang, t)
+        hit = None
+        if budget:
+            hit = cache.get(f"{key}|#b{budget}")
+        if hit is None:
+            hit = cache.get(key)
+        return hit
+
     def translate_paragraphs(self, paras: list[str],
                              cache=None,
-                             budgets: "list[int | None] | None" = None
+                             budgets: "list[int | None] | None" = None,
+                             unit_kinds: "list[str | None] | None" = None
                              ) -> tuple[list[str], int]:
         """翻译段落数组，返回 (译文数组, 实际调用次数)。
 
@@ -398,6 +584,9 @@ class TranslationClient:
         budgets: v0.6.0 每段目标框字符预算（None/空=不限）。批 prompt
         带 HARD 上限；译后软校验 len > budget×1.15 的段单段重问一次
         （每文档上限 = max_llm_calls 的 10% 防风暴，超限接受交渲染阶梯）。
+        unit_kinds: v0.7.0 与 paras 对齐的单元类型（"ref"/"caption"/None）。
+        ref 条目/图注是模板化文本，启用句子级缓存跨文档复用；其余单元
+        上下文依赖性强，只走整段主缓存。
         """
         results: list[str | None] = [None] * len(paras)
         budgets = list(budgets) if budgets else None
@@ -412,15 +601,10 @@ class TranslationClient:
         # 可能超长触发渲染阶梯）
         miss = []
         for i, t in enumerate(paras):
+            kind = unit_kinds[i] if unit_kinds and i < len(unit_kinds) else None
             if cache is not None:
-                key = cache.make_key(
-                    "openai-compat", self.model,
-                    self.src_lang, self.tgt_lang, t)
-                hit = None
-                if budgets and budgets[i]:
-                    hit = cache.get(f"{key}|#b{budgets[i]}")
-                if hit is None:
-                    hit = cache.get(key)
+                budget_i = budgets[i] if budgets else None
+                hit = self._cache_first(cache, i, t, budget_i, kind)
                 if hit is not None:
                     results[i] = hit
                     self.cache_hits += 1
@@ -449,10 +633,8 @@ class TranslationClient:
                     for j, dst in out.items():
                         results[j] = dst
                         if cache is not None:
-                            cache.put(cache.make_key(
-                                "openai-compat", model_used,
-                                self.src_lang, self.tgt_lang, paras[j]),
-                                paras[j], dst)
+                            self._store_cache(cache, j, paras, dst, model_used,
+                                              unit_kinds)
         else:
             for b in batches:
                 if self.control is not None:
@@ -467,10 +649,8 @@ class TranslationClient:
                 for j, dst in out.items():
                     results[j] = dst
                     if cache is not None:
-                        cache.put(cache.make_key(
-                            "openai-compat", model_used,
-                            self.src_lang, self.tgt_lang, paras[j]),
-                            paras[j], dst)
+                        self._store_cache(cache, j, paras, dst, model_used,
+                                          unit_kinds)
 
         # 3) v0.6.0 任务 E：超预算软校验 → 单段强约束重问（上限防风暴）
         if budgets:
@@ -542,3 +722,105 @@ class TranslationClient:
                            f"translation; kept over-limit original "
                            f"({len(dst)}/{b} chars), renderer ladder will "
                            f"compress")
+
+
+class StreamingTranslator:
+    """v0.7.0 布局-翻译流水线重叠：翻译单元流式进批，批满即发车。
+
+    与 translate_paragraphs 同一套批协议/缓存/预算/触顶记账；区别是
+    组批发生在布局产出页的同时（页 N 布局完 → 该页单元立即进组批
+    队列，布局继续跑页 N+1）——50+ 页大文档省整段布局时间。
+
+    add_unit(text, budget, kind) 由管线在每页布局完成时调用；
+    finish() 在全部页喂完后 flush 开批、join 全部 future、跑预算软
+    校验，返回与单元顺序对齐的译文数组（失败单元回落原文）。
+    """
+
+    def __init__(self, tc: "TranslationClient", cache=None):
+        self.tc = tc
+        self.cache = cache
+        self.paras: list[str] = []
+        self.budgets: list["int | None"] = []
+        self.kinds: list = []
+        self.results: list["str | None"] = []
+        self._open: list[int] = []
+        self._open_chars = 0
+        self._futures: list = []
+        self._pool: "ThreadPoolExecutor | None" = None
+        self._batches_spawned = 0
+
+    def add_unit(self, text: str, budget: "int | None" = None,
+                 kind: "str | None" = None) -> int:
+        """喂入一个翻译单元；缓存命中即回填，未命中进开批。返回单元序号。"""
+        i = len(self.paras)
+        hit = self.tc._cache_first(self.cache, i, text, budget, kind)
+        self.paras.append(text)
+        self.budgets.append(budget)
+        self.kinds.append(kind)
+        self.results.append(hit)          # None=未命中（后面批填）
+        if hit is not None:
+            self.tc.cache_hits += 1
+            return i
+        tc = self.tc
+        b = tc.batch_char_budget
+        # 组批边界与 _pack_batches 同语义：加下一段会超限/段数到顶 → 先冲批
+        if self._open and (len(self._open) >= tc.batch_size
+                           or (b > 0 and self._open_chars + len(text) > b)):
+            self.flush()
+        self._open.append(i)
+        self._open_chars += len(text)
+        return i
+
+    def flush(self) -> None:
+        """开批发车（触顶/停止发车时按放弃语义清空开批）。"""
+        if not self._open:
+            return
+        tc = self.tc
+        if tc.control is not None:
+            tc.control.checkpoint()
+        with tc._lock:
+            if tc._stop_spawning:
+                self._open, self._open_chars = [], 0
+                return
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=tc.max_workers)
+            if tc.sink is not None:
+                # 流式模式总批数未知：先按 1 发车，_batches_total 随发车增长
+                # （UI 进度分母随之调整）
+                tc.sink.emit("translate_start", batches=1,
+                             paragraphs=len(self.paras))
+        batch = list(self._open)
+        self._open, self._open_chars = [], 0
+        self._futures.append(self._pool.submit(
+            tc._guarded_batch, batch, self.paras, self.budgets))
+        self._batches_spawned += 1
+        with tc._lock:
+            tc._batches_total = self._batches_spawned
+
+    def finish(self) -> "tuple[list[str], int]":
+        """冲批 → join → 缓存回填 → 预算软校验 → 触顶警告。"""
+        tc = self.tc
+        self.flush()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+        for fut in self._futures:
+            _batch_idx, out, model_used = fut.result()
+            if out is None:
+                continue
+            for j, dst in out.items():
+                self.results[j] = dst
+                if self.cache is not None:
+                    tc._store_cache(self.cache, j, self.paras, dst,
+                                    model_used, self.kinds)
+        if any(b for b in self.budgets):
+            tc._reask_over_budget(self.paras, self.results, self.budgets,
+                                  self.cache)
+        with tc._lock:
+            remaining = sum(1 for r in self.results if r is None)
+            if remaining and tc.api_ok_calls >= tc.max_llm_calls:
+                tc.warnings.append(
+                    f"max_llm_calls={tc.max_llm_calls} reached; "
+                    f"{remaining} paragraph(s) kept untranslated")
+        final = [r if r is not None else t
+                 for r, t in zip(self.results, self.paras)]
+        return final, tc.calls_used

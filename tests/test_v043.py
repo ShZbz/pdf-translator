@@ -168,10 +168,13 @@ def test_ocr_uninstalled_warns_and_keeps_pages(tmp_path, monkeypatch):
 
 def test_ocr_appends_translation_page(tmp_path, monkeypatch):
     monkeypatch.setattr("translator.ocr.engine_available", lambda e: True)
+    # v0.7.0: 管线走多引擎投票入口 → 打点在 ocr_page_lines_scored
+    import pymupdf as _pm
     monkeypatch.setattr(
-        "translator.ocr.ocr_page_text",
-        lambda page, engine="paddle", src_lang="en":
-            "Scanned page content recognized by OCR engine.")
+        "translator.ocr.ocr_page_lines_scored",
+        lambda page, engine="paddle", src_lang="en", dpi=200:
+            [(_pm.Rect(60, 90, 520, 105),
+              "Scanned page content recognized by OCR engine.", 0.9)])
     src = _make_pdf([BODY, "", BODY], tmp_path)
     cfg = _cfg(src, tmp_path)
     from translator.pipeline import translate_document

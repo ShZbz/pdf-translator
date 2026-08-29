@@ -1,6 +1,6 @@
 [project]
 name = "pdf-translator"
-version = "0.6.0"
+version = "0.7.0"
 description = "学术 PDF 整册翻译工具：保留原始版面的 EN→ZH 翻译，附 Liquid Glass Web UI"
 requires-python = ">=3.11"
 dependencies = [

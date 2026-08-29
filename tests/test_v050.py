@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from translator.config import (IOConfig, LLMConfig, load_config)
 from translator.layout import external_layout_regions, layout_page
-from translator.ocr import _extract_lines
+from translator.ocr import _extract_paddle
 from translator.pipeline import _apply_ocr_inplace, _group_ocr_lines
 from translator.render import render_page
 
@@ -201,9 +201,11 @@ def test_group_ocr_lines():
 def test_extract_lines_paddle2x_format():
     result = [[[[72, 90], [300, 90], [300, 102], [72, 102]], ("hello", 0.99)],
               [[[72, 110], [300, 110], [300, 122], [72, 122]], ("world", 0.98)]]
-    lines = _extract_lines(result)
-    assert [t for _, t in lines] == ["hello", "world"]
+    # v0.7.0: _extract_paddle 返回 (rect, text, score) 三元组（投票用）
+    lines = _extract_paddle(result)
+    assert [t for _, t, _s in lines] == ["hello", "world"]
     assert lines[0][0].x0 == pytest.approx(72)
+    assert lines[0][2] == pytest.approx(0.99)
 
 
 def test_apply_ocr_inplace_covers_and_skips_graphics():
@@ -253,9 +255,11 @@ def test_ocr_inplace_end_to_end(tmp_path, monkeypatch):
     fake_lines = [(pymupdf.Rect(60, 90, 520, 105), "scanned english sentence"),
                   (pymupdf.Rect(60, 110, 480, 125), "second scanned line")]
     monkeypatch.setattr(ocr_mod, "engine_available", lambda e: True)
-    monkeypatch.setattr(ocr_mod, "ocr_page_lines",
+    # v0.7.0: 管线走多引擎投票入口 → 打点在 ocr_page_lines_scored
+    #（返回 (rect, text, score) 三元组；score 归一 0-1）
+    monkeypatch.setattr(ocr_mod, "ocr_page_lines_scored",
                         lambda page, engine="paddle", src_lang="en", dpi=200:
-                        fake_lines)
+                        [(r, t, 0.9) for r, t in fake_lines])
 
     class EchoClient:
         def __init__(self):
@@ -516,7 +520,7 @@ def test_build_run_config_backfills_stored_key(tmp_path, monkeypatch):
 
     req = app_mod.TranslateReq(
         input=str(tmp_path / "x.pdf"),
-        config={"llm": {"provider": "deepseek", "model": "deepseek-chat",
+        config={"llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                         "api_key": ""}})
     out = app_mod._build_run_config(req, Path(tmp_path / "x.pdf"))
     assert out["llm"]["api_key"] == "sk-stored-key"

@@ -34,6 +34,14 @@ llm:
   min_call_interval: 2              # 相邻调用最小间隔秒；限流严调大到 5-10
   max_workers: 3                    # 并发数；免费档建议 1
 
+  # ---- 速度（v0.7.0）----
+  stream: true                      # 流式解码+首包即回：增量收 delta 逐对
+                                    # 提交译文，收齐全部 id 即断流（省 10-30%
+                                    # 批耗时）；网关不支持 stream 自动退非流式
+  sentence_cache: true              # 句子级缓存：ref 条目/图注等模板文本按句
+                                    # 跨文档复用（全命中才免调；上下文依赖句
+                                    # 不启用）
+
   # ---- 重试与退避 ----
   timeout: 120.0                    # 单次请求超时秒（慢思考模型调大）
   max_retries: 2                    # 单批最大尝试次数（1=不重试直接降级）
@@ -51,6 +59,10 @@ performance:
   layout_cache: true                # v0.5.1 版面结果落盘缓存（段落级断点续跑）：
                                     # 同一输入重跑跳过布局直达翻译（配合翻译
                                     # 缓存只剩增量段）；输入/引擎变化自动失效
+  pipeline_overlap: auto            # v0.7.0 布局-翻译流水线重叠：auto=启发式
+                                    # 引擎且页数≥12 时启用（布局后台逐页产出，
+                                    # 翻译批随页发车，大文档省整段布局时间）；
+                                    # on=无条件启用；off=关闭
 
 features:
   watermark_removal: true           # 三层水印移除
@@ -84,9 +96,18 @@ fonts:
   # heading: ""                     # 目标语言标题字体
 
 ocr:
-  engine: paddle                    # 扫描件 OCR（v0.4.3 起真实接入；需另装
-                                    # paddleocr，未装则警告并保留原样；none=关闭）
+  engine: paddle                    # 扫描件 OCR 主引擎（v0.4.3 起真实接入）：
+                                    # paddle / rapidocr / tesseract；none=关闭。
+                                    # 未安装则警告并保留原样
+  engines: []                       # v0.7.0 多引擎投票：如 [paddle, rapidocr,
+                                    # tesseract]——同行结果按 IoU 对齐，一致取
+                                    # 一致、冲突取置信度最高并告警；空=单引擎
   min_chars: 50                     # 文字层少于此字符数的页视为扫描页
-  mode: appendix                    # v0.5.0 译文呈现：appendix=附录页（默认）；
-                                    # inplace=白块覆盖+原位回灌（实验性，与图形
-                                    # 重叠的块自动跳过保留原样）
+  mode: appendix                    # 译文呈现：appendix=附录页（默认）；
+                                    # inplace=白块覆盖+原位回灌（与图形重叠的
+                                    # 块自动跳过保留原样）；
+                                    # reconstruct=版面自监督重建（v0.7.0）：
+                                    #   区域几何来自影子页 GNN/几何分割（与
+                                    #   OCR 识别质量解耦），译文按区域原位回灌
+                                    #   + 原文对照附录页；需装 pymupdf-layout
+                                    #   （未装自动退几何分割）
