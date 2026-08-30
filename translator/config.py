@@ -297,23 +297,26 @@ class Config:
 
 def load_config(path: str | Path) -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    io_ = IOConfig(**{k: v for k, v in raw.get("io", {}).items()
+    # v0.8.2: 空节点容错——YAML 里「output:」这类只有键没有内容的节点是
+    # None，旧版 raw.get("output", {}) 拿到 None 后 .items() 直接
+    # AttributeError（用户手写最小配置即崩）；统一 or {} 走默认值
+    io_ = IOConfig(**{k: v for k, v in (raw.get("io") or {}).items()
                       if k in IOConfig.__dataclass_fields__})
-    llm_raw = raw.get("llm", {})
+    llm_raw = raw.get("llm") or {}
     llm = LLMConfig(**{k: v for k, v in llm_raw.items() if k in LLMConfig.__dataclass_fields__})
     llm._explicit = set(llm_raw.keys()) & set(LLMConfig.__dataclass_fields__)
-    feat = _filtered(FeatureConfig, raw.get("features", {}))
+    feat = _filtered(FeatureConfig, raw.get("features") or {})
     if feat.renderer not in ("writer", "htmlbox"):
         raise ValueError(
             f"features.renderer 必须是 'writer' 或 'htmlbox'，当前 {feat.renderer!r}")
-    ocr = _filtered(OCRConfig, raw.get("ocr", {}))
+    ocr = _filtered(OCRConfig, raw.get("ocr") or {})
     if ocr.mode not in ("appendix", "inplace", "reconstruct"):
         raise ValueError(
             f"ocr.mode 必须是 'appendix' / 'inplace' / 'reconstruct'，"
             f"当前 {ocr.mode!r}")
     if not isinstance(ocr.engines, list):
         raise ValueError(f"ocr.engines 必须是列表，当前 {ocr.engines!r}")
-    perf = _filtered(PerformanceConfig, raw.get("performance", {}))
+    perf = _filtered(PerformanceConfig, raw.get("performance") or {})
     if perf.layout_engine not in ("heuristic", "pymupdf-layout"):
         raise ValueError(
             "performance.layout_engine 必须是 'heuristic' 或 'pymupdf-layout'，"
@@ -335,12 +338,12 @@ def load_config(path: str | Path) -> Config:
         except ValueError as e:
             raise ValueError(f"fit 配置无效: {e}") from e
     # ---- v0.8.0: 双模式输出 + 渲染微调 + reflow 选项 ----
-    out_cfg = _filtered(OutputConfig, raw.get("output", {}))
+    out_cfg = _filtered(OutputConfig, raw.get("output") or {})
     if out_cfg.mode not in ("faithful", "reflow"):
         raise ValueError(
             f"output.mode 必须是 'faithful' 或 'reflow'，"
             f"当前 {out_cfg.mode!r}")
-    reflow_cfg = _filtered(ReflowConfig, raw.get("reflow", {}))
+    reflow_cfg = _filtered(ReflowConfig, raw.get("reflow") or {})
     if reflow_cfg.columns not in ("auto", "single"):
         raise ValueError(
             f"reflow.columns 必须是 'auto' 或 'single'，"
@@ -350,11 +353,10 @@ def load_config(path: str | Path) -> Config:
     reflow_cfg.segment_blocks = max(int(reflow_cfg.segment_blocks or 500),
                                     50)
     feat_bilingual = bool((raw.get("features") or {}).get("bilingual"))
-    if out_cfg.mode == "reflow" and feat_bilingual:
-        raise ValueError(
+    if out_cfg.mode == "reflow" and feat_bilingual:        raise ValueError(
             "reflow 模式暂不支持双语对照（双语为 faithful 专有排版）；"
             "请 output.mode: faithful 或关闭 features.bilingual")
-    render_cfg = _filtered(RenderConfig, raw.get("render", {}))
+    render_cfg = _filtered(RenderConfig, raw.get("render") or {})
     ps = render_cfg.page_story
     if isinstance(ps, bool):          # YAML 1.1 裸 on/off → bool
         ps = "on" if ps else "off"

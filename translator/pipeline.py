@@ -547,8 +547,17 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
         if client is not None and engines_avail \
                 and not page_has_text_layer(doc[pno], cfg.ocr.min_chars):
             ocr_q.put(pno)
-        # 段落：先决上一页遗留的跨页合并组，再收本页
+        # 段落：先登记本页非 verbatim 段，再决上一页遗留的跨页合并组
+        # v0.8.2 修复：旧版先查 flat_idx_of[(pno, 0)] 后登记本页段——
+        # 索引必不存在，跨页合并判定永远走 else 单段发射（v0.7.0 起
+        # overlap 文档的断句合并静默失效，前后半句各译各的）
         paras = lay["paragraphs"]
+        page_fis = []
+        for i in range(len(paras)):
+            if not paras[i].get("is_verbatim"):
+                flat_idx_of[(pno, i)] = len(pending)
+                pending.append((pno, i))
+                page_fis.append(len(pending) - 1)
         skip_fi = None
         if open_group is not None:
             fi_prev = open_group[0]
@@ -561,12 +570,6 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
             else:
                 _emit_para_group([fi_prev])
             open_group = None
-        page_fis = []
-        for i in range(len(paras)):
-            if not paras[i].get("is_verbatim"):
-                flat_idx_of[(pno, i)] = len(pending)
-                pending.append((pno, i))
-                page_fis.append(len(pending) - 1)
         for fi in page_fis:
             if fi == skip_fi:
                 continue
@@ -741,6 +744,11 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
         "page_pixmaps": page_pixmaps,
         "texts_by_page": texts_by_page,
         "cell_texts": cell_texts,
+        # v0.8.2 修复：跨页合并单元整段译文/reflow 跳过集——旧版流式路径
+        # 漏返回这两个键，≥12 页 overlap 文档 reflow 拿到空 dict，跨页段
+        # 退回按比例拆分两段（v0.8.0 P3 整段入流特性在流式路径静默失效）
+        "cross_full": cross_full,
+        "cross_skip": cross_skip,
         "ocr_jobs": ocr_jobs,
         "ocr_translations": ocr_flat_out,
         "n_paras": n_paras,
@@ -1216,22 +1224,33 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     # v0.4.2: 字体族按目标语言解析（langs.py），跨平台候选链
     from .typography import Typography
     typo = None
+    _cov_thread = None       # v0.8.2 覆盖率校验后台线程（渲染前 join 收口）
+    _cov_warns: list[str] = []
     if getattr(cfg.features, "preserve_formatting", True):
         try:
             typo = Typography(cfg.fonts, lang=tgt_lang)
             _log(f"typography: body={os.path.basename(typo.body_path) or '(builtin)'}, "
                  f"heading={os.path.basename(typo.heading_path) or '(builtin)'}")
-            # 字形覆盖率校验（选到的字体缺目标语言字符 → 豆腐块预警）
-            # （lang_info 在模块顶部导入；此处再导入会把整个函数的
-            #  lang_info 变成局部名，上方引用直接 UnboundLocalError）
-            from .langs import coverage_warnings
-            for w in coverage_warnings(typo.f_body, tgt_lang):
-                _log(f"WARNING: {w}")
-                all_warnings.append(w)
-            if typo.heading_path != typo.body_path:
-                for w in coverage_warnings(typo.f_head, tgt_lang):
-                    _log(f"WARNING: {w}")
-                    all_warnings.append(w)
+            # v0.8.2: 字形覆盖率校验后台化——Font(18MB CJK ttc) 构造实测
+            # ~1s/个，旧版在主管线串行做两次（body+heading），每文档白付
+            # ~2s；校验只读字体文件与目标语言字符表，与布局/翻译无依赖，
+            # 放后台线程跑完汇入警告（渲染前 join 收口，零等待重叠）
+            import threading as _threading
+            _cov_warns: list[str] = []
+
+            def _coverage_worker():
+                try:
+                    from .langs import coverage_warnings
+                    _cov_warns.extend(coverage_warnings(typo.f_body, tgt_lang))
+                    if typo.heading_path != typo.body_path:
+                        _cov_warns.extend(
+                            coverage_warnings(typo.f_head, tgt_lang))
+                except Exception:
+                    pass       # 覆盖率校验失败不拖垮管线
+
+            _cov_thread = _threading.Thread(target=_coverage_worker,
+                                            daemon=True)
+            _cov_thread.start()
             _log(f"target language: {tgt_lang} ({lang_info(tgt_lang).native})")
         except Exception as e:
             _log(f"typography init failed ({e}); fallback to single-font mode")
@@ -1265,8 +1284,10 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         # ---- v0.4.3 布局本体：缓存命中 → 并行 → 串行回退 ----
         cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER) \
             if (dcache is not None and doc_fp is not None) else None
+        layout_cache_hit = False
         if cached is not None and len(cached) == n_pages:
             page_layouts = cached
+            layout_cache_hit = True
             _log(f"layout: cache hit (project store), skipping layout "
                  f"for {n_pages} page(s)")
             sink.emit("layout_cache_hit", pages=n_pages)
@@ -1306,10 +1327,13 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 page_layouts.append(lay)
                 page_pixmaps.append(pixmaps)
                 sink.page_done(pno, n_pages)
-        if dcache is not None and doc_fp is not None and page_layouts and \
+        if not layout_cache_hit and dcache is not None and doc_fp is not None \
+                and page_layouts and \
                 len(page_layouts) == n_pages and \
                 not any(p for p in page_pixmaps if p is None):
             # 布局完成（非缓存命中路径）→ 落项目库供断点续跑/跨输出目录复用
+            # v0.8.2: 缓存命中路径跳过——旧版热跑也全量重编码+重写布局
+            # JSON（实测 paper3 8 页 ~1.3s 纯浪费），流式路径本就有此判断
             dcache.save_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
                                src, n_pages, page_layouts, sel=sel_spec)
         # v0.5.1: 全部页 fallback 才告警——pymupdf-layout 已装且正常运行时，
@@ -1637,6 +1661,13 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         _log(f"table continuation link failed ({e}); skipped")
 
     # ---- 渲染回灌 ----
+    # v0.8.2: 覆盖率校验收口——布局/翻译阶段的耗时远超字体构造（~2s），
+    # join 通常零等待；异常兜底（线程已死/未启动）不阻塞渲染
+    if _cov_thread is not None:
+        _cov_thread.join(timeout=30.0)
+    for _w in _cov_warns:
+        _log(f"WARNING: {_w}")
+        all_warnings.append(_w)
     if control:
         control.checkpoint()
     sink.stage("render")

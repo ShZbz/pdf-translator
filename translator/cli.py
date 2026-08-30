@@ -42,7 +42,12 @@ def main() -> int:
         base_url, api_key = cfg.llm.resolve()
         if base_url:
             from openai import OpenAI
-            client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop")
+            # v0.8.2: timeout 透传——UI worker（jobs.py）v0.5.1 已修，CLI 漏了
+            # 同款：SDK 默认 600s，慢/挂网关下单批可无限拖住整文档
+            # （实测 opencode go 偶发流挂起），llm.timeout 配置对 CLI 不生效
+            client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop",
+                            timeout=float(getattr(cfg.llm, "timeout", 120.0)
+                                          or 120.0))
 
     if quick and client is not None:
         # 1) dry-run 冒烟（布局/字体/渲染管线零成本验证）

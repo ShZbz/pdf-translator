@@ -301,22 +301,35 @@ def render_page(page, layout: dict, translated: list[dict],
             cell_specs = collect_cell_specs(
                 cells, cell_texts or {}, layout.get("tables"),
                 font_path, lang)
-        _render_cells_htmlbox(page, cells, cell_texts or {}, font_path,
-                              typography, lang, warn_local,
-                              cell_specs=cell_specs, factors=factors,
-                              archive=archive, font_css=font_css)
         # ---- v0.7.1: 页级 Story 接管（任务 2-3 P1）----
         # 启用条件：render.page_story 启用 + 非双语 + (fit auto 或强制 on)。
+        # v0.8.2: 单元格一并收编（段落+宽格进同一 Story，一次字体重解析
+        # 替代逐格 insert_htmlbox ~320ms/格）；预检局部收缩让紧段以确定性
+        # 因子收纳（f<0.78 段/f<0.3 格仍整页回退或剔除，深缩交引擎）。
         # 预检/预演任一失败 → 整页回退逐段路径（本函数无墨，回退无痕）。
         story_done = False
+        story_left_cells = None
         if page_story in ("auto", "on") and not bilingual \
-                and para_specs and (fit_cfg is not None
-                                    or page_story == "on"):
+                and (para_specs or cell_specs) \
+                and (fit_cfg is not None or page_story == "on"):
             from .render_story import try_render_page_story
-            story_done = try_render_page_story(
+            story_done, story_left_cells = try_render_page_story(
                 page, para_specs, factors, font_css, archive,
-                stats=story_stats)
-        if not story_done:
+                stats=story_stats, cell_specs=cell_specs,
+                warnings=warn_local)
+        if story_done:
+            # Story 已落墨：只剩被剔除的深缩格走逐格路径
+            if story_left_cells:
+                _render_cells_htmlbox(page, cells, cell_texts or {},
+                                      font_path, typography, lang, warn_local,
+                                      cell_specs=story_left_cells,
+                                      factors=factors, archive=archive,
+                                      font_css=font_css)
+        else:
+            _render_cells_htmlbox(page, cells, cell_texts or {}, font_path,
+                                  typography, lang, warn_local,
+                                  cell_specs=cell_specs, factors=factors,
+                                  archive=archive, font_css=font_css)
             _render_paras_htmlbox(page, paras, tmap, font_path, typography,
                                   bilingual, formula_rects, lang, warn_local,
                                   para_specs=para_specs, factors=factors,

@@ -746,7 +746,11 @@ def build_reflow_css(body_size: float, dir_css: str, font_css: str) -> str:
             + " p.abs{line-height:1.35;}"
             + " p.caption{font-size:8.5pt;line-height:1.3;"
               "text-align:center;margin:3pt 0 9pt 0;}"
-            + " p.ref{font-size:9pt;line-height:1.25;margin:0 0 3pt 0;}"
+            # v0.8.2: 文献条目悬挂缩进（探针实测 padding-left+负 text-indent
+            # 在 Story 流式写入精确生效 14pt）——续行右移对齐编号后正文，
+            # 多行条目不再呈方块段（v0.8.0 已知限制「文献无悬挂缩进」收尾）
+            + " p.ref{font-size:9pt;line-height:1.25;margin:0 0 3pt 0;"
+              "padding-left:14pt;text-indent:-14pt;}"
             + " p.fx{text-align:center;margin:4pt 0 6pt 0;}"
             + " div.fig{page-break-inside:avoid;margin:6pt 0;}"
             + " div.fig p.fc{text-align:center;margin:0;}"

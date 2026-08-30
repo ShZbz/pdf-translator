@@ -65,13 +65,37 @@ class Typography:
         # ---- 原文层字体（双语对照/保留原文段，Times 系含西里尔）----
         self.en_body_path = cfg.get("en") or langs.resolve_original_font()
         self.en_bold_path = self.en_body_path
+        # v0.8.2: Font 对象懒加载——实测 CJK 字体（simsun.ttc 18MB）每个
+        # ~1s，而 htmlbox 主路径只用路径串（Archive/Story 自行加载）、
+        # Font 对象仅字形覆盖率校验与 writer 路径需要；旧版构造即加载
+        # 三个 Font，每文档白付 ~2s
+        self._fonts: dict = {}
 
-        import pymupdf
-        self.f_body = pymupdf.Font(fontfile=self.body_path)   # 宋体/Times
-        self.f_head = pymupdf.Font(fontfile=self.heading_path)  # 黑体/粗衬线
-        self.f_en = pymupdf.Font(fontfile=self.en_body_path) \
-            if self.en_body_path else pymupdf.Font("tiro")     # Times 兜底内置
-        self.f_en_bold = self.f_en
+    def _font(self, key: str, path: str, fallback: str = ""):
+        if key not in self._fonts:
+            import pymupdf
+            try:
+                self._fonts[key] = pymupdf.Font(fontfile=path) if path \
+                    else pymupdf.Font(fallback)
+            except Exception:
+                self._fonts[key] = pymupdf.Font(fallback)
+        return self._fonts[key]
+
+    @property
+    def f_body(self):
+        return self._font("body", self.body_path)
+
+    @property
+    def f_head(self):
+        return self._font("head", self.heading_path)
+
+    @property
+    def f_en(self):
+        return self._font("en", self.en_body_path, fallback="tiro")
+
+    @property
+    def f_en_bold(self):
+        return self.f_en
 
     def resolve(self, para: dict, body_size: float | None) -> "ParaStyle":
         """段落元数据 → 排版样式（期刊映射规则）。"""

@@ -116,7 +116,8 @@ class TranslationClient:
                  sink=None,
                  control=None,
                  stream: bool = True,
-                 sentence_cache: bool = True):
+                 sentence_cache: bool = True,
+                 stream_deadline: float = 0.0):
         self.client = client
         self.model = model
         self.temperature = temperature
@@ -162,6 +163,8 @@ class TranslationClient:
         self.stream = bool(stream)
         self.sentence_cache = bool(sentence_cache)
         self.sent_cache_hits = 0               # 句子级缓存命中段数（报表用）
+        # v0.8.2: 流式总墙钟上限（秒；0=自动 2×timeout+30）。测试注入口
+        self._stream_deadline = float(stream_deadline or 0.0)
 
     # ---- prompt 构造 ----
     def _system_prompt(self, budget_rule: str = "") -> str:
@@ -336,28 +339,57 @@ class TranslationClient:
                 buf = ""
                 got: set[str] = set()
                 need = {str(k) for k in want_ids} if want_ids else None
+                # v0.8.2: 流式总墙钟上限（双保险）——实测网关可能停发内容
+                # 但保持连接（SSE 保活字节周期到达，httpx read timeout 按
+                # 单次读间隙计时被不断重置，worker 卡死在 ssl read 整文档
+                # 假死，py-spy 实锤双线程全挂 _receive_response_body）。
+                # ① 逐 chunk 墙钟检查（内容滴漏型停顿）；② 看门狗定时器到
+                # 点强制 close 流（保活字节型停顿——注释行不产出 chunk，
+                # 逐 chunk 检查永不触达）。墙钟 = 2×timeout+30s：正常批
+                # 30-120s 完成，慢思考模型 timeout 本身已放大；超时走非流式
+                # 重发（该路径 httpx 对整包读取有完整超时语义）
+                deadline = self._stream_deadline or (self.timeout * 2.0 + 30.0)
+                t0 = time.monotonic()
                 stream = self.client.chat.completions.create(
                     stream=True, **kwargs)
                 if not hasattr(stream, "__iter__"):
                     # 网关/mock 无视 stream 参数直接回完整响应对象——
                     # 当非流式结果用（不再二次请求，响应已被本次消耗）
                     return stream.choices[0].message.content or ""
-                for chunk in stream:
+
+                def _close_quietly():
                     try:
-                        delta = chunk.choices[0].delta.content or ""
-                    except (IndexError, AttributeError):
-                        delta = ""
-                    if not delta:
-                        continue
-                    buf += delta
-                    if need is not None and '"' in delta:
-                        got.update(m.group(1) for m in _KV_RE.finditer(buf))
-                        if need <= got:
-                            break          # 收齐即断流（见 docstring）
+                        stream.close()
+                    except Exception:
+                        pass
+
+                watchdog = threading.Timer(deadline, _close_quietly)
+                watchdog.daemon = True
+                watchdog.start()
+                try:
+                    for chunk in stream:
+                        if time.monotonic() - t0 > deadline:
+                            raise TimeoutError(
+                                f"stream stalled > {deadline:.0f}s without "
+                                f"completing {len(need or ())} id(s)")
+                        try:
+                            delta = chunk.choices[0].delta.content or ""
+                        except (IndexError, AttributeError):
+                            delta = ""
+                        if not delta:
+                            continue
+                        buf += delta
+                        if need is not None and '"' in delta:
+                            got.update(m.group(1) for m in _KV_RE.finditer(buf))
+                            if need <= got:
+                                break      # 收齐即断流（见 docstring）
+                finally:
+                    watchdog.cancel()
                 return buf
             except Exception as e:
-                # 流式通道不可用（网关不支持/代理剥离 SSE）→ 非流式重发。
-                # 429/配额类语义明确：直接上抛走退避/切链，别浪费一次非流式。
+                # 流式通道不可用（网关不支持/代理剥离 SSE/墙钟超时）→ 非流式
+                # 重发。429/配额类语义明确：直接上抛走退避/切链，别浪费一次
+                # 非流式。
                 if self._is_rate_limit_error(e) or self._is_daily_quota_error(e):
                     raise
                 self._warn(f"stream failed ({e}); retrying non-stream")
