@@ -331,10 +331,11 @@ def validate_key(req: ValidateReq):
         env_name = p.get("env") or ""
         api_key = api_key if api_key and not api_key.endswith("***") \
             else os.environ.get(env_name, "") if env_name else ""
-        if not api_key and UI_CONFIG_PATH.exists():
-            stored = yaml.safe_load(
-                UI_CONFIG_PATH.read_text(encoding="utf-8")).get("llm", {})
-            api_key = stored.get("api_key", "")
+        if not api_key:
+            # v0.8.1: 空/仅注释的 ui_config.yaml 会让 yaml.safe_load 返回
+            # None——旧版直接 .get() 抛 AttributeError → 500。_stored_llm
+            # 已做容错，这里复用（key 回填语义不变）
+            api_key = _stored_llm().get("api_key", "")
 
     st_timeout, st_retries = _stored_llm_timeout_retry()
     timeout = max(5.0, float(req.timeout or 0) or st_timeout)

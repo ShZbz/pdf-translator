@@ -13,6 +13,8 @@
       ├─ layouts 版面缓存（key=文档指纹|引擎|缓存版本——内容寻址，
       │           同一文档复制/改名后布局仍命中；配合翻译缓存形成
       │           「改 1 页只重译 1 页」的文档增量翻译能力）
+      ├─ pixmaps 位图裁剪缓存（v0.8.1：key=指纹|页|区域|dpi——布局/翻译
+      │           全缓存命中时重跑不再重裁 300dpi 位图，S4）
       └─ docs    文档指纹索引（指纹 → 路径/大小/mtime/页数，簿记+introspection）
 
 根目录解析（resolve_cache_root）：performance.cache_dir 显式配置 >
@@ -24,12 +26,15 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
 from .cache import TranslationCache
 
 CACHE_DIR_NAME = ".pdf_translator_cache"
+# v0.8.1: 位图缓存总字节上限（300dpi 裁图单张 0.1-3MB，超限按 LRU 淘汰）
+PIXMAP_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
 
 def resolve_cache_root(explicit: str, src: Path, out_dir: Path) -> tuple[Path, str]:
@@ -66,8 +71,12 @@ class DocumentCache:
         self._log = log or (lambda m: None)
         # 翻译缓存表（沿用 TranslationCache：key 空间/容量淘汰/报表不变）
         self.tc = TranslationCache(self.path, max_entries=max_entries)
-        # 文档指纹索引 + 版面缓存表（独立连接，同文件 SQLite 并发安全足够）
-        self._conn = sqlite3.connect(self.path, timeout=15.0)
+        # 文档指纹索引 + 版面缓存表（独立连接，同文件 SQLite 并发安全足够）。
+        # v0.8.1: check_same_thread=False + 外部锁——位图缓存会被流式路径
+        # 的布局/OCR 后台线程并发使用（连接默认禁止跨线程使用）
+        self._conn_lock = threading.RLock()
+        self._conn = sqlite3.connect(self.path, timeout=15.0,
+                                     check_same_thread=False)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS docs ("
             " fp TEXT PRIMARY KEY, path TEXT, size INTEGER, mtime REAL,"
@@ -76,7 +85,14 @@ class DocumentCache:
             "CREATE TABLE IF NOT EXISTS layouts ("
             " key TEXT PRIMARY KEY, fp TEXT, engine TEXT, ver INTEGER,"
             " pages INTEGER, data TEXT, updated REAL)")
+        # v0.8.1: 位图裁剪缓存（BLOB）。key 内容寻址（指纹|页|区域|dpi），
+        # 同一文档重跑（布局+翻译全命中）时 300dpi 裁图 0.1-0.5s/张全免
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS pixmaps ("
+            " key TEXT PRIMARY KEY, fp TEXT, page INTEGER,"
+            " data BLOB, updated REAL)")
         self._conn.commit()
+        self._pixmap_puts = 0
         self.migrated = 0
         if legacy_sources:
             self.migrated = self._migrate_legacy(
@@ -109,9 +125,10 @@ class DocumentCache:
     def load_layout(self, fp: str, engine: str, ver: int,
                     sel: str = "") -> "list[dict] | None":
         try:
-            row = self._conn.execute(
-                "SELECT data, pages FROM layouts WHERE key=?",
-                (self.layout_key(fp, engine, ver, sel),)).fetchone()
+            with self._conn_lock:
+                row = self._conn.execute(
+                    "SELECT data, pages FROM layouts WHERE key=?",
+                    (self.layout_key(fp, engine, ver, sel),)).fetchone()
         except sqlite3.Error:
             return None
         if not row:
@@ -133,19 +150,86 @@ class DocumentCache:
         try:
             data = json.dumps(_layout_cache_encode(layouts), ensure_ascii=False)
             st = src.stat()
-            with self._conn:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO layouts"
-                    " (key, fp, engine, ver, pages, data, updated)"
-                    " VALUES (?,?,?,?,?,?,?)",
-                    (key, fp, engine, ver, n_pages, data, time.time()))
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO docs"
-                    " (fp, path, size, mtime, pages, updated)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (fp, str(src), st.st_size, st.st_mtime, n_pages, time.time()))
+            with self._conn_lock:
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO layouts"
+                        " (key, fp, engine, ver, pages, data, updated)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (key, fp, engine, ver, n_pages, data, time.time()))
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO docs"
+                        " (fp, path, size, mtime, pages, updated)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (fp, str(src), st.st_size, st.st_mtime, n_pages,
+                         time.time()))
         except Exception:
             pass                   # 缓存写失败不影响主流程
+
+    # ---- v0.8.1: 位图裁剪缓存（S4）----
+
+    @staticmethod
+    def pixmap_key(fp: str, pno: int, rect, dpi: int) -> str:
+        """位图缓存 key：指纹|页|区域(pt 两位小数)|dpi——同一源页同一
+        裁剪区域的 300dpi 渲染是确定性的，跨运行字节一致。"""
+        r = ",".join(f"{v:.2f}" for v in (rect.x0, rect.y0, rect.x1, rect.y1))
+        return hashlib.md5(
+            f"{fp}|p{pno}|{r}|{dpi}".encode("utf-8")).hexdigest()
+
+    def load_pixmap(self, key: str) -> "bytes | None":
+        try:
+            with self._conn_lock:
+                row = self._conn.execute(
+                    "SELECT data FROM pixmaps WHERE key=?",
+                    (key,)).fetchone()
+            return bytes(row[0]) if row else None
+        except (sqlite3.Error, TypeError, IndexError):
+            return None       # 坏缓存按 miss 处理，重裁即可
+
+    def save_pixmap(self, key: str, fp: str, pno: int, blob: bytes) -> None:
+        if not blob:
+            return
+        try:
+            with self._conn_lock:
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO pixmaps"
+                        " (key, fp, page, data, updated)"
+                        " VALUES (?,?,?,?,?)",
+                        (key, fp, pno, blob, time.time()))
+            self._pixmap_puts += 1
+            if self._pixmap_puts % 16 == 0:
+                self._prune_pixmaps()
+        except Exception:
+            pass              # 缓存写失败不影响主流程
+
+    def _prune_pixmaps(self, force: bool = False) -> int:
+        """总字节超上限时按 updated LRU 淘汰（每 16 次写入检查一次）。"""
+        try:
+            with self._conn_lock:
+                total = self._conn.execute(
+                    "SELECT COALESCE(SUM(LENGTH(data)),0) FROM pixmaps"
+                ).fetchone()[0]
+                if total <= PIXMAP_CACHE_MAX_BYTES and not force:
+                    return 0
+                over = total - PIXMAP_CACHE_MAX_BYTES
+                # 按最旧逐条删除直至回到上限内（LRU；逐条而非整批，避免
+                # 一次淘汰过多导致缓存命中突降）
+                n = 0
+                while over > 0:
+                    row = self._conn.execute(
+                        "SELECT key, LENGTH(data) FROM pixmaps"
+                        " ORDER BY updated ASC, rowid ASC LIMIT 1").fetchone()
+                    if not row:
+                        break
+                    self._conn.execute("DELETE FROM pixmaps WHERE key=?",
+                                       (row[0],))
+                    over -= (row[1] or 0)
+                    n += 1
+                self._conn.commit()
+                return n
+        except sqlite3.Error:
+            return 0
 
     # ---- 旧库迁移 ----
     def _migrate_legacy(self, legacy_paths: list[Path]) -> int:
@@ -175,6 +259,10 @@ class DocumentCache:
         return total
 
     def close(self) -> None:
+        try:
+            self._prune_pixmaps()
+        except Exception:
+            pass
         for c in (self.tc, self._conn):
             try:
                 c.close()

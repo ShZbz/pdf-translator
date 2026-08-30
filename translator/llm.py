@@ -472,26 +472,40 @@ class TranslationClient:
 
         旧版按固定段数切片（batch_size=6），长短段混批导致单批 token
         失衡——长批易超时失败、短批浪费调用。现按 batch_char_budget
-        （默认 3000 字符）贪心装填：
+        （默认 3000 字符）装填：
         - 批内累计字符超预算 → 开新批
         - 段数达 batch_size 上限 → 开新批（保留旧参数语义为每批段数上限）
         - 单段自身超预算 → 独占一批（段落是原子翻译单元，不拆）
         - budget=0 → 纯段数模式（v0.4.2 行为）
+
+        v0.8.1 first-fit：顺序贪心改为「放入第一个装得下的开批，否则开
+        新批」——长段装不下即封批会把开批剩余字符空间浪费掉，first-fit
+        让后续短段回填早批空位。批协议/id（全局段索引）/缓存 key 全不变，
+        只改装填顺序（真实段长分布模拟 ~-8% 批数；「最长优先」反而差
+        6-25%——段数上限对短段成约束，不用）。批内段序仍为文档序。
         """
         budget = self.batch_char_budget
         batches: list[list[int]] = []
-        cur: list[int] = []
-        cur_chars = 0
+        chars: list[int] = []              # 各开批当前字符量（与 batches 对齐）
         for i in miss:
             n = len(paras[i])
-            if cur and (len(cur) >= self.batch_size
-                        or (budget > 0 and cur_chars + n > budget)):
-                batches.append(cur)
-                cur, cur_chars = [], 0
-            cur.append(i)
-            cur_chars += n
-        if cur:
-            batches.append(cur)
+            placed = False
+            if budget > 0:
+                for k, cur in enumerate(batches):
+                    if len(cur) < self.batch_size and chars[k] + n <= budget:
+                        cur.append(i)
+                        chars[k] += n
+                        placed = True
+                        break
+            else:                          # 纯段数模式：first-fit 即顺序
+                for k, cur in enumerate(batches):
+                    if len(cur) < self.batch_size:
+                        cur.append(i)
+                        placed = True
+                        break
+            if not placed:
+                batches.append([i])
+                chars.append(n)
         return batches
 
     # ---- 批量入口（并发版）----
@@ -546,6 +560,23 @@ class TranslationClient:
         if self.sentence_cache and unit_kinds \
                 and j < len(unit_kinds) and unit_kinds[j] in _TEMPLATE_KINDS:
             self._sentence_cache_put(cache, paras[j], dst, model_used)
+
+    def _store_cache_many(self, cache, pairs: "list[tuple[int, str]]",
+                          paras: list[str], model_used: str,
+                          unit_kinds=None) -> None:
+        """v0.8.1: 批成功段落的主缓存批量写（put_many 单事务——旧版逐条
+        put 每条一次 commit/fsync，数百段文档数百次 fsync）+ 模板句缓存
+        回填（模板文本量小，维持逐条）。"""
+        if cache is None or not pairs:
+            return
+        rows = [(cache.make_key("openai-compat", model_used,
+                                self.src_lang, self.tgt_lang, paras[j]),
+                 paras[j], dst) for j, dst in pairs]
+        cache.put_many(rows)
+        if self.sentence_cache and unit_kinds:
+            for j, dst in pairs:
+                if j < len(unit_kinds) and unit_kinds[j] in _TEMPLATE_KINDS:
+                    self._sentence_cache_put(cache, paras[j], dst, model_used)
 
     def _cache_first(self, cache, i: int, t: str,
                      budget: "int | None", kind: "str | None") -> str | None:
@@ -632,9 +663,9 @@ class TranslationClient:
                         continue
                     for j, dst in out.items():
                         results[j] = dst
-                        if cache is not None:
-                            self._store_cache(cache, j, paras, dst, model_used,
-                                              unit_kinds)
+                    self._store_cache_many(
+                        cache, list(out.items()), paras, model_used,
+                        unit_kinds)
         else:
             for b in batches:
                 if self.control is not None:
@@ -648,9 +679,8 @@ class TranslationClient:
                     continue
                 for j, dst in out.items():
                     results[j] = dst
-                    if cache is not None:
-                        self._store_cache(cache, j, paras, dst, model_used,
-                                          unit_kinds)
+                self._store_cache_many(
+                    cache, list(out.items()), paras, model_used, unit_kinds)
 
         # 3) v0.6.0 任务 E：超预算软校验 → 单段强约束重问（上限防风暴）
         if budgets:
@@ -675,11 +705,14 @@ class TranslationClient:
         每文档上限 max(1, max_llm_calls//10)；预算槽位走 _ask 的常规
         记账（触顶自动放弃）。重问结果通过校验才采纳（公式数一致），
         存预算档缓存 key（|#b{N} 后缀）；仍超限则接受并告警（渲染阶梯兜底）。
+        v0.8.1: 候选先收集后并行重问（提交进临时池，不超过 max_workers；
+        _ask 的 in-flight 记账/全局节流保证不超预算不越 RPM）——旧版串行
+        重问，超预算段多时逐段排队等待。
         """
         cap = max(1, self.max_llm_calls // 10)
-        asked = 0
+        cands: list[int] = []
         for i, b in enumerate(budgets):
-            if asked >= cap:
+            if len(cands) >= cap:
                 break
             dst = results[i]
             if not b or b <= 0 or dst is None or len(dst) <= b * 1.15:
@@ -690,13 +723,29 @@ class TranslationClient:
                 continue
             if self._stop_spawning:
                 break
-            asked += 1
-            over = len(dst) - b
+            cands.append(i)
+        if not cands:
+            return
+
+        def _ask_one(i: int):
+            b = budgets[i]
+            over = len(results[i]) - b
             rule = (f"Length limit (HARD): id 1 <= {b} characters. The "
                     f"previous attempt was {over} characters over; compress "
                     f"the translation (keep every technical fact, unit and "
                     f"citation) to fit.")
-            got = self._ask({"1": paras[i]}, attempt=1, budget_rule=rule)
+            return self._ask({"1": paras[i]}, attempt=1, budget_rule=rule)
+
+        if len(cands) == 1 or self.max_workers <= 1:
+            got_list = [(i, _ask_one(i)) for i in cands]
+        else:
+            from concurrent.futures import ThreadPoolExecutor as _Pool
+            with _Pool(max_workers=min(self.max_workers, len(cands))) as pool:
+                got_list = list(zip(
+                    cands, pool.map(_ask_one, cands)))
+        for i, got in got_list:
+            b = budgets[i]
+            dst = results[i]
             if got is None or "1" not in got:
                 self._warn(f"budget re-ask #{i} failed; kept over-limit "
                            f"translation ({len(dst)}/{b} chars), renderer "
@@ -743,8 +792,11 @@ class StreamingTranslator:
         self.budgets: list["int | None"] = []
         self.kinds: list = []
         self.results: list["str | None"] = []
-        self._open: list[int] = []
-        self._open_chars = 0
+        # v0.8.1 first-fit 开批组：未满的批保持开放等短单元回填（与
+        # _pack_batches 同语义）；放满即发车（保住布局-翻译流水线重叠，
+        # 不把全量攒到 finish）
+        self._open: list[list[int]] = []
+        self._open_chars: list[int] = []
         self._futures: list = []
         self._pool: "ThreadPoolExecutor | None" = None
         self._batches_spawned = 0
@@ -763,24 +815,55 @@ class StreamingTranslator:
             return i
         tc = self.tc
         b = tc.batch_char_budget
-        # 组批边界与 _pack_batches 同语义：加下一段会超限/段数到顶 → 先冲批
-        if self._open and (len(self._open) >= tc.batch_size
-                           or (b > 0 and self._open_chars + len(text) > b)):
-            self.flush()
-        self._open.append(i)
-        self._open_chars += len(text)
+        n = len(text)
+        placed = False
+        for k, cur in enumerate(self._open):
+            if len(cur) < tc.batch_size and (b <= 0
+                                             or self._open_chars[k] + n <= b):
+                cur.append(i)
+                self._open_chars[k] += n
+                placed = True
+                break
+        if not placed:
+            self._open.append([i])
+            self._open_chars.append(n)
+        # 放满（段数到顶/字符到顶）的批立即发车——不等到 finish
+        self._flush_full()
         return i
 
-    def flush(self) -> None:
-        """开批发车（触顶/停止发车时按放弃语义清空开批）。"""
+    def _flush_full(self) -> None:
+        """把已放满的开批发车，未满的保持开放（first-fit 回填空位）。"""
         if not self._open:
             return
+        b = self.tc.batch_char_budget
+        todo: list[list[int]] = []
+        keep: list[list[int]] = []
+        keep_chars: list[int] = []
+        for cur, ch in zip(self._open, self._open_chars):
+            if len(cur) >= self.tc.batch_size or (b > 0 and ch >= b):
+                todo.append(cur)
+            else:
+                keep.append(cur)
+                keep_chars.append(ch)
+        if todo:
+            self._open, self._open_chars = keep, keep_chars
+            self._spawn(todo)
+
+    def flush(self) -> None:
+        """全部剩余开批发车（触顶/停止发车时按放弃语义清空）。"""
+        if not self._open:
+            return
+        todo, self._open = self._open, []
+        _chars, self._open_chars = self._open_chars, []
+        self._spawn(todo)
+
+    def _spawn(self, batches: list[list[int]]) -> None:
+        """提交批进线程池（池惰性建；触顶后按放弃语义丢弃）。"""
         tc = self.tc
         if tc.control is not None:
             tc.control.checkpoint()
         with tc._lock:
             if tc._stop_spawning:
-                self._open, self._open_chars = [], 0
                 return
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=tc.max_workers)
@@ -789,11 +872,10 @@ class StreamingTranslator:
                 # （UI 进度分母随之调整）
                 tc.sink.emit("translate_start", batches=1,
                              paragraphs=len(self.paras))
-        batch = list(self._open)
-        self._open, self._open_chars = [], 0
-        self._futures.append(self._pool.submit(
-            tc._guarded_batch, batch, self.paras, self.budgets))
-        self._batches_spawned += 1
+        for batch in batches:
+            self._futures.append(self._pool.submit(
+                tc._guarded_batch, batch, self.paras, self.budgets))
+            self._batches_spawned += 1
         with tc._lock:
             tc._batches_total = self._batches_spawned
 
@@ -809,9 +891,8 @@ class StreamingTranslator:
                 continue
             for j, dst in out.items():
                 self.results[j] = dst
-                if self.cache is not None:
-                    tc._store_cache(self.cache, j, self.paras, dst,
-                                    model_used, self.kinds)
+            tc._store_cache_many(self.cache, list(out.items()),
+                                 self.paras, model_used, self.kinds)
         if any(b for b in self.budgets):
             tc._reask_over_budget(self.paras, self.results, self.budgets,
                                   self.cache)

@@ -233,7 +233,8 @@ def build_document_model(page_layouts: list[dict], doc,
                          texts_by_page: dict, cell_texts: dict,
                          cross_full: dict, cross_skip: set,
                          formula_pixmaps: dict, typo,
-                         warnings: "list | None" = None) \
+                         warnings: "list | None" = None,
+                         dcache=None, doc_fp: "str | None" = None) \
         -> tuple[list[Block], dict[str, bytes], list[dict]]:
     """layout 全输出 → 跨页阅读序统一块流。
 
@@ -241,14 +242,25 @@ def build_document_model(page_layouts: list[dict], doc,
     书签页码由写入循环回填。公式位图复用 pipeline 预裁 PNG（与 faithful
     同源，reflow 不重复裁剪）；图区/表格/verbatim 位图此处从原 doc 裁剪
     （reflow 不 redact，原像素完整）。
+    v0.8.1 S4: dcache/doc_fp 提供时全部 300dpi 裁图入项目位图缓存
+    （(指纹,页,区域,dpi) 内容寻址——重跑/调开关重渲染场景免重裁）。
     """
     warn = warnings if warnings is not None else []
     images: dict[str, bytes] = {}
     bm_by_block: dict[int, dict] = {}
 
     def _crop(page, rect: "pymupdf.Rect", name: str, dpi: int = 300) -> str:
-        pix = page.get_pixmap(clip=rect, dpi=dpi)
-        images[name] = pix.tobytes("png")
+        png = None
+        if dcache is not None and doc_fp is not None:
+            from .doccache import DocumentCache
+            key = DocumentCache.pixmap_key(doc_fp, page.number, rect, dpi)
+            png = dcache.load_pixmap(key)
+            if png is None:
+                png = page.get_pixmap(clip=rect, dpi=dpi).tobytes("png")
+                dcache.save_pixmap(key, doc_fp, page.number, png)
+        else:
+            png = page.get_pixmap(clip=rect, dpi=dpi).tobytes("png")
+        images[name] = png
         return name
 
     blocks: list[Block] = []
@@ -340,7 +352,10 @@ def build_document_model(page_layouts: list[dict], doc,
                               "subsec_title": 3}[kind_cls], "text": txt}
             entries.append((r.y0, r.x0, p.get("col", 0), b, r))
 
-        # display 公式位图（复用 pipeline 预裁；全宽分带元素）
+        # display 公式位图（复用 pipeline 预裁；全宽分带元素）。
+        # v0.8.1 修复：公式 rect 必须进 baked_rects——layout 的 in_protected
+        # 把与公式区 ≥30% 相交的碎片块（'dt .'/'(6)'）放 fig_text_blocks，
+        # 漏登记会令这些碎片以原文段落重复回归文流（位图已含其像素）
         page_pms = (formula_pixmaps or {}).get(pno) or {}
         for fi, f in enumerate(formulas):
             fr = pymupdf.Rect(f["bbox"])
@@ -352,6 +367,7 @@ def build_document_model(page_layouts: list[dict], doc,
                 _crop(page, fr, name)
             b = Block(kind="formula", img_name=name, width_pt=fr.width)
             entries.append((fr.y0, fr.x0, -1, b, fr))
+            baked_rects.append(fr)
 
         # 图区（+绑定图注；裁剪修整见 _trim_region——区域检测 bbox 可能
         # 吞进邻接作者块/正文边缘，faithful 原位无感而 reflow 搬运后
@@ -394,6 +410,11 @@ def build_document_model(page_layouts: list[dict], doc,
                 html_tab = _table_html(cells, cell_texts, pno, cell_off)
             if html_tab is not None:
                 b = Block(kind="table", html_extra=html_tab)
+                # v0.8.1 修复：HTML 重排表同样要进 baked_rects——表内文字块
+                # 被 layout 归入 fig_text_blocks（中心落表判定），漏登记会
+                # 令表内容以原文段落重复回归文流（译文已在 HTML 表里）。
+                # 用原始 tr0（收紧只考虑 paras 侵入，格可布满原区）
+                baked_rects.append(pymupdf.Rect(tr0))
             else:
                 name = _crop(page, tr, f"t{pno}_{ti}")
                 b = Block(kind="table", img_name=name, width_pt=tr.width)
@@ -415,10 +436,15 @@ def build_document_model(page_layouts: list[dict], doc,
         # 被吞文字带回归文流：未烘焙进任何位图区域的 fig_text_blocks。
         # 自然语言（作者块/机构行）→ 原文文本块回流；伪代码形态碎片
         # （Algorithm 框漏网行，实测 'action = {ak, Lk}'/'Break out of
-        # for loop'）→ 独立位图随文流（避免英文散落中文行间）
+        # for loop'）→ 独立位图随文流（避免英文散落中文行间）。
+        # v0.8.1: 自然语言带先做纵向并块——作者块/机构行在源文档是一个
+        # 视觉单元，被图区边界切成多个碎块，逐块独立成段在 reflow 下
+        # 成为间距不均的散落行（实测 paper3 p1 每位作者 2 块三种版式）
         two = _mode_cols(page_layouts) == "two"
         mid = page.rect.width / 2
-        for k, tb in enumerate(fig_texts):
+        nat_bands: list[dict] = []
+        frag_bands: list[tuple] = []
+        for tb in fig_texts:
             try:
                 r = pymupdf.Rect(tb["bbox"])
             except Exception:
@@ -428,16 +454,29 @@ def build_document_model(page_layouts: list[dict], doc,
             t = (tb.get("text") or "").strip()
             if not t:
                 continue
-            hint = ((0 if (r.x0 + r.x1) / 2 < mid else 1) if two else 0)
             if _PSEUDO_RE.search(t) and len(t) < 90:
-                grow = pymupdf.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2)
-                name = _crop(page, grow, f"ft{pno}_{k}")
-                b = Block(kind="verbatim", img_name=name,
-                          width_pt=grow.width)
-                baked_rects.append(pymupdf.Rect(grow))
+                frag_bands.append((
+                    r, t,
+                    (0 if (r.x0 + r.x1) / 2 < mid else 1) if two else 0))
             else:
-                b = Block(kind="para", text=_clean_zh_text(t),
-                          kind_cls="body", src_text=t)
+                nat_bands.append({
+                    "r": r, "t": t,
+                    "hint": ((0 if (r.x0 + r.x1) / 2 < mid else 1)
+                             if two else 0)})
+        for m in _merge_adjacent_bands(nat_bands):
+            b = Block(kind="para", text=_clean_zh_text(m["t"]),
+                      kind_cls="body", src_text=m["t"])
+            # geo=None：自然语言带按列项参与栏序（hint 已按 x 中点定栏）。
+            # 传 rect 会让 _is_fullwidth 把跨几何中线的带升级成全宽分带
+            # ——作者区横跨中线的带会把同 y 左栏第一作者段落挤到后面
+            # （实测 paper3 p1 作者序 3rd/2nd/1st 错乱根因）
+            entries.append((m["r"].y0, m["r"].x0, m["hint"], b, None))
+        for r, t, hint in frag_bands:
+            grow = pymupdf.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2)
+            name = _crop(page, grow, f"ft{pno}_{len(baked_rects)}")
+            b = Block(kind="verbatim", img_name=name,
+                      width_pt=grow.width)
+            baked_rects.append(pymupdf.Rect(grow))
             entries.append((r.y0, r.x0, hint, b, r))
 
         blocks.extend(_order_page(entries, page, page_layouts))
@@ -451,6 +490,33 @@ def build_document_model(page_layouts: list[dict], doc,
 def _x_overlap(a: "pymupdf.Rect", b: "pymupdf.Rect") -> float:
     inter = max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
     return inter / max(min(a.width, b.width), 1.0)
+
+
+def _merge_adjacent_bands(bands: list[dict]) -> list[dict]:
+    """自然语言带回流的纵向并块（v0.8.1，reflow 特有）。
+
+    作者块/机构行在源文档是一个视觉单元，被图区检测边界切成多个碎块
+    （实测 paper3 p1 每位作者「姓名/机构」+「大学/邮箱」两块）；逐块
+    独立成段在重排后成为间距不均的散落行。同一纵向堆叠（横向重叠
+    ≥ 0.25 且纵向紧邻 gap ≤ 1.2×行高）的带并成一段——按 (栏, x, y)
+    排序聚堆（按 (y, x) 排会把左右并列的堆叠交错，实测并块失效）。
+    """
+    if len(bands) < 2:
+        return bands
+    bands = sorted(bands, key=lambda b: (b["hint"], b["r"].x0, b["r"].y0))
+    out: list[dict] = []
+    for b in bands:
+        if out:
+            p = out[-1]
+            gap = b["r"].y0 - p["r"].y1
+            h = max(p["r"].height, b["r"].height, 1.0)
+            if b["hint"] == p["hint"] and -0.3 * h <= gap <= 1.2 * h \
+                    and _x_overlap(p["r"], b["r"]) >= 0.25:
+                p["t"] = p["t"] + " " + b["t"]
+                p["r"] |= b["r"]
+                continue
+        out.append(dict(b))
+    return out
 
 
 def _trim_region(fr0: "pymupdf.Rect", fig_texts: list[dict],
@@ -571,9 +637,13 @@ def _order_page(entries: list[tuple], page, page_layouts: list[dict]) \
                 c = 0 if x < mid else 1
             col_items[c].append((y, x, b))
     ordered: list[Block] = []
+    # 排序键 y 做 2pt 桶量化：源 PDF 同行元素的 y0 常带亚像素抖动
+    # （实测 paper3 p1 两位作者 y0 差 0.001pt），不量化时 x 决胜永不
+    # 生效——同行右元素以微小 y 优势排到左元素前（3rd 排到 2nd 前）
+    qy = lambda v: round(v / 2.0)
     for c in (0, 1):
-        col_items[c].sort(key=lambda e: (e[0], e[1]))
-    dividers.sort(key=lambda e: (e[0], e[1]))
+        col_items[c].sort(key=lambda e: (qy(e[0]), e[1]))
+    dividers.sort(key=lambda e: (qy(e[0]), e[1]))
     c0 = c1 = 0
     for dy, _dx, db in dividers:
         while c0 < len(col_items[0]) and col_items[0][c0][0] < dy:
@@ -791,8 +861,10 @@ def render_reflow_document(page_layouts: list[dict], doc,
                            cross_full: dict, cross_skip: set,
                            formula_pixmaps: dict, typo, font_path: str,
                            lang: str, reflow_cfg, warnings: list[str],
-                           log) -> bytes:
-    """翻译完成的文档模型 → reflow PDF bytes（不触碰原 doc 页面）。"""
+                           log, dcache=None, doc_fp: "str | None" = None) \
+        -> bytes:
+    """翻译完成的文档模型 → reflow PDF bytes（不触碰原 doc 页面）。
+    v0.8.1 S4: dcache/doc_fp 提供时图/表/verbatim 位图裁剪入项目缓存。"""
     template = build_template(page_layouts, doc,
                               columns=getattr(reflow_cfg, "columns",
                                               "auto") or "auto")
@@ -800,7 +872,8 @@ def render_reflow_document(page_layouts: list[dict], doc,
         or _doc_body_size(page_layouts)
     blocks, images, bookmarks = build_document_model(
         page_layouts, doc, texts_by_page, cell_texts, cross_full,
-        cross_skip, formula_pixmaps, typo, warnings=warnings)
+        cross_skip, formula_pixmaps, typo, warnings=warnings,
+        dcache=dcache, doc_fp=doc_fp)
     log(f"reflow: template {template.page_w:.0f}x{template.page_h:.0f}pt "
         f"x {len(template.cols)} col(s); {len(blocks)} block(s), "
         f"{len(images)} bitmap(s)")
@@ -852,6 +925,15 @@ def render_reflow_document(page_layouts: list[dict], doc,
                             page_base + m["page"] + 1])
         page_base += len(seg_doc)
         seg_doc.close()
+
+    # 零内容守卫（实测：无可译块的纯扫描页文档 0 块 → 0 页 PDF，
+    # tobytes 直接 ValueError "cannot save with zero pages"）——落一页
+    # 空白页保输出合法，并告警提示内容缺失
+    if len(all_pdf) == 0:
+        all_pdf.new_page(width=template.page_w, height=template.page_h)
+        warnings.append(
+            "reflow: no translatable content (all pages scanned/empty?) "
+            "- output is a blank page")
 
     # 页码（页脚居中，首页封面惯例跳过）+ PDF 书签
     n_out = len(all_pdf)

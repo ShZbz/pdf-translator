@@ -221,7 +221,8 @@ def render_page(page, layout: dict, translated: list[dict],
                 archive: "pymupdf.Archive | None" = None,
                 font_css: str | None = None,
                 page_story: str = "off",
-                story_stats: dict | None = None) -> None:
+                story_stats: dict | None = None,
+                fonts: "dict | None" = None) -> None:
     """原地改造一页：redact 全部正文块 → 中文回灌 → display 公式位图回贴。
 
     layout:    layout_page() 输出
@@ -248,6 +249,10 @@ def render_page(page, layout: dict, translated: list[dict],
                  保持原行为，见验收门 d）。
     story_stats: v0.7.1 页级 Story 计数 {"story", "fallback", "reasons"}
                  （pipeline 汇总日志用），None 则不计数。
+    fonts:      v0.8.1 每文档一次的字体对象集（writer 路径用）：
+                {"body": pymupdf.Font, "latin": pymupdf.Font}。None 时本页
+                自建（旧行为）。pymupdf.Font(fontfile=…) 实测 ~93ms/个——
+                旧版每页重建，50 页文档白建 100+ 次。
     """
     paras = layout["paragraphs"]
     tmap = {t["index"]: t["text"] for t in translated}
@@ -272,35 +277,16 @@ def render_page(page, layout: dict, translated: list[dict],
     if links_before:
         restore_destroyed_links(page, links_before)
 
-    font = pymupdf.Font(fontfile=font_path)
-    tw = pymupdf.TextWriter(page.rect)
-    # v0.2.2: 标题用黑体族（typography 提供时）
-    tw_head = pymupdf.TextWriter(page.rect)
-    f_head = typography.f_head if typography else font
-    # 双语原文层字体:原文含 CJK(如 zh→en 反向)用目标 CJK 字体;西文原文用
-    # Times 系（覆盖西里尔/扩展拉丁，Helvetica 只有拉丁-1，俄语原文会豆腐块）
-    if _has_cjk("".join(p["text"] for p in paras)):
-        en_font = font
-    else:
-        en_path = (typography.en_body_path if typography
-                   else None) or resolve_original_font()
-        en_font = pymupdf.Font(fontfile=en_path) if en_path else pymupdf.Font("helv")
-    # D6 公式区 rects(双语 en 层防压公式位图)
+    # D6 公式区 rects(双语 en 层防压公式位图; htmlbox/writer 两路径共用)
     formula_rects = [pymupdf.Rect(f["bbox"]) for f in layout.get("formulas", [])]
-
-    body_size = None
-    if typography:
-        from collections import Counter
-        _sz: Counter = Counter()
-        for p in paras:
-            _sz[round(p.get("size") or dominant_size(p), 1)] += max(len(p["text"]), 1)
-        body_size = _sz.most_common(1)[0][0] if _sz else None
 
     # ---- 2/3. 回灌 + 公式回贴（按渲染引擎分流）----
     # v0.5.1 修复:旧版单元格先画进 writer 缓冲再判 renderer，htmlbox 分支
     # 提前 return → tw.write_text 永不执行，htmlbox 模式表格文字全部丢失
     # （redact 后空白）。现单元格与段落同引擎渲染，htmlbox 模式彻底无
     # writer 残留路径。
+    # v0.8.1: 字体/TextWriter 构建移入 writer 分支——htmlbox（默认）路径
+    # 完全不用它们，旧版每页白建 font/en_font 两个 Font（~93ms/个）
     if renderer == "htmlbox":
         if archive is None or font_css is None:
             archive, font_css = _build_font_archive(
@@ -340,6 +326,32 @@ def render_page(page, layout: dict, translated: list[dict],
         if formula_pixmaps:
             _paste_formula_pixmaps(page, formula_pixmaps, layout["formulas"])
         return
+
+    # ---- writer 路径专属资源 ----
+    font = (fonts or {}).get("body") or pymupdf.Font(fontfile=font_path)
+    tw = pymupdf.TextWriter(page.rect)
+    # v0.2.2: 标题用黑体族（typography 提供时）
+    tw_head = pymupdf.TextWriter(page.rect)
+    f_head = typography.f_head if typography else font
+    # 双语原文层字体:原文含 CJK(如 zh→en 反向)用目标 CJK 字体;西文原文用
+    # Times 系（覆盖西里尔/扩展拉丁，Helvetica 只有拉丁-1，俄语原文会豆腐块）
+    if _has_cjk("".join(p["text"] for p in paras)):
+        en_font = font
+    else:
+        en_font = (fonts or {}).get("latin")
+        if en_font is None:
+            en_path = (typography.en_body_path if typography
+                       else None) or resolve_original_font()
+            en_font = pymupdf.Font(fontfile=en_path) if en_path \
+                else pymupdf.Font("helv")
+
+    body_size = None
+    if typography:
+        from collections import Counter
+        _sz: Counter = Counter()
+        for p in paras:
+            _sz[round(p.get("size") or dominant_size(p), 1)] += max(len(p["text"]), 1)
+        body_size = _sz.most_common(1)[0][0] if _sz else None
 
     cell_map = cell_texts or {}
     for ci, cell in enumerate(cells):

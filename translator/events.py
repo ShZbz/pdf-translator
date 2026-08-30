@@ -36,6 +36,10 @@ class EventSink:
         self._stage = ""               # 当前阶段标签（v0.7.1）
         self._subs: list[Callable[[dict], None]] = []   # v0.7.1 订阅者
         self._cmds: list[dict] = []    # v0.7.1 命令通道（入站队列）
+        # v0.8.1: 警告事件按文本去重——同一警告可能同时走 llm._warn 与
+        # pipeline._WarningList 转发两条路（stats 列表保留全部出现，
+        # 仅事件流去重；UI 快照的 40 条上限不再被重复文本挤占）
+        self._warn_seen: set = set()
 
     def emit(self, kind: str, **fields) -> None:
         with self._lock:
@@ -66,6 +70,15 @@ class EventSink:
         self.emit("progress", done=done, total=total, **extra)
 
     def warning(self, msg: str) -> None:
+        """发警告事件（同文本每 sink 实例只发一次——见 _warn_seen）。
+
+        去重只作用于事件流；stats["warnings"] 列表由各生产方自行维护，
+        保留每次出现（CLI 完整打印行为不变）。
+        """
+        with self._lock:
+            if msg in self._warn_seen:
+                return
+            self._warn_seen.add(msg)
         self.emit("warning", msg=msg)
 
     def page_done(self, pno: int, total: int) -> None:

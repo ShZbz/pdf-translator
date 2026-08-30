@@ -68,10 +68,22 @@ def _cfg(src: Path, tmp_path: Path, **llm_kw) -> Config:
 # ---------- 1. 批字符预算组批 ----------
 
 def test_pack_batches_char_budget():
+    """v0.8.1 first-fit：放入第一个装得下的开批，否则开新批（省批数）。
+
+    旧顺序贪心给 [[0], [1, 2]]——批 0 的 10 字符余量被浪费；first-fit
+    让 z(5) 回填批 0（25 ≤ 30）。预算/段数上限语义不变。
+    """
     tc = TranslationClient(EchoLLM(), model="m", batch_size=10,
                            batch_char_budget=30)
     paras = ["x" * 20, "y" * 20, "z" * 5]
-    assert tc._pack_batches([0, 1, 2], paras) == [[0], [1, 2]]
+    batches = tc._pack_batches([0, 1, 2], paras)
+    assert batches == [[0, 2], [1]]
+    # 不变量：全覆盖无重复、批内不超预算（独占批除外）、批内序升序
+    assert sorted(i for b in batches for i in b) == [0, 1, 2]
+    for b in batches:
+        assert len(b) <= 10
+        assert sum(len(paras[i]) for i in b) <= 30 or len(b) == 1
+        assert b == sorted(b)
 
 
 def test_pack_batches_long_para_alone():
@@ -105,7 +117,8 @@ def test_translate_paragraphs_char_budget_splits_calls():
     paras = ["x" * 20, "y" * 20, "z" * 5]
     out, calls = tc.translate_paragraphs(paras)
     assert calls == 2
-    assert [len(c) for c in fake.calls] == [1, 2]   # 2 段/1 段切分
+    # v0.8.1 first-fit 切分：z 回填批 0（20+5≤30）→ 2 段/1 段
+    assert sorted(len(c) for c in fake.calls) == [1, 2]
     assert all(o.startswith("【译】") for o in out)
 
 

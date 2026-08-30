@@ -836,7 +836,7 @@ function collectConfig() {
       preserve_formatting: $('cfg-formatting').checked,
       glossary_lock: $('cfg-glosslock').checked,
       translation_cache: $('cfg-cache').checked,
-      bilingual: $('cfg-bilingual').checked,
+      bilingual: $('cfg-bilingual').checked && $('cfg-outmode').value !== 'reflow',
       renderer: $('cfg-renderer').value || 'htmlbox',
     },
     fit: { ...fit0, mode: $('cfg-fitmode').value || 'auto' },
@@ -878,7 +878,18 @@ function updateQuotaFields() {
 
 /* 流畅阅读·栏结构仅在输出模式=流畅阅读时相关，其余模式隐藏该行 */
 function updateReflowRow() {
-  $('row-reflowcols').style.display = $('cfg-outmode').value === 'reflow' ? '' : 'none';
+  const isReflow = $('cfg-outmode').value === 'reflow';
+  $('row-reflowcols').style.display = isReflow ? '' : 'none';
+  /* v0.8.1: 流畅阅读×双语联动——后端 load_config 会拒绝该组合，旧版前端
+     无提示，用户要等 worker 报错才知道。这里切换即禁用+自动关闭双语开关 */
+  const bl = $('cfg-bilingual');
+  bl.disabled = isReflow;
+  const row = bl.closest('.set-row');
+  if (row) row.style.opacity = isReflow ? .45 : '';
+  if (isReflow && bl.checked) {
+    bl.checked = false;
+    toast('流畅阅读模式不支持双语对照，已自动关闭双语开关');
+  }
 }
 $('cfg-outmode').addEventListener('change', updateReflowRow);
 
@@ -1387,6 +1398,9 @@ function setBar(pct, indet=false) {
 }
 
 const STAGE_NAMES = { layout: '布局分析', translate: 'LLM 翻译', render: '渲染回灌' };
+/* v0.8.1: 进度条单调上限（流式重叠模式下批总数逐批增长，done/total 先
+   到 100% 再回落会视觉回跳——条只升不降，文本仍显示真实 done/total） */
+let barMaxPct = 0;
 const TERMINAL = ['done', 'error', 'cancelled'];
 
 function updateProgressUI(j) {
@@ -1423,7 +1437,13 @@ function updateProgressUI(j) {
     if (j.status === 'paused') s = `⏸ 已暂停（${s}）`;
     if (j.queue_len > 0) s += ` · 队列中还有 ${j.queue_len} 个任务`;
     $('statusLine').textContent = s;
-    if (p && p.total > 0) setBar(Math.round(100 * p.done / p.total));
+    if (p && p.total > 0) {
+      /* v0.8.1: 流式布局-翻译重叠下批总数逐批增长（总批数事先未知），
+         done/total 会先到 100% 再回落——进度条按单调上限渲染不回跳 */
+      const pct = Math.round(100 * p.done / p.total);
+      barMaxPct = Math.max(barMaxPct || 0, pct);
+      setBar(barMaxPct);
+    }
     else setBar(0, true);
   }
   // v0.5.0: 警告列表（服务端 v0.5.0 起透传管线 warning 事件，旧版被丢弃）
@@ -1535,6 +1555,7 @@ $('btnTranslate').onclick = async () => {
       input, output_dir: $('outputDir').value.trim(), config: CFG,
     })});
     $('warnList').textContent = ''; $('doneRow').classList.remove('show');
+    barMaxPct = 0;   // v0.8.1: 新任务重置进度条单调上限
     if (r.queued) {
       toast(`已加入队列（当前任务完成后自动开始）`);
     } else {

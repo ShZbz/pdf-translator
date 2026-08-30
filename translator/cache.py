@@ -52,6 +52,24 @@ class TranslationCache:
         if self.max_entries and self._put_count % 256 == 0:
             self.prune()
 
+    def put_many(self, rows: "list[tuple[str, str, str]]") -> None:
+        """v0.8.1: 批量写（单事务单 commit）。
+
+        旧版逐条 put——每条一个 commit（SQLite 每 commit 一次 fsync），
+        新文档数百段就是数百次 fsync。调用方按批聚合后整事务落盘，
+        中断语义：事务原子（要么全进要么全无，不留半批）。
+        """
+        if not rows:
+            return
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO cache (k, src, dst, created) "
+                "VALUES (?,?,?, datetime('now'))",
+                rows)
+        self._put_count += len(rows)
+        if self.max_entries and self._put_count % 256 < len(rows):
+            self.prune()
+
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
 
