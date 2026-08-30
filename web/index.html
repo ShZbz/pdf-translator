@@ -187,6 +187,10 @@ h1 { font-size:21px; font-weight:600; letter-spacing:.2px; margin-bottom:4px; }
 .pane { display:none; }
 .pane.active { display:block; animation:paneIn .3s var(--spring) both; }
 @keyframes paneIn { from{opacity:0; transform:translateX(10px);} to{opacity:1; transform:none;} }
+/* 分组小标题：把长设置列表切成视觉段落 */
+.pane-cap { font-size:11px; font-weight:600; color:var(--text-dim); letter-spacing:1px;
+  margin:16px 0 10px; padding-top:12px; border-top:0.8px solid var(--glass-border); }
+.pane-cap:first-child { margin-top:0; padding-top:0; border-top:none; }
 .set-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:13px; }
 /* v0.5.2: 标签占满左列、控件固定宽贴右——开关/下拉/输入框右侧对齐 */
 .set-row > label:not(.switch) { font-size:13.5px; flex:1; min-width:0; }
@@ -399,7 +403,7 @@ body.dragging::after {
 <!-- 主卡片 -->
 <div class="card">
   <h1>PDF 翻译器</h1>
-  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · v0.7.1</div>
+  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · <span id="uiVersion">v0.8.0</span></div>
 
   <div class="field">
     <input type="text" id="inputPath" placeholder="翻译原文件路径 (.pdf)" spellcheck="false">
@@ -465,7 +469,7 @@ body.dragging::after {
 
     <!-- 模型 -->
     <div class="pane active" id="pane-model">
-      <div class="set-row"><label>Provider</label>
+      <div class="set-row"><label>服务商</label>
         <select id="cfg-provider"></select></div>
       <div class="set-row"><label>模型名<span class="tip" data-tip="如 deepseek-v4-flash / glm-4.7-flash">?</span></label>
         <input type="text" id="cfg-model"></div>
@@ -481,12 +485,13 @@ body.dragging::after {
 
     <!-- 翻译 -->
     <div class="pane" id="pane-trans">
-      <div class="set-row"><label>源语言<span class="tip" data-tip="版面识别启发式针对英文文献优化">?</span></label>
+      <div class="pane-cap">语言与术语</div>
+      <div class="set-row"><label>源语言<span class="tip" data-tip="版面分析按英文文献优化，其他语言文档的段落识别效果可能略差">?</span></label>
         <select id="cfg-srclang"></select></div>
       <div class="set-row"><label>目标语言</label>
         <select id="cfg-tgtlang"></select></div>
       <div class="set-row" style="align-items:flex-start;">
-        <label style="padding-top:8px;">术语表 (YAML)<span class="tip" data-tip="锁定专业术语一致性">?</span></label>
+        <label style="padding-top:8px;">术语表 (YAML)<span class="tip" data-tip="表中的词按固定译法翻译，保证同一术语全文一致">?</span></label>
         <div class="glz-col">
           <input type="text" id="cfg-glossary" placeholder="路径，可空">
           <div class="glz-loaded" id="glzLoaded"></div>
@@ -498,94 +503,109 @@ body.dragging::after {
             </button>
           </div>
         </div></div>
-      <div class="set-row"><label>期刊排版<span class="tip" data-tip="按目标语言选字体：中文宋体/黑体，日韩相应字体，西文 Times 系">?</span></label>
+
+      <div class="pane-cap">版面与输出</div>
+      <div class="set-row"><label>期刊排版<span class="tip" data-tip="按目标语言选用印刷字体（中文宋体/黑体、西文 Times 系），输出更像正式出版物；关闭则用统一默认字体">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-formatting" checked><span class="slider"></span></label></div>
-      <div class="set-row"><label>水印移除<span class="tip" data-tip="仅文字层水印（出版社声明类）；扫描图片型水印无法移除">?</span></label>
+      <div class="set-row"><label>水印移除<span class="tip" data-tip="只移除文字型水印（出版社声明类）；扫描图片里的水印无法去除">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-watermark" checked><span class="slider"></span></label></div>
-      <div class="set-row"><label>双语对照模式</label>
+      <div class="set-row"><label>双语对照模式<span class="tip" data-tip="译文与原文对照呈现，便于核对原文；输出页数约增加一倍，不支持流畅阅读模式">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-bilingual"><span class="slider"></span></label></div>
-      <div class="set-row"><label>扫描页译文呈现<span class="tip" data-tip="附录页=译文插附加页（稳）；原位回贴=白块覆盖原位回灌（观感更好）；版面重建=区域几何来自 GNN 影子页/几何分割（与 OCR 识别质量解耦），译文按区域回灌+原文对照附录页">?</span></label>
-        <select id="cfg-ocrmode">
-          <option value="appendix">附录页（默认）</option>
-          <option value="inplace">原位回贴</option>
-          <option value="reconstruct">版面重建（v0.7.0）</option>
-        </select></div>
-      <div class="set-row"><label>OCR 引擎<span class="tip" data-tip="多引擎投票：可用引擎对同一页各行按 IoU 对齐，一致取一致、冲突取置信度最高并告警。paddle/rapidocr/tesseract 需分别安装；未装的自动跳过">?</span></label>
-        <div style="display:flex;gap:10px;align-self:center;font-size:12px;">
-          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-paddle" checked>paddle</label>
-          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-rapidocr">rapidocr</label>
-          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-tesseract">tesseract</label>
-        </div></div>
-      <div class="set-row"><label>渲染引擎<span class="tip" data-tip="htmlbox=HTML+CSS 排版引擎（v0.5.1 起默认，自带两端对齐/复杂文字整形，支持阿拉伯语等 RTL）；writer=逐字排印（遗留路径）">?</span></label>
+      <div class="set-row"><label>渲染引擎<span class="tip" data-tip="排版输出引擎。htmlbox=HTML 排版引擎，支持两端对齐与阿拉伯语等从右向左文字（默认）；TextWriter=旧引擎，仅在输出异常时备用">?</span></label>
         <select id="cfg-renderer">
-          <option value="htmlbox">insert_htmlbox（默认）</option>
-          <option value="writer">TextWriter（遗留）</option>
+          <option value="htmlbox">htmlbox（默认）</option>
+          <option value="writer">TextWriter（备用）</option>
         </select></div>
-      <div class="set-row"><label>排版自适配<span class="tip" data-tip="v0.6.0：两遍式渲染——先测量全文按样式类（正文/图注/文献/表格）算统一字号因子再重排回灌，同类字号永远一致。膨胀方向自动走 扩框→微压行距→类级缩字 阶梯；收缩方向低填充文档微升字号。off=回到逐段独立缩放（字号可能大小不一）">?</span></label>
+      <div class="set-row"><label>排版自适配<span class="tip" data-tip="自动统一全文译文字号：先测量全文，按“扩大文本框→压缩行距→缩小字号”的顺序消化过长译文（翻译时同步告知每段字数上限，从源头控制长度），同类文字（正文/图注/文献）字号始终一致。关闭后逐段独立缩放，字号可能忽大忽小">?</span></label>
         <select id="cfg-fitmode">
           <option value="auto">自动（默认）</option>
-          <option value="off">关闭（遗留）</option>
+          <option value="off">关闭</option>
         </select></div>
-      <div class="set-row"><label>源头控长<span class="tip" data-tip="翻译时把每段目标框的字符预算告知模型，超长段自动带强约束重译一次——从上游减少溢出；随「排版自适配」自动开启">?</span></label>
-        <span style="opacity:.7;font-size:12px;align-self:center;">随排版自适配自动开启</span></div>
-      <div class="set-row"><label>页级整页排版<span class="tip" data-tip="v0.7.1：整页段落进单个流式排版引擎逐段落位（页几何冻结），段间基线共享连续网格，消除段间 baseline 抖动。auto=页级预检全过才启用（预检失败的页自动整页回退逐段排版）；on=尽量启用；off=关闭">?</span></label>
+      <div class="set-row"><label>页级整页排版<span class="tip" data-tip="整页段落按统一网格排版，消除相邻段落行位错跳的现象。自动=先预检，仅对能安全套用的页面启用，失败的页自动退回逐段排版；强制开启=所有页尽量套用；关闭=全部逐段排版">?</span></label>
         <select id="cfg-pagestory">
           <option value="auto">自动（默认）</option>
           <option value="on">强制开启</option>
           <option value="off">关闭</option>
         </select></div>
+      <div class="set-row"><label>输出模式<span class="tip" data-tip="对照阅读=版面 1:1 保留原文档排版，适合对照原文精读（默认）；流畅阅读=整册按语义重排为连续书页，公式/图/表以图片随文嵌入，附页码与书签，适合通读长文。流畅阅读不支持双语对照与扫描页">?</span></label>
+        <select id="cfg-outmode">
+          <option value="faithful">对照阅读（默认）</option>
+          <option value="reflow">流畅阅读</option>
+        </select></div>
+      <div class="set-row" id="row-reflowcols" style="display:none;"><label>流畅阅读·栏结构<span class="tip" data-tip="沿用原文档=保留原文档的栏数与栏宽；强制单栏=重排为单栏，适合手机或窄屏阅读">?</span></label>
+        <select id="cfg-reflowcols">
+          <option value="auto">沿用原文档（默认）</option>
+          <option value="single">强制单栏</option>
+        </select></div>
+
+      <div class="pane-cap">扫描件</div>
+      <div class="set-row"><label>扫描页译文呈现<span class="tip" data-tip="扫描页（图片页）译文的呈现方式。附录页=原文页面不动，译文集中附在文档末尾，最稳妥；原位回贴=译文覆盖在原文位置上，阅读直观，但覆盖范围依赖文字识别结果，复杂版面可能遮不准；版面重建=先重建页面版面结构再填入译文，位置最准，耗时也最长，并附原文对照页">?</span></label>
+        <select id="cfg-ocrmode">
+          <option value="appendix">附录页（默认）</option>
+          <option value="inplace">原位回贴</option>
+          <option value="reconstruct">版面重建</option>
+        </select></div>
+      <div class="set-row"><label>OCR 引擎<span class="tip" data-tip="勾选多个时各引擎互相校对识别结果，文字识别更准，但耗时成倍增加；未安装的引擎自动跳过">?</span></label>
+        <div style="display:flex;gap:10px;align-self:center;font-size:12px;">
+          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-paddle" checked>paddle</label>
+          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-rapidocr">rapidocr</label>
+          <label style="display:flex;gap:4px;align-items:center;"><input type="checkbox" id="cfg-ocr-tesseract">tesseract</label>
+        </div></div>
     </div>
 
     <!-- 性能 -->
     <div class="pane" id="pane-perf">
-      <div class="set-row"><label>并发数<span class="tip" data-tip="免费档建议 1">?</span></label>
+      <div class="pane-cap">速度</div>
+      <div class="set-row"><label>并发数<span class="tip" data-tip="同时请求模型的数量。调大翻译更快，但更容易触发服务商限流；免费或低配额账号建议 1">?</span></label>
         <input type="text" id="cfg-workers" value="3"></div>
-      <div class="set-row"><label>批大小<span class="tip" data-tip="每批段落数上限（v0.4.3 起另有字符预算）">?</span></label>
+      <div class="set-row"><label>批大小<span class="tip" data-tip="每次请求发给模型的段落数上限。适当增大可让模型参考同批上下文，译文衔接更连贯；过大则单次失败需要重译的内容更多">?</span></label>
         <input type="text" id="cfg-batchsize" value="6"></div>
-      <div class="set-row"><label>批字符预算<span class="tip" data-tip="~3000 字符/批，长短段不混批；0=仅按段数；设置配额后可留默认自动换算">?</span></label>
+      <div class="set-row"><label>批字符预算<span class="tip" data-tip="每批字符数上限，防止单批过长被模型截断。填写 RPM/TPM 配额后由系统自动换算，无需手动调整">?</span></label>
         <input type="text" id="cfg-batchchars" value="3000"></div>
-      <div class="set-row"><label>Provider 配额 RPM<span class="tip" data-tip="每分钟请求上限；设置后自动换算调用间隔与批预算（v0.5.0，显式配置优先）">?</span></label>
+      <div class="set-row"><label>服务商配额 RPM<span class="tip" data-tip="服务商允许的每分钟请求数。填入后系统自动安排调用节奏，避免触发限流；0=不限">?</span></label>
         <input type="text" id="cfg-rpm" value="0" inputmode="numeric"></div>
-      <div class="set-row"><label>Provider 配额 TPM<span class="tip" data-tip="每分钟 token 上限；与 RPM 同时设置时自动换算批字符预算">?</span></label>
+      <div class="set-row"><label>服务商配额 TPM<span class="tip" data-tip="服务商允许的每分钟 token 数，与 RPM 同时填写时批大小自动按配额换算；0=不限">?</span></label>
         <input type="text" id="cfg-tpm" value="0" inputmode="numeric"></div>
-      <div class="set-row"><label>布局并行数<span class="tip" data-tip="版面分析进程数；0=自动，1=串行">?</span></label>
+      <div class="set-row"><label>布局并行数<span class="tip" data-tip="版面分析的并行进程数，调大可加快大文档的版面分析；0=自动">?</span></label>
         <input type="text" id="cfg-layoutworkers" value="0"></div>
-      <div class="set-row"><label>布局-翻译重叠<span class="tip" data-tip="v0.7.0：大文档布局后台逐页产出、翻译批随页发车（省整段布局时间）。auto=启发式引擎且 ≥12 页自动启用；on=无条件；off=关闭">?</span></label>
+      <div class="set-row"><label>布局-翻译重叠<span class="tip" data-tip="版面分析与翻译同时进行：分析完一页立即开始翻译该页，省去整册分析完毕才开始翻译的等待，大文档总耗时明显缩短。自动=大文档（约 12 页以上）自动启用；始终开启=小文档也启用，收益有限；关闭=先完成全部版面分析再翻译，流程最保守">?</span></label>
         <select id="cfg-overlap">
           <option value="auto">自动（默认）</option>
           <option value="on">始终开启</option>
           <option value="off">关闭</option>
         </select></div>
-      <div class="set-row"><label>流式解码<span class="tip" data-tip="stream=True 增量收译文，收齐即断流（省 10-30% 批耗时）；网关不支持自动退非流式">?</span></label>
+      <div class="set-row"><label>流式解码<span class="tip" data-tip="译文逐段接收、收到即写入，比等整批完成快 10–30%；服务商不支持时自动改用普通模式。不影响译文质量">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-stream" checked><span class="slider"></span></label></div>
-      <div class="set-row"><label>句子级缓存<span class="tip" data-tip="参考文献/图注等模板文本按句跨文档复用（全命中才免调）；正文句不启用">?</span></label>
+      <div class="set-row"><label>句子级缓存<span class="tip" data-tip="参考文献、图注等模板化句子跨文档复用，整段全命中时不再调用模型——更省时间与费用；正文句子不受影响">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-sentcache" checked><span class="slider"></span></label></div>
-      <div class="set-row"><label>调用间隔 (秒)<span class="tip" data-tip="限流严调大">?</span></label>
+      <div class="pane-cap">限流与重试</div>
+      <div class="set-row"><label>调用间隔 (秒)<span class="tip" data-tip="两次请求之间的最小间隔。频繁被限流时调大">?</span></label>
         <input type="text" id="cfg-interval" value="2"></div>
-      <div class="set-row"><label>调用上限<span class="tip" data-tip="单文档防跑飞">?</span></label>
+      <div class="set-row"><label>调用上限<span class="tip" data-tip="单个文档最多允许的模型调用次数，防止异常情况无限消耗额度">?</span></label>
         <input type="text" id="cfg-maxcalls" value="40"></div>
-      <div class="set-row"><label>重试次数</label>
+      <div class="set-row"><label>重试次数<span class="tip" data-tip="请求失败后的自动重试次数；设得过大，服务不可用时会等待更久">?</span></label>
         <input type="text" id="cfg-retries" value="2"></div>
     </div>
 
     <!-- 高级 -->
     <div class="pane" id="pane-adv">
-      <div class="set-row"><label>翻译缓存<span class="tip" data-tip="二次运行零调用">?</span></label>
+      <div class="pane-cap">缓存与术语</div>
+      <div class="set-row"><label>翻译缓存<span class="tip" data-tip="同一文档的译文结果存档复用：再次翻译不再调用模型，改 1 页只重译 1 页；关闭则每次全部重译">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-cache" checked><span class="slider"></span></label></div>
-      <div class="set-row"><label>缓存位置<span class="tip" data-tip="v0.7.1 项目级缓存库目录（空=自动：输入文件所在目录，只读时退输出目录）。同一输入译到不同输出目录共享翻译缓存与版面缓存，文档按内容指纹索引——改 1 页只重译 1 页">?</span></label>
+      <div class="set-row"><label>缓存位置<span class="tip" data-tip="翻译缓存的存放目录。留空=自动放在输入文件旁；同一文档译到不同目录时共用缓存">?</span></label>
         <input type="text" id="cfg-cachedir" placeholder="自动（输入文件目录）"></div>
-      <div class="set-row"><label>术语锁定校验</label>
+      <div class="set-row"><label>术语锁定校验<span class="tip" data-tip="译后自动核对术语是否按术语表翻译，残留原文的自动替换为目标译法；保持术语一致，不增加模型调用">?</span></label>
         <label class="switch"><input type="checkbox" id="cfg-glosslock" checked><span class="slider"></span></label></div>
-      <hr style="border:none;border-top:0.8px solid var(--glass-border);margin:14px 0 16px;">
-      <div class="set-row"><label>Temperature<span class="tip" data-tip="默认 0 · 建议 0–0.5 固定风格">?</span></label>
+      <div class="pane-cap">模型调用微调</div>
+      <div class="set-row"><label>Temperature<span class="tip" data-tip="模型的“发挥”程度：数值越大，用词越发散、更有文采，但越容易偏离原文、术语不稳定；越小越忠实保守。翻译建议 0–0.3，0 最稳">?</span></label>
         <input type="text" id="cfg-temperature" value="0" inputmode="decimal"></div>
-      <div class="set-row"><label>请求超时 (秒)<span class="tip" data-tip="默认 120 · 慢模型调大至 180–300">?</span></label>
+      <div class="set-row"><label>请求超时 (秒)<span class="tip" data-tip="等待模型响应的最长时间。慢模型频繁误报超时时调大（如 180–300）；过小会把正常响应误判为失败">?</span></label>
         <input type="text" id="cfg-timeout" value="120" inputmode="decimal"></div>
-      <div class="set-row"><label>传输重试退避起点 (秒)<span class="tip" data-tip="默认 8 · 建议 5–15">?</span></label>
+      <div class="set-row"><label>传输重试退避起点 (秒)<span class="tip" data-tip="请求失败后首次重试前的等待秒数，之后逐次加倍；一般保持默认">?</span></label>
         <input type="text" id="cfg-backoffbase" value="8" inputmode="decimal"></div>
-      <div class="set-row"><label>退避上限 (秒)<span class="tip" data-tip="默认 30 · 建议 20–60">?</span></label>
+      <div class="set-row"><label>退避上限 (秒)<span class="tip" data-tip="重试等待的最大秒数，保持默认">?</span></label>
         <input type="text" id="cfg-backoffcap" value="30" inputmode="decimal"></div>
-      <div class="set-row"><label>限流等待封顶 (秒)<span class="tip" data-tip="默认 60 · 建议 30–120">?</span></label>
+      <div class="set-row"><label>限流等待封顶 (秒)<span class="tip" data-tip="被限流时单次最长等待秒数；服务商限流严格时可调大">?</span></label>
         <input type="text" id="cfg-retrycaps" value="60" inputmode="decimal"></div>
       <div class="save-float"><button id="btnSaveCfg">保存设置</button></div>
     </div>
@@ -711,6 +731,7 @@ async function loadConfig() {
   try {
     const d = await api('/api/config');
     CFG = d.config || {};
+    if (d.version) $('uiVersion').textContent = 'v' + d.version;   // 版本号唯一显示位（主界面副标题）
     const llm = CFG.llm || {};
     $('cfg-provider').value = llm.provider || 'deepseek';
     $('cfg-model').value = llm.model || '';
@@ -726,6 +747,8 @@ async function loadConfig() {
     $('cfg-renderer').value = (CFG.features||{}).renderer || 'htmlbox';
     $('cfg-fitmode').value = (CFG.fit||{}).mode || 'auto';
     $('cfg-pagestory').value = (CFG.render||{}).page_story || 'auto';
+    $('cfg-outmode').value = (CFG.output||{}).mode || 'faithful';
+    $('cfg-reflowcols').value = (CFG.reflow||{}).columns || 'auto';
     $('cfg-ocrmode').value = (CFG.ocr||{}).mode || 'appendix';
     // v0.7.0: OCR 引擎多选（engines 空 = 单引擎 engine）
     const ocrEngines = (CFG.ocr||{}).engines
@@ -760,6 +783,7 @@ async function loadConfig() {
       ? CFG.glossary_sources : [];
     refreshGlossaryStatus();   // v0.5.2: 配置载入后刷新术语表「已加载」状态
     updateQuotaFields();       // v0.7.1: 载入后同步配额字段的禁用态
+    updateReflowRow();         // 载入后同步栏结构行的显隐
     if (d.first_run) openWizard();   // v0.7.1: 首启向导
   } catch(e) { console.warn('loadConfig', e); }
 }
@@ -817,6 +841,8 @@ function collectConfig() {
     },
     fit: { ...fit0, mode: $('cfg-fitmode').value || 'auto' },
     render: { ...(CFG.render||{}), page_story: $('cfg-pagestory').value || 'auto' },
+    output: { ...(CFG.output||{}), mode: $('cfg-outmode').value || 'faithful' },
+    reflow: { ...(CFG.reflow||{}), columns: $('cfg-reflowcols').value || 'auto' },
     glossary_file: $('cfg-glossary').value.trim(),
     glossary_sources: glzSources.slice(),   // v0.5.2: 合并来源清单（批量导入记忆）
     performance: {
@@ -849,6 +875,12 @@ function updateQuotaFields() {
   $('cfg-batchchars').disabled = rpm > 0 && tpm > 0;
 }
 ['cfg-rpm', 'cfg-tpm'].forEach(id => $(id).addEventListener('input', updateQuotaFields));
+
+/* 流畅阅读·栏结构仅在输出模式=流畅阅读时相关，其余模式隐藏该行 */
+function updateReflowRow() {
+  $('row-reflowcols').style.display = $('cfg-outmode').value === 'reflow' ? '' : 'none';
+}
+$('cfg-outmode').addEventListener('change', updateReflowRow);
 
 (function initProviders() {
   const sel = $('cfg-provider');

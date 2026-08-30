@@ -72,10 +72,13 @@ performance:
                                     # 翻译批随页发车，大文档省整段布局时间）；
                                     # on=无条件启用；off=关闭
 
-# ---- v0.7.1 双模式输出与渲染微调 ----
+# ---- v0.8.0 双模式输出与渲染微调 ----
 output:
-  mode: faithful                    # faithful=版面1:1对照（默认）。
-                                    # reflow=整文档语义重排（P3 提供，当前配置会报错）
+  mode: faithful                    # faithful=版面1:1对照（默认，服务对照阅读）。
+                                    # reflow=整文档语义重排（v0.8.0 P3）：文档模型
+                                    # → 新模板 → Story 流式写入自动断页，页面对应
+                                    # 关系不存在，输出名带 -reflow 后缀，附页码与
+                                    # PDF 书签；不支持双语与扫描页
 render:
   page_story: auto                  # faithful 模式整页 Story 接管（v0.7.1 P1）：
                                     # 整页段落进单个流式排版引擎逐段落位（页几何
@@ -84,12 +87,25 @@ render:
                                     #（失败页自动整页回退逐段排版）；on=尽量启用；
                                     # off=关闭。仅 htmlbox+fit auto+非双语生效
 
+# ---- reflow 模板/样式（v0.8.0 P3，仅 output.mode: reflow 读取）----
+reflow:
+  columns: auto                     # auto=沿用原文档主导栏数与栏宽（默认）；
+                                    # single=强制单栏
+  body_size: 0                      # 正文字号 pt（0=沿用原文档 body 众数字号，
+                                    # 保持视觉延续；预设行距 1.4/H1 16/H2 13/
+                                    # 图注 8.5/文献 9pt 恒定）
+  segment_blocks: 500               # 单 Story 块数软上限（超长文档在章节边界
+                                    # 分段写入防内存）
+
 features:
   watermark_removal: true           # 三层水印移除
   preserve_formatting: true         # 期刊排版（宋体正文/黑体标题）
   glossary_lock: true               # 术语一致性校验
   translation_cache: true           # SQLite 缓存，二次运行零调用
-  bilingual: false                  # true=双语对照模式
+  bilingual: false                  # true=双语对照模式（v0.8.0 起每段
+                                    # “译文行+弱化原文行”以表格语义同框两行
+                                    # 排布，行高按内容自然分配；装不下自动
+                                    # 回退译文上/原文下切框布局）
   renderer: htmlbox                 # v0.5.1 渲染器：htmlbox=insert_htmlbox
                                     # HTML+CSS 排版引擎（默认，自带两端对齐/
                                     # 复杂文字整形，支持阿拉伯语等 RTL）；

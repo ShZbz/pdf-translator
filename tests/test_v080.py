@@ -289,224 +289,6 @@ def test_render_story_whole_page_placement():
                 lang="zh", page_story="on", story_stats=stats)
     assert stats["story"] == 1 and stats["fallback"] == 0, stats["reasons"]
     out = doc[0]
-    for i, p in enumerate(paras):
-        r = pymupdf.Rect(p["bbox"])
-        got = out.get_text("text", clip=r).replace("\n", "")
-        assert f"【译】{p['text']}" in got, f"para {i} not in its box: {got!r}"
-    # 相邻段不串位：段 k 的译文不出现在段 k±1 框内
-    for i in range(len(paras)):
-        nb = pymupdf.Rect(paras[i]["bbox"])
-        nb.y0 -= 60
-        nb.y1 += 60
-        for j, p in enumerate(paras):
-            if j == i:
-                continue
-            r = pymupdf.Rect(p["bbox"])
-            if nb.intersects(r):
-                inter = pymupdf.Rect(nb)
-                inter.intersect(r)
-                got = out.get_text("text", clip=inter).replace("\n", "")
-                assert f"【译】{p['text']}" not in got, \
-                    f"para {j} spilled into neighbor {i}"
-
-
-def test_render_story_overflow_falls_back():
-    """超长段（译文超预算且禁缩）：预检拦截 → 整页回退 → 兜底仍出字。"""
-    font_path = _cjk_font_or_skip()
-    long_text = "超长" * 300          # 远超 50pt 框预算
-    paras = [_para(0, pymupdf.Rect(30, 20, 280, 70), "正常段落。"),
-             _para(1, pymupdf.Rect(30, 90, 280, 140), "第二段。")]
-    translated = [{"index": 0, "text": long_text},
-                  {"index": 1, "text": "【译】第二段。"}]
-    doc, page, layout = _story_page(paras)
-    stats = {"story": 0, "fallback": 0, "reasons": []}
-    from translator.render import render_page
-    render_page(page, layout, translated, font_path, renderer="htmlbox",
-                lang="zh", page_story="on", story_stats=stats)
-    assert stats["fallback"] == 1 and stats["story"] == 0, stats["reasons"]
-    out = doc[0]
-    full = out.get_text("text")
-    assert "第二段。" in full or "【译】第二段。" in full
-    # 兜底必出字：超长段不能整段消失
-    assert "超长" in full
-
-
-def test_render_story_off_and_bilingual_keep_legacy():
-    """page_story=off / 双语模式：不进 story 路径（计数全零）。"""
-    font_path = _cjk_font_or_skip()
-    paras = [_para(0, pymupdf.Rect(30, 20, 280, 70), "Hello world paragraph.")]
-    translated = [{"index": 0, "text": "【译】你好世界段落。"}]
-    for mode, bilingual in (("off", False), ("on", True)):
-        doc, page, layout = _story_page([dict(paras[0])])
-        stats = {"story": 0, "fallback": 0, "reasons": []}
-        from translator.render import render_page
-        render_page(page, layout, translated, font_path, renderer="htmlbox",
-                    lang="zh", page_story=mode, story_stats=stats,
-                    bilingual=bilingual)
-        assert stats["story"] == 0 and stats["fallback"] == 0, \
-            f"mode={mode} bilingual={bilingual}: {stats}"
-
-
-def test_verify_flow_detects_spill():
-    """落墨前预演：框高不足时逐框对账必须拦截（不落墨）。"""
-    from translator.render_story import _verify_flow, build_page_story
-    font_path = _cjk_font_or_skip()
-    from translator.render import collect_para_specs
-    paras = [_para(0, pymupdf.Rect(30, 20, 280, 30), "很长很长" * 40)]
-    translated = [{"index": 0, "text": "很" * 200}]
-    specs = collect_para_specs(paras, {0: "很" * 200}, None, False, [],
-                               "zh", page_h=400)
-    html, css, _mc = build_page_story(specs, None, "")
-    boxes = [pymupdf.Rect(s["rect"]) for s in specs]
-    ok, why = _verify_flow(html, css, boxes, None)
-    assert ok, f"should fit when box is generous: {why}"
-    # 框压到 12pt：内容必然漫延（box 耗尽 → False）
-    small = [pymupdf.Rect(30, 20, 280, 32)]
-    ok2, why2 = _verify_flow(html, css, small, None)
-    assert not ok2
-
-
-def test_config_output_render_keys(tmp_path):
-    """output.mode/render.page_story 校验与 YAML bool 归一。"""
-    from translator.config import load_config
-    src = _make_pdf(tmp_path)
-    y = tmp_path / "c.yaml"
-    y.write_text(f"""
-io:
-  input: {src.as_posix()}
-  output_dir: {tmp_path.as_posix()}
-output:
-  mode: faithful
-render:
-  page_story: on
-""", encoding="utf-8")
-    cfg = load_config(y)
-    assert cfg.output.mode == "faithful"
-    assert cfg.render.page_story == "on"
-    # 裸 on（YAML 1.1 → bool True）归一为 "on"
-    y2 = tmp_path / "c2.yaml"
-    y2.write_text(f"""
-io:
-  input: {src.as_posix()}
-render:
-  page_story: on
-""", encoding="utf-8")
-    assert load_config(y2).render.page_story == "on"
-    # reflow 未实装：直接报错防误解
-    y3 = tmp_path / "c3.yaml"
-    y3.write_text(f"""
-io:
-  input: {src.as_posix()}
-output:
-  mode: reflow
-""", encoding="utf-8")
-    with pytest.raises(ValueError, match="reflow"):
-        load_config(y3)
-    # page_story 非法值报错
-    y4 = tmp_path / "c4.yaml"
-    y4.write_text(f"""
-io:
-  input: {src.as_posix()}
-render:
-  page_story: sometimes
-""", encoding="utf-8")
-    with pytest.raises(ValueError, match="page_story"):
-        load_config(y4)
-
-
-def test_pages_subset_quick_flow(tmp_path):
-    """io.pages 子集：只译前 2 页 + 输出名带 -p1-2 标记（不覆盖全量名）。"""
-    font_path = _cjk_font_or_skip()
-    src = tmp_path / "t.pdf"
-    doc = pymupdf.open()
-    for i in range(4):
-        doc.new_page().insert_text(
-            (72, 90), f"Page {i + 1} content paragraph.", fontsize=11)
-    doc.save(str(src))
-    doc.close()
-    y = tmp_path / "c.yaml"
-    y.write_text(f"""
-io:
-  input: {src.as_posix()}
-  output_dir: {tmp_path.as_posix()}
-  pages: "1-2"
-features:
-  translation_cache: false
-fonts:
-  cjk: {Path(font_path).as_posix()}
-""", encoding="utf-8")
-    from translator.config import load_config
-    from translator.pipeline import translate_document
-    stats = translate_document(load_config(y), client=None)
-    assert stats["pages"] == 2
-    assert "-p1-2-" in Path(stats["output"]).name
-    out_doc = pymupdf.open(stats["output"])
-    assert len(out_doc) == 2
-    out_doc.close()
-
-
-def test_parse_page_ranges():
-    from translator.config import parse_page_ranges
-    assert parse_page_ranges("", 10) == []
-    assert parse_page_ranges("1-2,5", 10) == [0, 1, 4]
-    assert parse_page_ranges("3", 4) == [2]
-    assert parse_page_ranges("9-20", 10) == [8, 9]   # 越界钳制
-    with pytest.raises(ValueError):
-        parse_page_ranges("abc", 10)
-    with pytest.raises(ValueError):
-        parse_page_ranges("0", 10)
-    with pytest.raises(ValueError):
-        parse_page_ranges("5-2", 10)
-
-
-# ---------- 页级 Story 接管（任务 2-3 P1） ----------
-
-def _cjk_font_or_skip():
-    from translator.render import find_cjk_font
-    try:
-        fp = find_cjk_font(None, lang="zh")
-        assert fp and Path(fp).is_file()
-        return fp
-    except Exception as e:
-        pytest.skip(f"no CJK font on this machine: {e}")
-
-
-def _story_page(paras: list[dict]):
-    """构造单页文档 + layout dict。"""
-    doc = pymupdf.open()
-    page = doc.new_page(width=300, height=400)
-    layout = {"mode": "one", "paragraphs": paras, "tables_cells": [],
-              "tables": [], "formulas": [], "hf_blocks": [],
-              "fig_text_blocks": [], "figure_regions": [],
-              "layout_engine": "heuristic"}
-    return doc, page, layout
-
-
-def _para(idx, rect, text, size=10.0):
-    return {"index": idx, "bbox": rect, "text": text, "size": size,
-            "spans": [], "col": 0, "is_heading": False, "is_caption": False,
-            "is_ref": False, "is_verbatim": False, "is_alg_caption": False}
-
-
-def test_render_story_whole_page_placement():
-    """页级 Story：多段各归其框（段落框级位置不变），无串位。"""
-    font_path = _cjk_font_or_skip()
-    paras = []
-    zh = ["第一段落讲述学术翻译的质量评估方法与流程设计。",
-          "第二段落阐述双栏版面的逐框落位验证策略。",
-          "第三段落说明公式与表格的原位保留机制。"]
-    for i, t in enumerate(zh):
-        paras.append(_para(i, pymupdf.Rect(30, 20 + i * 60, 280,
-                                           20 + i * 60 + 50), t))
-    translated = [{"index": i, "text": f"【译】{p['text']}"}
-                  for i, p in enumerate(paras)]
-    doc, page, layout = _story_page(paras)
-    stats = {"story": 0, "fallback": 0, "reasons": []}
-    from translator.render import render_page
-    render_page(page, layout, translated, font_path, renderer="htmlbox",
-                lang="zh", page_story="on", story_stats=stats)
-    assert stats["story"] == 1 and stats["fallback"] == 0, stats["reasons"]
-    out = doc[0]
     # span 级几何断言（get_text(clip=) 是块级语义，会带出框外文本）
     spans = []
     for b in out.get_text("dict")["blocks"]:
@@ -605,7 +387,17 @@ render:
     cfg = load_config(y)
     assert cfg.output.mode == "faithful"
     assert cfg.render.page_story == "on"
-    # reflow 未实装：直接报错防误解
+    # 裸 on（YAML 1.1 → bool True）归一为 "on"（v0.8.0 去重时回补——
+    # 该断言曾随被遮蔽的重复拷贝静默丢失）
+    y2 = tmp_path / "c2.yaml"
+    y2.write_text(f"""
+io:
+  input: {src.as_posix()}
+render:
+  page_story: on
+""", encoding="utf-8")
+    assert load_config(y2).render.page_story == "on"
+    # reflow 已实装（v0.8.0 P3）：合法配置
     y3 = tmp_path / "c3.yaml"
     y3.write_text(f"""
 io:
@@ -613,8 +405,17 @@ io:
 output:
   mode: reflow
 """, encoding="utf-8")
-    with pytest.raises(ValueError, match="reflow"):
-        load_config(y3)
+    assert load_config(y3).output.mode == "reflow"
+    # 非法 mode 报错
+    y3b = tmp_path / "c3b.yaml"
+    y3b.write_text(f"""
+io:
+  input: {src.as_posix()}
+output:
+  mode: linear
+""", encoding="utf-8")
+    with pytest.raises(ValueError, match="output.mode"):
+        load_config(y3b)
     # page_story 非法值报错
     y4 = tmp_path / "c4.yaml"
     y4.write_text(f"""
@@ -734,3 +535,125 @@ def test_command_bus_direct_calls_unaffected():
     assert control.state == "running"
     control._apply_commands()     # 未绑定 → no-op
     assert control.state == "running"
+
+
+# ---------- v0.8.0 P2：双语 <table> 语义布局（任务 2.2.1） ----------
+
+def _page_spans(page) -> list[tuple[pymupdf.Rect, str, float]]:
+    spans = []
+    for b in page.get_text("dict")["blocks"]:
+        if b.get("type") != 0:
+            continue
+        for l in b.get("lines", []):
+            for sp in l["spans"]:
+                spans.append((pymupdf.Rect(sp["bbox"]), sp["text"],
+                              sp["size"]))
+    return spans
+
+
+def test_bilingual_table_two_rows_same_box():
+    """双语表格：译文行+原文行同框两行（原文在下、字号 0.75×、不分离）。"""
+    font_path = _cjk_font_or_skip()
+    src = ("Hello world paragraph with enough length to wrap across "
+           "multiple lines inside the box.")
+    zh = "你好世界段落，这是一段足够长从而能够在框内换行的中文译文文本。"
+    paras = [_para(0, pymupdf.Rect(30, 20, 280, 130), src)]
+    translated = [{"index": 0, "text": zh}]
+    doc, page, layout = _story_page(paras)
+    from translator.render import render_page
+    render_page(page, layout, translated, font_path, renderer="htmlbox",
+                lang="zh", bilingual=True)
+    spans = _page_spans(doc[0])
+    zh_spans = [(r, s, sz) for r, t, sz in spans for s in [t.strip()]
+                if s and s[0] == "你"]
+    en_spans = [(r, s, sz) for r, t, sz in spans for s in [t.strip()]
+                if s.startswith("Hello")]
+    assert zh_spans and en_spans, "both rows must render"
+    # 原文行整体位于译文行下方（同框两行、不分离）
+    assert max(r.y0 for r, _s, _z in zh_spans) \
+        < min(r.y0 for r, _s, _z in en_spans)
+    # 两行都在原段框内（表格尊重外框）
+    box = pymupdf.Rect(29, 19, 281, 131)
+    assert all(r.y1 <= box.y1 + 1.0 for r, _s, _z in zh_spans + en_spans)
+    # 原文行字号 ≈ 0.75×译文行
+    zh_sz = max(z for _r, _s, z in zh_spans)
+    en_sz = max(z for _r, _s, z in en_spans)
+    assert en_sz <= zh_sz * 0.8 + 0.15, f"en {en_sz} not weakened vs {zh_sz}"
+
+
+def test_bilingual_table_fallback_on_tight_box():
+    """框装不下双行表格 → 落回 60/40 旧路径：译文必须仍然完整落墨。"""
+    font_path = _cjk_font_or_skip()
+    src = "Long English source paragraph for the fallback path check."
+    zh = "回退路径验证" * 40            # 双行总高必然超框
+    paras = [_para(0, pymupdf.Rect(30, 20, 280, 40), src)]
+    translated = [{"index": 0, "text": zh}]
+    doc, page, layout = _story_page(paras)
+    from translator.render import render_page
+    warnings: list = []
+    render_page(page, layout, translated, font_path, renderer="htmlbox",
+                lang="zh", bilingual=True, warnings=warnings)
+    text = doc[0].get_text("text").replace("\n", "")
+    assert "回退路径验证" in text, "zh text must never be lost"
+
+
+def test_bilingual_heading_skips_table():
+    """标题段不做双语双层（保持单行译文）——既有行为不回归。"""
+    font_path = _cjk_font_or_skip()
+    paras = [_para(0, pymupdf.Rect(30, 20, 280, 60), "Section Heading",
+                   size=14.0)]
+    paras[0]["is_heading"] = True
+    translated = [{"index": 0, "text": "章节标题译文"}]
+    doc, page, layout = _story_page(paras)
+    from translator.render import render_page
+    render_page(page, layout, translated, font_path, renderer="htmlbox",
+                lang="zh", bilingual=True)
+    text = doc[0].get_text("text")
+    assert "章节标题译文" in text
+    assert "Section Heading" not in text.replace("\n", " ")
+
+
+# ---------- v0.8.0 P2：链接存活（任务 2.3） ----------
+
+def test_links_survive_redaction(tmp_path):
+    """redaction 摧毁重叠区链接 → 先存后补原位重插（save 后持久化）。"""
+    font_path = _cjk_font_or_skip()
+    doc = pymupdf.open()
+    pg = doc.new_page(width=300, height=400)
+    pg.insert_text((35, 60), "Some English paragraph text here.",
+                   fontsize=11)
+    pg.insert_link({"kind": pymupdf.LINK_URI,
+                    "from": pymupdf.Rect(35, 48, 250, 64),
+                    "uri": "https://example.org/ref"})
+    # 不重叠的控制链接（页脚区，redact 不可及）必须不重复重插
+    pg.insert_link({"kind": pymupdf.LINK_URI,
+                    "from": pymupdf.Rect(35, 380, 150, 392),
+                    "uri": "https://example.org/foot"})
+    src = tmp_path / "linked.pdf"
+    doc.save(str(src))
+    doc.close()
+
+    doc = pymupdf.open(str(src))
+    pg = doc[0]
+    assert len(pg.get_links()) == 2
+    paras = [_para(0, pymupdf.Rect(30, 40, 260, 70),
+                   "Some English paragraph text here.")]
+    translated = [{"index": 0, "text": "这里是段落译文。"}]
+    layout = {"mode": "one", "paragraphs": paras, "tables_cells": [],
+              "tables": [], "formulas": [], "hf_blocks": [],
+              "fig_text_blocks": [], "figure_regions": [],
+              "layout_engine": "heuristic"}
+    from translator.render import render_page
+    render_page(pg, layout, translated, font_path, renderer="htmlbox",
+                lang="zh")
+    # 怪癖：redact 后重插的链接在内存 get_links() 不可见，save 后持久化
+    out = tmp_path / "out.pdf"
+    doc.save(str(out), garbage=4, deflate=True)
+    doc.close()
+    d2 = pymupdf.open(str(out))
+    links = d2[0].get_links()
+    uris = sorted(l["uri"] for l in links if l.get("kind") == pymupdf.LINK_URI)
+    assert uris == ["https://example.org/foot", "https://example.org/ref"], \
+        f"links lost or duplicated: {uris}"
+    assert "这里是段落译文" in d2[0].get_text("text")
+    d2.close()

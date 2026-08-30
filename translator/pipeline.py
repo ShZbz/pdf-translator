@@ -43,6 +43,7 @@ from .render import _build_font_archive, _clean_zh_text, _draw_para, \
     _html_escape, _insert_one_htmlbox, _wrap_cjk, cell_spec_css, \
     collect_cell_specs, collect_para_specs, crop_formula_pixmaps, \
     find_cjk_font, render_page, spec_css
+from .render_reflow import render_reflow_document
 
 _VERBOSE_TS = False
 
@@ -563,6 +564,9 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
     # 分发译文（含 v0.7.0 术语锁确定性修复——与非流式路径同语义）
     texts_by_page: dict[int, list["str | None"]] = {}
     cell_texts: dict[tuple[int, int], str] = {}
+    # v0.8.0 P3: 跨页合并单元的整段译文（reflow 不拆回两页；faithful 忽略）
+    cross_full: dict[tuple[int, int], str] = {}
+    cross_skip: set = set()
     ocr_flat_out: list["str | None"] = []
     ocr_counts: list[int] = []         # 每 job 的单元数（粘贴阶段按序消费）
     for job in ocr_jobs:
@@ -594,6 +598,9 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
                 continue
             pno_a, pi_a = pending[g[0]]
             pno_b, pi_b = pending[g[1]]
+            # v0.8.0 P3: reflow 需要整段译文（faithful 拆回两页原位）
+            cross_full[(pno_a, pi_a)] = dst
+            cross_skip.add((pno_b, pi_b))
             len_a = len(page_layouts[pno_a]["paragraphs"][pi_a]["text"])
             len_b = len(page_layouts[pno_b]["paragraphs"][pi_b]["text"])
             part_a, part_b = _split_proportional(
@@ -1304,6 +1311,9 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         # ---- 批量翻译（全文档统一排队，摊薄调用次数）----
         texts_by_page: dict[int, list[str | None]] = {}
         cell_texts: dict[tuple[int, int], str] = {}   # v0.2.3: (pno, ci) → 译文
+        # v0.8.0 P3: 跨页合并单元整段译文（reflow 用；faithful 忽略）
+        cross_full: dict[tuple[int, int], str] = {}
+        cross_skip: set = set()
         if client is not None:
             # v0.2.3: 合并组拼成翻译单元（组内段落用 \n 连接送译）
             # v0.5.1: 跨页连字符合并——前段尾 '-' + 后段小写开头 = 同词被
@@ -1442,6 +1452,9 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 # 两段组：按原文长度比在词边界切分
                 pno_a, pi_a = pending[g[0]]
                 pno_b, pi_b = pending[g[1]]
+                # v0.8.0 P3: reflow 需要整段译文（faithful 拆回两页原位）
+                cross_full[(pno_a, pi_a)] = dst
+                cross_skip.add((pno_b, pi_b))
                 len_a = len(page_layouts[pno_a]["paragraphs"][pi_a]["text"])
                 len_b = len(page_layouts[pno_b]["paragraphs"][pi_b]["text"])
                 part_a, part_b = _split_proportional(dst, len_a / max(len_a + len_b, 1))
@@ -1458,6 +1471,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             "page_pixmaps": page_pixmaps,
             "texts_by_page": texts_by_page,
             "cell_texts": cell_texts,
+            "cross_full": cross_full,
+            "cross_skip": cross_skip,
             "ocr_jobs": ocr_jobs,
             "ocr_translations": (ocr_translations if client is not None else []),
             "n_paras": n_paras,
@@ -1468,6 +1483,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     page_pixmaps = state["page_pixmaps"]
     texts_by_page = state["texts_by_page"]
     cell_texts = state["cell_texts"]
+    cross_full = state.get("cross_full") or {}
+    cross_skip = state.get("cross_skip") or set()
     ocr_jobs = state["ocr_jobs"]
     ocr_translations = state["ocr_translations"]
     n_paras = state["n_paras"]
@@ -1490,6 +1507,51 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     if control:
         control.checkpoint()
     sink.stage("render")
+
+    # ---- v0.8.0 P3: reflow 整文档重排（output.mode: reflow）----
+    # 文档模型 → 新模板 → Story 流式写入（render_reflow.py）；不 redact
+    # 原 doc、无 fit 因子/降级阶梯（框跟内容走）；翻译层与 faithful 完全
+    # 共用（同缓存同调用数）。扫描页（OCR 任务存在）暂不支持，明确报错。
+    if cfg.output.mode == "reflow":
+        if ocr_jobs:
+            raise ValueError(
+                "reflow 模式暂不支持扫描页（检测到 OCR 任务）；"
+                "请使用 output.mode: faithful")
+        _log("renderer: reflow (whole-document Story re-layout)")
+        reflow_warns: list[str] = []
+        pixmaps_by_page = {pno: (page_pixmaps[pno] or {})
+                           for pno in range(len(page_layouts))
+                           if pno < len(page_pixmaps)}
+        pdf_bytes = render_reflow_document(
+            page_layouts, doc, texts_by_page, cell_texts,
+            cross_full, cross_skip, pixmaps_by_page, typo, font_path,
+            tgt_lang, cfg.reflow, reflow_warns, _log)
+        all_warnings.extend(reflow_warns)
+        out_path = out_dir / output_pdf_name(
+            src.stem, tgt_lang, False, extra="-reflow" + sel_extra)
+        out_path.write_bytes(pdf_bytes)
+        cache_hits = getattr(tc, "cache_hits", 0) if client is not None else 0
+        _log(f"done: {n_paras} paras, {total_calls} LLM calls, "
+             f"{cache_hits} cache hits, {len(all_warnings)} warnings, "
+             f"{time.time() - t0:.1f}s")
+        sink.emit("done", output=str(out_path), pages=n_pages,
+                  paragraphs=n_paras, calls=total_calls,
+                  cache_hits=cache_hits,
+                  elapsed=round(time.time() - t0, 1))
+        return {
+            "pages": n_pages,
+            "paragraphs": n_paras,
+            "calls": total_calls,
+            "warnings": all_warnings,
+            "output": str(out_path),
+            "cache_db": (str(dcache.path) if dcache is not None else ""),
+            "ocr_pages": 0,
+            "ocr_inplace_blocks": 0,
+            "cache_hits": cache_hits,
+            "cache_saved_calls": 0,
+            "cache_entries": 0,
+        }
+
     if renderer == "writer":
         _log("renderer: writer (legacy TextWriter engine)")
     # ---- v0.7.1: 页级 Story 接管（任务 2-3 P1）----

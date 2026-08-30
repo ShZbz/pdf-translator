@@ -265,8 +265,12 @@ def render_page(page, layout: dict, translated: list[dict],
     cells = layout.get("tables_cells") or []
     for cell in cells:
         page.add_redact_annot(pymupdf.Rect(cell["bbox"]))
+    # v0.8.0 P2 任务 2.3：redaction 会摧毁重叠区链接注释——先存后补
+    links_before = page.get_links()
     page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                           graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    if links_before:
+        restore_destroyed_links(page, links_before)
 
     font = pymupdf.Font(fontfile=font_path)
     tw = pymupdf.TextWriter(page.rect)
@@ -431,6 +435,38 @@ def render_page(page, layout: dict, translated: list[dict],
     # ---- 3. D6 display 公式位图回贴（原 bbox 原位浮回）----
     if formula_pixmaps:
         _paste_formula_pixmaps(page, formula_pixmaps, layout["formulas"])
+
+
+def _link_key(l: dict) -> tuple:
+    """链接身份键（redact 前后对账用：矩形+类型+目标）。"""
+    r = l.get("from")
+    return (l.get("kind"), round(r.x0, 1), round(r.y0, 1),
+            l.get("uri"), l.get("page"), l.get("nameddest", ""))
+
+
+def restore_destroyed_links(page, links_before: list[dict]) -> int:
+    """apply_redactions 后原位重插被摧毁的链接注释（v0.8.0 P2 任务 2.3）。
+
+    实测（Achintya p2）：apply_redactions 摧毁重叠区链接注释（38 存活 4），
+    译文输出丢全部正文区链接（引用跳转/DOI/URL）。先存后补：redact 后把
+    消失的链接按原 rect 重插——rect 仍指向译文所在区域，导航语义保留。
+    注意怪癖：redact 后 insert_link 的注释在本次会话的 get_links()/annots()
+    里不可见，但 save 后真实持久化（实测 garbage=4 存活）。
+    """
+    try:
+        alive = {_link_key(l) for l in page.get_links()}
+    except Exception:
+        return 0
+    n = 0
+    for l in links_before:
+        if _link_key(l) in alive:
+            continue
+        try:
+            page.insert_link(l)
+            n += 1
+        except Exception:
+            pass          # 不支持的链接形态（GOTOR 等）放弃，不阻塞渲染
+    return n
 
 
 def _paste_formula_pixmaps(page, formula_pixmaps: dict[int, bytes],
@@ -783,6 +819,49 @@ def _render_cells_htmlbox(page, cells: list[dict], cell_map: dict,
                             scale_low=0.3)
 
 
+def _bilingual_table_parts(spec: dict, font_css: str, factor: float,
+                           lead: float, tracking: float,
+                           font_path: str | None,
+                           en_scale: float = 0.75) -> tuple[str, str]:
+    """双语 <table> 语义布局（v0.8.0 P2 任务 2.2.1）的 HTML/CSS 构造。
+
+    每段一组行：译文行（td，沿用逐段路径同源段落样式）+ 原文行（td.o，
+    en_scale×factor×字号弱化）。两行同框不分离由表格语义保证（单框
+    insert_htmlbox，行只会在框内依次排布）。
+    en_scale 随收编闸三级下探（0.75/0.65/0.55）：译文行字号绝不动——
+    双语类因子按 60% 切框测量（偏保守），原文行降档吸收空间差，
+    语义等价于旧路径"引擎只压缩原文层"。
+    引擎实测（tools/bilingual_table_probe.py，10/10）：
+    - td/td.class 选择器命中；table 尊重外框宽度（width:100%）；
+    - CSS opacity 属性在 td 上是静默 no-op——弱化必须用 #rrggbbaa 颜色
+      alpha（实测墨密度 0.546@0x8c）；
+    - text-indent/方向 rtl 在 td 上生效；溢出时 insert_htmlbox 整表压缩
+      （scale 语义不变，不丢行）。
+    """
+    from .render_story import _para_rule
+    zh_rule = _para_rule(spec["family"], spec["base"], spec["lh"],
+                         spec["align"], spec["indent"], spec["dir_css"],
+                         factor=factor, lead=lead, tracking=tracking)
+    # 原文层字体：含 CJK（zh→en 反向）用 ptbody；西文用 serif
+    en_family = "ptbody, serif" \
+        if (font_path and _has_cjk(spec["src_text"])) else "serif"
+    en_size = max(4.5, spec["base"] * en_scale * factor)
+    css = (font_css
+           + " table{width:100%;margin:0;}"
+           + " td" + zh_rule[:-1] + "padding:0;}"
+           + f" td.o{{font-family:{en_family};"
+             f"font-size:{en_size:.2f}pt; line-height:1.2; margin:0;"
+             f"padding:0; text-align:left; color:#00000099;"
+             f"{spec['dir_css']}}}")
+    inner = spec["html"]
+    if inner.startswith("<p>") and inner.endswith("</p>"):
+        inner = inner[3:-4]
+    en_txt = _html_escape(_clean_zh_text(spec["src_text"]))
+    html = (f"<table><tr><td>{inner}</td></tr>"
+            f"<tr><td class=o>{en_txt}</td></tr></table>")
+    return html, css
+
+
 def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
                           font_path: str, typography, bilingual: bool,
                           formula_rects: list["pymupdf.Rect"],
@@ -828,12 +907,37 @@ def _render_paras_htmlbox(page, paras: list[dict], tmap: dict,
                         spec["lh"], spec["align"], spec["indent"],
                         spec["dir_css"], factor=factor,
                         lead=lead, tracking=track)
-        # 双语：上部 60% 译文（spec.rect 已按 60% 切好）；底部原文层
-        # 半透明（与公式区重叠则放弃）
+        # 双语（v0.8.0 P2 任务 2.2.1）：首选 <table> 语义布局——每段一组
+        # 行（译文行 + 原文行），行高按内容自然分配（替代 60/40 硬切框
+        # 拼凑），同框不分离由表格语义保证；原文行 #rrggbbaa 弱化。
+        # 收编闸（测量基座 ~1ms/段）：表格以类因子字号自然装下才启用；
+        # 装不下/公式区重叠/引擎拒收 → 落回 60/40 逐段路径（旧版兜底）。
         if bilingual and spec["raw_translated"] != spec["src_text"] \
                 and not spec["is_heading"]:
-            zh_rect = spec["rect"]
             full = spec.get("full_rect") or spec["rect"]
+            en_zone = pymupdf.Rect(full.x0, full.y0 + full.height * 0.6,
+                                   full.x1, full.y1)
+            if not any(en_zone.intersects(fr) for fr in formula_rects):
+                from .fit import measure_fit_factor
+                # 收编闸：原文行字号三级下探（0.75/0.65/0.55，等比随
+                # 译文因子），译文行字号绝不动——哪档自然装下用哪档
+                for en_scale in (0.75, 0.65, 0.55):
+                    html_t, css_t = _bilingual_table_parts(
+                        spec, font_css, factor, lead, track, font_path,
+                        en_scale=en_scale)
+                    f_t, _ok = measure_fit_factor(
+                        full, html_t, css_t, archive,
+                        f_min=0.5, f_max=1.0)
+                    if f_t >= 0.996:
+                        break
+                else:
+                    html_t = None
+                if html_t is not None and _insert_one_htmlbox(
+                        page, full, html_t, css_t, f"{spec['tag']}/bl",
+                        warnings, archive=archive):
+                    continue
+            # ---- 60/40 旧路径（兜底）----
+            zh_rect = spec["rect"]
             en_rect = pymupdf.Rect(full.x0, zh_rect.y1 + 1.0, full.x1,
                                    full.y1)
             _insert_one_htmlbox(page, zh_rect, spec["html"], css,
@@ -862,8 +966,9 @@ def _insert_one_htmlbox(page, rect: "pymupdf.Rect", text: str, css: str,
                         tag: str, warnings: list[str],
                         opacity: float = 1.0,
                         archive: "pymupdf.Archive | None" = None,
-                        scale_low: float = 0.5) -> None:
-    """单段 insert_htmlbox + 溢出告警。
+                        scale_low: float = 0.5) -> bool:
+    """单段 insert_htmlbox + 溢出告警。返回是否落墨（v0.8.0：双语表格
+    路径失败时要落回 60/40 旧路径，段落绝不因引擎拒收而消失）。
 
     v0.6.0 任务 A 丢段修复：spare < -0.5 表示引擎在 scale_low 下限仍
     装不下——insert_htmlbox 此时【不落任何墨】（v0.5.1 只告警，段落
@@ -873,7 +978,7 @@ def _insert_one_htmlbox(page, rect: "pymupdf.Rect", text: str, css: str,
     仍在做元素级缩放——说明测量与渲染出现了偏差，值得暴露）。
     """
     if not text.strip():
-        return
+        return True
     spare = scale = None
     try:
         spare, scale = page.insert_htmlbox(
@@ -881,7 +986,7 @@ def _insert_one_htmlbox(page, rect: "pymupdf.Rect", text: str, css: str,
             opacity=opacity, overlay=True, archive=archive)
     except Exception as e:
         warnings.append(f"{tag}: htmlbox failed ({e})")
-        return
+        return False
     if spare is not None and spare < -0.5:
         warnings.append(
             f"{tag}: paragraph dropped (scale {scale:.2f} < scale_low "
@@ -892,13 +997,14 @@ def _insert_one_htmlbox(page, rect: "pymupdf.Rect", text: str, css: str,
                 opacity=opacity, overlay=True, archive=archive)
         except Exception as e:
             warnings.append(f"{tag}: paragraph dropped; retry failed ({e})")
-            return
+            return False
         if spare is not None and spare < -0.5:
             warnings.append(f"{tag}: paragraph dropped entirely")
-            return
+            return False
         warnings.append(f"{tag}: rendered at emergency scale {scale:.2f}")
-        return
+        return True
     if scale is not None and scale < 0.995:
         warnings.append(
             f"{tag}: element-level scale={scale:.2f} (style factor "
             f"exhausted) — size may be inconsistent")
+    return True

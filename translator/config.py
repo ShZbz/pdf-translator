@@ -242,11 +242,24 @@ class PerformanceConfig:
 
 @dataclass
 class OutputConfig:
-    """v0.7.1 双模式输出（任务 2-3）：faithful=版面1:1对照（默认）。
+    """v0.8.0 双模式输出（任务 2-3 / P3）。
 
-    reflow=整文档语义重排（P3 预留，当前配置直接报错防误解）。
+    faithful=版面1:1对照（默认，服务对照阅读）；
+    reflow=整文档语义重排（P3：文档模型→新模板→Story 流式写入自动
+    断页，页面对应关系不存在，输出名带 -reflow 后缀，服务纯阅读）。
     """
     mode: str = "faithful"
+
+
+@dataclass
+class ReflowConfig:
+    """v0.8.0 P3 reflow 模板/样式选项（任务 3.2/3.4.1）。"""
+    # auto=沿用原文档主导栏数与栏宽；single=强制单栏
+    columns: str = "auto"
+    # 正文字号 pt（0=沿用原文档 body 众数字号，保持视觉延续）
+    body_size: float = 0.0
+    # 单 Story 块数软上限（超长文档在章节边界分段写入防内存）
+    segment_blocks: int = 500
 
 
 @dataclass
@@ -278,6 +291,8 @@ class Config:
     # v0.7.1: 双模式输出 + 渲染微调（任务 2-3）
     output: OutputConfig = field(default_factory=OutputConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
+    # v0.8.0 P3: reflow 模板/样式选项
+    reflow: ReflowConfig = field(default_factory=ReflowConfig)
 
 
 def load_config(path: str | Path) -> Config:
@@ -319,12 +334,26 @@ def load_config(path: str | Path) -> Config:
             fit_cfg = FitConfig.from_raw(raw.get("fit") or {})
         except ValueError as e:
             raise ValueError(f"fit 配置无效: {e}") from e
-    # ---- v0.7.1: 双模式输出 + 渲染微调（任务 2-3）----
+    # ---- v0.8.0: 双模式输出 + 渲染微调 + reflow 选项 ----
     out_cfg = _filtered(OutputConfig, raw.get("output", {}))
-    if out_cfg.mode != "faithful":
+    if out_cfg.mode not in ("faithful", "reflow"):
         raise ValueError(
-            f"output.mode 必须是 'faithful'（reflow 整文档重排随 P3 提供，"
-            f"当前 {out_cfg.mode!r}）")
+            f"output.mode 必须是 'faithful' 或 'reflow'，"
+            f"当前 {out_cfg.mode!r}")
+    reflow_cfg = _filtered(ReflowConfig, raw.get("reflow", {}))
+    if reflow_cfg.columns not in ("auto", "single"):
+        raise ValueError(
+            f"reflow.columns 必须是 'auto' 或 'single'，"
+            f"当前 {reflow_cfg.columns!r}")
+    reflow_cfg.body_size = min(max(float(reflow_cfg.body_size or 0.0),
+                                   0.0), 24.0)
+    reflow_cfg.segment_blocks = max(int(reflow_cfg.segment_blocks or 500),
+                                    50)
+    feat_bilingual = bool((raw.get("features") or {}).get("bilingual"))
+    if out_cfg.mode == "reflow" and feat_bilingual:
+        raise ValueError(
+            "reflow 模式暂不支持双语对照（双语为 faithful 专有排版）；"
+            "请 output.mode: faithful 或关闭 features.bilingual")
     render_cfg = _filtered(RenderConfig, raw.get("render", {}))
     ps = render_cfg.page_story
     if isinstance(ps, bool):          # YAML 1.1 裸 on/off → bool
@@ -337,7 +366,8 @@ def load_config(path: str | Path) -> Config:
     cfg = Config(io=io_, llm=llm, features=feat, performance=perf, ocr=ocr,
                  glossary_file=raw.get("glossary_file", ""),
                  fonts=raw.get("fonts") or {"cjk": ""},
-                 fit=fit_cfg, output=out_cfg, render=render_cfg)
+                 fit=fit_cfg, output=out_cfg, render=render_cfg,
+                 reflow=reflow_cfg)
     # 硬校验：输入输出路径必填
     if not cfg.io.input:
         raise ValueError("config.io.input is required")

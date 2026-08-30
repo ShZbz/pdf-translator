@@ -248,8 +248,10 @@ def get_config() -> dict:
     else:
         masked["has_key"] = False
     # v0.7.1: 首启向导触发条件——ui_config.yaml 不存在即向导模式
+    from translator import __version__ as app_version
     return {"config": {**raw, "llm": masked},
-            "first_run": not UI_CONFIG_PATH.exists()}
+            "first_run": not UI_CONFIG_PATH.exists(),
+            "version": app_version}
 
 
 @app.get("/api/presets")

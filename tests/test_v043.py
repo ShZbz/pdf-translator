@@ -301,7 +301,11 @@ def test_worker_subprocess_with_pool_e2e(tmp_path):
         time.sleep(0.5)
     assert job.status == "done", f"status={job.status} err={job.error}"
     assert Path(job.output_path).is_file()
-    time.sleep(0.5)
+    # 控制文件清理可能略晚于 status=done（worker 收尾与状态置位竞态）——
+    # 固定 0.5s 等待在高负载下偶发不足，改轮询（v0.8.0 修复套件 flaky）
+    deadline = time.time() + 10
+    while time.time() < deadline and list(root.glob(".ui_ctl_*")):
+        time.sleep(0.25)
     assert not list(root.glob(".ui_ctl_*"))            # 控制文件已清理
 
 
