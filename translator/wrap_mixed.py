@@ -76,8 +76,7 @@ def wrap_mixed(text: str, font: "pymupdf.Font", fs: float, width: float,
 
     for tok in _tokenize(text):
         if tok == " ":
-            if cur:                       # 行尾空格不落墨,记挂起宽度
-                cur_w_pending = True
+            if cur:                       # 行尾空格不落墨,只记挂起宽度
                 cur += " "
                 cur_w += space_w
             continue

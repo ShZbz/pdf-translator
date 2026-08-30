@@ -41,13 +41,20 @@ def main() -> int:
     if not args.dry_run:
         base_url, api_key = cfg.llm.resolve()
         if base_url:
-            from openai import OpenAI
-            # v0.8.2: timeout 透传——UI worker（jobs.py）v0.5.1 已修，CLI 漏了
-            # 同款：SDK 默认 600s，慢/挂网关下单批可无限拖住整文档
-            # （实测 opencode go 偶发流挂起），llm.timeout 配置对 CLI 不生效
-            client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop",
-                            timeout=float(getattr(cfg.llm, "timeout", 120.0)
-                                          or 120.0))
+            # v0.8.2: timeout 透传——SDK 默认 600s，慢/挂网关下单批可
+            # 无限拖住整文档（实测 opencode go 偶发流挂起）。
+            # v0.8.3: LLMClientPool 统一构造——自持连接池（楔死终结器）
+            # + SDK max_retries=0（重试单层化，见 llm.LLMClientPool）
+            from translator.llm import LLMClientPool
+            client = LLMClientPool(base_url, api_key or "sk-noop",
+                                   float(getattr(cfg.llm, "timeout", 120.0)
+                                         or 120.0))
+        else:
+            # v0.8.3: 旧版静默降级干跑——provider 拼错/漏配 base_url 时
+            # 用户拿到的是「原文原样输出」，却以为翻译完成了。显式告警。
+            print("WARNING: 无法确定 API 地址（llm.base_url 为空且 provider "
+                  f"{cfg.llm.provider!r} 无预设）——本次按 dry-run 运行，"
+                  "输出保留原文", file=sys.stderr)
 
     if quick and client is not None:
         # 1) dry-run 冒烟（布局/字体/渲染管线零成本验证）

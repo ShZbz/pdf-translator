@@ -280,7 +280,9 @@ def put_config(req: ConfigReq) -> dict:
         old = yaml.safe_load(UI_CONFIG_PATH.read_text(encoding="utf-8")) or {}
     new_llm = cfg.get("llm", {})
     old_llm = old.get("llm", {})
-    if new_llm.get("api_key", "").endswith("***") or (
+    # 打码 key 检测用子串匹配（_mask 长键格式 sk-xxx***xxxx 并不以 ***
+    # 结尾——endswith 判不出，会把打码串当真 key 存进去毁掉旧值）
+    if "***" in new_llm.get("api_key", "") or (
             not new_llm.get("api_key") and old_llm.get("api_key")):
         new_llm["api_key"] = old_llm.get("api_key", "")
     UI_CONFIG_PATH.write_text(
@@ -327,46 +329,58 @@ def validate_key(req: ValidateReq):
     p = PRESETS.get(req.provider, {})
     base_url = req.base_url or p.get("base_url", "")
     api_key = req.api_key
-    if api_key.endswith("***") or (not api_key and p.get("env")):
+    # 打码 key 检测用子串匹配（_mask 长键格式 sk-xxx***xxxx 不以 *** 结尾，
+    # endswith 判不出会把打码串当真 key 发给网关）
+    if "***" in api_key:
+        api_key = ""
+    if not api_key:
         env_name = p.get("env") or ""
-        api_key = api_key if api_key and not api_key.endswith("***") \
-            else os.environ.get(env_name, "") if env_name else ""
-        if not api_key:
-            # v0.8.1: 空/仅注释的 ui_config.yaml 会让 yaml.safe_load 返回
-            # None——旧版直接 .get() 抛 AttributeError → 500。_stored_llm
-            # 已做容错，这里复用（key 回填语义不变）
-            api_key = _stored_llm().get("api_key", "")
+        if env_name:
+            api_key = os.environ.get(env_name, "")
+    if not api_key:
+        # v0.8.1: 空/仅注释的 ui_config.yaml 会让 yaml.safe_load 返回
+        # None——旧版直接 .get() 抛 AttributeError → 500。_stored_llm
+        # 已做容错，这里复用（key 回填语义不变）
+        api_key = _stored_llm().get("api_key", "")
 
     st_timeout, st_retries = _stored_llm_timeout_retry()
     timeout = max(5.0, float(req.timeout or 0) or st_timeout)
     max_retries = max(1, int(req.max_retries or 0) or st_retries)
 
-    from openai import OpenAI
-    client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop",
-                    timeout=timeout)
+    # v0.8.3: LLMClientPool 统一构造——SDK max_retries=0（重试单层化：
+    # 本端点的 attempt 循环是唯一重试层），用毕关池
+    from translator.llm import LLMClientPool
+    pool = LLMClientPool(base_url, api_key or "sk-noop", timeout)
     t0 = time.time()
     last_err = ""
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=req.model,
-                messages=[
-                    {"role": "system",
-                     "content": f"Translate to {prompt_lang_name(req.target_lang)}. "
-                                f"Output only the translation."},
-                    {"role": "user", "content": "Hello."},
-                ],
-                max_tokens=50,
-            )
-            sample = resp.choices[0].message.content or ""
-            # v0.7.1 修复：latency 键此前缺引号（裸名）→ NameError 被
-            # except 吞掉，API 成功也回 ok=False——连通性测试恒失败
-            return {"ok": True, "latency": round(time.time() - t0, 1),
-                    "sample": sample[:60]}
-        except Exception as e:
-            last_err = str(e)[:300]
-            if attempt < max_retries:
-                time.sleep(min(2.0 * attempt, 5.0))
+    try:
+        for attempt in range(1, max_retries + 1):
+            try:
+                # v0.8.3: 走池墙钟——头部阶段（_receive_response_headers）
+                # 楔死时 httpx read timeout 不触发，裸调会让端点无限挂起
+                resp = pool.call(
+                    lambda: pool.client.chat.completions.create(
+                        model=req.model,
+                        messages=[
+                            {"role": "system",
+                             "content": f"Translate to {prompt_lang_name(req.target_lang)}. "
+                                        f"Output only the translation."},
+                            {"role": "user", "content": "Hello."},
+                        ],
+                        max_tokens=50,
+                    ),
+                    "validate-key")
+                sample = resp.choices[0].message.content or ""
+                # v0.7.1 修复：latency 键此前缺引号（裸名）→ NameError 被
+                # except 吞掉，API 成功也回 ok=False——连通性测试恒失败
+                return {"ok": True, "latency": round(time.time() - t0, 1),
+                        "sample": sample[:60]}
+            except Exception as e:
+                last_err = str(e)[:300]
+                if attempt < max_retries:
+                    time.sleep(min(2.0 * attempt, 5.0))
+    finally:
+        pool.close()
     return JSONResponse(status_code=200,
                         content={"ok": False, "error": last_err})
 

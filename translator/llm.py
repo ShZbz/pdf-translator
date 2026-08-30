@@ -15,6 +15,17 @@ v0.7.0:
   重试后仍缺的 id 逐段保留原文 + 警告（其余段正常回填）
 - 句子级缓存（模板化文本）：ref 条目/图注按句拆分跨文档复用
   （全命中才免调；翻译成功且句数对齐时回填句缓存）
+
+v0.8.3:
+- 请求墙钟 + 连接池终结（①/⑤：网关异常 × 重试叠加的根治）：
+  create()（流式/非流式头部+整包）在守护线程执行并设独立墙钟——
+  实测 httpx2 read timeout 在 _receive_response_headers 路径不触发，
+  真实网关可把请求楔死 25min+ 无异常（py-spy 实锤品类）。到点时
+  LLMClientPool.rebuild() 终结旧连接池（close 强制解堵楔死读）并换新，
+  本线程按 TimeoutError 走既有失败批重试语义
+- 重试单层化：SDK max_retries=0（LLMClientPool 统一构造），SDK 层盲
+  重试 × 自有重试的时延乘法废止（实测 5s 超时被放大到 29.7s）——
+  重试语义全部收敛到本类（内容感知：只重问缺失/违例 id）
 """
 from __future__ import annotations
 
@@ -99,6 +110,132 @@ def _parse_pairs(raw: str, want_ids: set[str]) -> "tuple[dict[str, str] | None, 
     return got, set(want_ids) - set(got)
 
 
+class LLMClientPool:
+    """自持 HTTP 连接池持有器（v0.8.3 ①：楔死终结器 + 重试单层化）。
+
+    三处入口（CLI / UI worker / validate-key）统一用它构造 OpenAI 兼容
+    client：
+    - 自持 httpx2 连接池（openai SDK 3.x 的 HTTP 栈）：看门狗到点可从
+      外部 close——SDK 自建池时外部拿不到句柄，楔死连接无法终结；
+    - SDK max_retries=0：重试单层化。SDK 层盲重试（连接类错误一律
+      重发）与 TranslationClient 自有重试相乘（5s 超时实测放大到
+      29.7s）；废止后重试语义全部收敛到自有层（内容感知，只重问
+      缺失/违例 id）。
+
+    duck-type 协议（TranslationClient 识别）：
+    ``.client``（当前 OpenAI 实例）/ ``.generation``（池代数）/
+    ``.rebuild(reason, expect_gen)``（终结并重建）/ ``.close()``。
+    构造纯离线（OpenAI() 不联网），无 key/无网环境可安全建。
+    """
+
+    def __init__(self, base_url: str, api_key: str, timeout: float):
+        self._base_url = base_url
+        self._api_key = api_key or "sk-noop"
+        self._timeout = float(timeout)
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._openai, self._http = self._build_new()
+
+    def _build_new(self) -> tuple:
+        # httpx2 是 openai SDK 3.x 的 HTTP 栈；SDK 2.x 装的是 httpx（API 同源
+        # 的前身）——按装的是哪个 SDK 用哪个，任一缺失不阻塞池构造
+        # （实测 Windows 侧 openai 2.x 环境无 httpx2，旧版直接 ImportError
+        # 令全部真翻译失败）
+        try:
+            import httpx2 as _httpx
+        except ImportError:
+            import httpx as _httpx
+        from openai import OpenAI
+        http = _httpx.Client(timeout=_httpx.Timeout(self._timeout))
+        openai_client = OpenAI(base_url=self._base_url, api_key=self._api_key,
+                               timeout=self._timeout, max_retries=0,
+                               http_client=http)
+        return openai_client, http
+
+    @property
+    def client(self):
+        return self._openai
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def rebuild(self, reason: str = "", expect_gen: int | None = None) -> bool:
+        """终结当前池并换新（看门狗楔死终结出口）。
+
+        expect_gen：调用方在发起请求前捕获的池代数——不一致说明别的
+        线程已重建过（本请求多半已被那次重建顺手解堵），跳过防把新池
+        关掉。先建新池换引用（并发线程随后的请求立即落新池），再关旧
+        池——close 强制解堵阻塞在旧池 socket 读上的请求（含楔死的
+        _receive_response_headers），它们按传输层失败走既有重试语义。
+        已知竞态：两个楔死同时到点会各重建一次，第二次会关掉第一次的
+        新池（在飞请求被解堵重试）——代价可接受，不为此加序贯协议。
+        """
+        new_openai, new_http = self._build_new()
+        rebuilt = False
+        with self._lock:
+            if expect_gen is None or expect_gen == self._generation:
+                old_openai, old_http = self._openai, self._http
+                self._openai, self._http = new_openai, new_http
+                self._generation += 1
+                rebuilt = True
+            else:
+                old_openai, old_http = new_http, new_openai   # 放弃：新池关掉
+        for c in (old_http, old_openai):
+            try:
+                c.close()
+            except Exception:
+                pass
+        return rebuilt
+
+    def close(self) -> None:
+        """进程收尾用（validate 等一次性路径）；close 后本池不可再用。"""
+        with self._lock:
+            pools = (self._http, self._openai)
+            self._openai = self._http = None
+            self._generation += 1
+        for c in pools:
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+    def call(self, fn, what: str, deadline: float = 0.0):
+        """fn() 带独立墙钟执行（与 TranslationClient._run_with_wallclock 同款
+        楔死终结语义，供 validate-key 等不经 TranslationClient 的一次性路径
+        复用——旧版 validate 直接裸调 create()，头部阶段楔死时端点无限挂起，
+        正是 v0.8.3 要根治的品类）。
+
+        到点：rebuild 终结旧池（解堵楔死读）→ 仍无结果则 TimeoutError；
+        调用方按传输层失败语义处理（validate 的 attempt 循环即重试层）。
+        """
+        out: dict = {}
+        done = threading.Event()
+        gen0 = self._generation
+
+        def _run():
+            try:
+                out["v"] = fn()
+            except BaseException as e:
+                out["e"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="llm-call").start()
+        dl = float(deadline or 0.0) or (self._timeout * 2.0 + 30.0)
+        if not done.wait(dl):
+            self.rebuild(f"{what} wallclock {dl:.0f}s", expect_gen=gen0)
+            done.wait(5.0)
+            if not done.is_set():
+                raise TimeoutError(
+                    f"{what} wedged > {dl:.0f}s (connection pool rebuilt)")
+        if "e" in out:
+            raise out["e"]
+        return out.get("v")
+
+
 class TranslationClient:
     def __init__(self, client, model: str, temperature: float = 0.0,
                  glossary_prompt: str = "", src_lang: str = "en",
@@ -117,7 +254,8 @@ class TranslationClient:
                  control=None,
                  stream: bool = True,
                  sentence_cache: bool = True,
-                 stream_deadline: float = 0.0):
+                 stream_deadline: float = 0.0,
+                 request_deadline: float = 0.0):
         self.client = client
         self.model = model
         self.temperature = temperature
@@ -165,6 +303,65 @@ class TranslationClient:
         self.sent_cache_hits = 0               # 句子级缓存命中段数（报表用）
         # v0.8.2: 流式总墙钟上限（秒；0=自动 2×timeout+30）。测试注入口
         self._stream_deadline = float(stream_deadline or 0.0)
+        # v0.8.3: create() 请求墙钟（流式头部/非流式整包共用；0=自动
+        # 2×timeout+30）。测试注入口
+        self._request_deadline = float(request_deadline or 0.0)
+
+    # ---- v0.8.3: 连接池协议 + 请求墙钟 ----
+
+    def _pool(self):
+        """duck-type 连接池持有器（LLMClientPool/测试假池）；裸 client（mock
+        注入）返回 None——墙钟仍生效，只是没有池可终结。"""
+        c = self.client
+        if c is not None and callable(getattr(c, "rebuild", None)) \
+                and getattr(c, "client", None) is not None:
+            return c
+        return None
+
+    def _cur_client(self):
+        """当前请求用的 OpenAI 实例——池持有器则取实时引用（重建后立即生效）。"""
+        pool = self._pool()
+        return pool.client if pool is not None else self.client
+
+    def _run_with_wallclock(self, fn, what: str):
+        """fn() 在守护线程执行并设独立墙钟（v0.8.3 ①/⑤）。
+
+        背景（v0.8.2 e2e 遗留）：httpx2 read timeout 在
+        _receive_response_headers 路径实测不触发，真实网关可把请求楔死
+        25min+ 无异常——HTTP 路径的独立墙钟是最后防线。到点：
+        池持有器 → rebuild()（旧池 close 强制解堵楔死读，再稍等片刻让
+        解堵异常自然返回）；裸 client（测试 mock）→ 直接按墙钟失败。
+        两条路都把 TimeoutError 交给 _ask 的传输层失败语义（退避重试）。
+        被放弃的守护线程随旧池 close 或网关最终响应自然消亡（daemon）。
+        """
+        out: dict = {}
+        done = threading.Event()
+        pool = self._pool()
+        gen0 = getattr(pool, "generation", None) if pool is not None else None
+
+        def _run():
+            try:
+                out["v"] = fn()
+            except BaseException as e:      # 原样带回调用线程判型
+                out["e"] = e
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_run, daemon=True, name="llm-create")
+        t.start()
+        deadline = self._request_deadline or (self.timeout * 2.0 + 30.0)
+        if not done.wait(deadline):
+            if pool is not None:
+                pool.rebuild(f"{what} wallclock {deadline:.0f}s",
+                             expect_gen=gen0)
+                done.wait(5.0)              # close 通常立刻解堵楔死读
+            if not done.is_set():
+                raise TimeoutError(
+                    f"{what} wedged > {deadline:.0f}s "
+                    f"(connection pool {'rebuilt' if pool is not None else 'absent'})")
+        if "e" in out:
+            raise out["e"]
+        return out.get("v")
 
     # ---- prompt 构造 ----
     def _system_prompt(self, budget_rule: str = "") -> str:
@@ -323,13 +520,16 @@ class TranslationClient:
 
     def _request(self, messages: list[dict],
                  want_ids: set[str] | None = None) -> str:
-        """一次 HTTP 请求（v0.7.0 流式优先）。
+        """一次 HTTP 请求（v0.7.0 流式优先；v0.8.3 create() 全程独立墙钟）。
 
         流式路径增量收 delta，每当缓冲区出现新的已闭合 "id":"…" 对就记账；
         want_ids 全部收齐即 break——模型爱在 JSON 后面跟的解释性废话
         一个 token 都不用等（实测省 10-30% 批耗时）。断流点之后所有对
         已由 , 或 } 闭合，_parse_pairs 必然全量命中。
         流式通道异常（网关不支持 stream/代理剥离 SSE）自动退非流式重发。
+        v0.8.3: 流式/非流式的 create() 都经 _run_with_wallclock——头部
+        等待阶段（_receive_response_headers）的 httpx2 read timeout 失效
+        楔死由墙钟终结（池持有器 rebuild + TimeoutError → 退避重试）。
         """
         kwargs = dict(model=self.model, temperature=self.temperature,
                       timeout=self.timeout, messages=messages)
@@ -350,8 +550,10 @@ class TranslationClient:
                 # 重发（该路径 httpx 对整包读取有完整超时语义）
                 deadline = self._stream_deadline or (self.timeout * 2.0 + 30.0)
                 t0 = time.monotonic()
-                stream = self.client.chat.completions.create(
-                    stream=True, **kwargs)
+                stream = self._run_with_wallclock(
+                    lambda: self._cur_client().chat.completions.create(
+                        stream=True, **kwargs),
+                    "stream create")
                 if not hasattr(stream, "__iter__"):
                     # 网关/mock 无视 stream 参数直接回完整响应对象——
                     # 当非流式结果用（不再二次请求，响应已被本次消耗）
@@ -400,7 +602,9 @@ class TranslationClient:
                         close()
                     except Exception:
                         pass
-        resp = self.client.chat.completions.create(**kwargs)
+        resp = self._run_with_wallclock(
+            lambda: self._cur_client().chat.completions.create(**kwargs),
+            "non-stream request")
         return resp.choices[0].message.content or ""
 
     @staticmethod
@@ -888,6 +1092,24 @@ class StreamingTranslator:
         todo, self._open = self._open, []
         _chars, self._open_chars = self._open_chars, []
         self._spawn(todo)
+
+    def abort(self) -> None:
+        """v0.8.3: 失败/取消路径的批终结——撤销未起跑的批、不再等在飞批。
+
+        _translate_streaming 的错误路径调用（布局线程异常/取消/OCR 失败）：
+        旧版直接 raise，线程池既不 shutdown 也不 cancel——排队批继续烧
+        LLM 调用，回退顺序路径后新旧两条路并发请求（预算/缓存记账互不
+        知情）。cancel_futures 撤销队列中的批；已起跑的批让其自然结束
+        （单批有请求墙钟兜底，不会无限挂）。幂等：重复调用无副作用。
+        """
+        self._open, self._open_chars = [], []
+        pool, self._pool = self._pool, None
+        futures, self._futures = self._futures, []
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            for fut in futures:
+                if not fut.done():
+                    fut.cancel()
 
     def _spawn(self, batches: list[list[int]]) -> None:
         """提交批进线程池（池惰性建；触顶后按放弃语义丢弃）。"""

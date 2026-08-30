@@ -133,7 +133,7 @@ def test_reflow_template_and_model():
     mb1, rect1 = tpl.frame(1)
     assert mb1 is None and abs(rect1.y0 - rect.y0) < 0.01
     typo = _typo_zh()
-    blocks, images, bookmarks = build_document_model(
+    blocks, images, bookmarks, _ls = build_document_model(
         lays, doc, texts, {(1, 0): "0.91", (1, 1): "0.91"}, {}, set(),
         {}, typo)
     kinds = [b.kind for b in blocks]
@@ -231,7 +231,7 @@ def test_reflow_cross_page_merge_whole():
     texts = {0: {0: "页一末句译文的_B_部分。"}, 1: {0: "页一首句的B部分。"}}
     cross_full = {(0, 0): "页一末句与页一首句合并后的完整译文段落。"}
     cross_skip = {(1, 0)}
-    blocks, _images, _bm = build_document_model(
+    blocks, _images, _bm, _ls = build_document_model(
         lays, doc, texts, {}, cross_full, cross_skip, {}, _typo_zh())
     paras = [b.text for b in blocks if b.kind == "para"]
     assert paras == ["页一末句与页一首句合并后的完整译文段落。"], paras

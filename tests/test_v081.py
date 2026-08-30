@@ -77,7 +77,7 @@ def test_reflow_baked_regions_no_text_leak():
     doc.new_page(width=612, height=792)
     lay = _baked_leak_layout()
     cell_texts = {(0, 0): "方法", (0, 1): "得分", (0, 2): "PLG", (0, 3): "0.91"}
-    blocks, _imgs, _bm = build_document_model(
+    blocks, _imgs, _bm, _ls = build_document_model(
         [lay], doc, {0: {0: "前导段落译文。"}}, cell_texts, {}, set(), {},
         _typo_zh())
     paras = [b.text for b in blocks if b.kind == "para"]
@@ -97,7 +97,7 @@ def test_reflow_unbaked_text_still_returns():
     doc = pymupdf.open()
     doc.new_page(width=612, height=792)
     lay = _baked_leak_layout()
-    blocks, _imgs, _bm = build_document_model(
+    blocks, _imgs, _bm, _ls = build_document_model(
         [lay], doc, {0: {0: "前导段落译文。"}}, {}, {}, set(), {}, _typo_zh())
     paras = [b.text for b in blocks if b.kind == "para"]
     assert any("Author Block" in t for t in paras), \

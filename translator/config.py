@@ -238,6 +238,10 @@ class PerformanceConfig:
     # v0.7.1: 项目级缓存库位置（空=自动：输入文件目录，只读时退输出目录）。
     # 同一输入译到不同输出目录共享翻译缓存/版面缓存；文档按内容指纹索引
     cache_dir: str = ""
+    # v0.8.3: 按文档字体子集化（fontTools 可选依赖，未装自动跳过并提示）。
+    # 实测输出嵌完整 SimSun 17.5MB + SimHei 9.3MB——子集化后输出文件
+    # 约 15MB → 2-4MB。false=保持旧版完整字体嵌入
+    subset_fonts: bool = True
 
 
 @dataclass
@@ -353,7 +357,8 @@ def load_config(path: str | Path) -> Config:
     reflow_cfg.segment_blocks = max(int(reflow_cfg.segment_blocks or 500),
                                     50)
     feat_bilingual = bool((raw.get("features") or {}).get("bilingual"))
-    if out_cfg.mode == "reflow" and feat_bilingual:        raise ValueError(
+    if out_cfg.mode == "reflow" and feat_bilingual:
+        raise ValueError(
             "reflow 模式暂不支持双语对照（双语为 faithful 专有排版）；"
             "请 output.mode: faithful 或关闭 features.bilingual")
     render_cfg = _filtered(RenderConfig, raw.get("render") or {})

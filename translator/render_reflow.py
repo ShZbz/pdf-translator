@@ -32,7 +32,8 @@ import pymupdf
 
 from .render import _build_font_archive, _clean_zh_text, _dir_css, _html_escape
 
-# 单 Story 块数软上限：超过则在章节边界分段写入（防超长文档内存膨胀）
+# 单 Story 块数软上限默认值（可被 reflow.segment_blocks 配置覆盖：
+# 超过则在章节边界分段写入，防超长文档内存膨胀）
 SEGMENT_BLOCKS = 500
 # 图注绑定：图下注/表上注的最大吸附距离（pt）
 _CAPTION_GAP = 34.0
@@ -130,10 +131,143 @@ class Block:
     width_pt: float = 0.0         # 位图原宽（pt）
     img_name: str = ""            # archive 内名（位图块）
     html_id: str = ""             # 书签锚 id（heading 段）
+    # ---- v0.8.3 ②：链接重映射（reflow 下源页链接全部丢失的修复）----
+    # links: 源页归属到本块的链接记录（build_document_model 几何归属，
+    # render 阶段完成译文内定位与 href 构造；字段见 _collect_page_links）
+    links: list = field(default_factory=list)
+    anchor_id: str = ""           # 内部跳转目标锚 id（ltN；标题块复用 hd 锚）
 
 
 _ORDERED_MARKER_RE = re.compile(
     r"^\s*[\(\[（【]?(?:\d{1,2}|[ivxIVX]{1,4}|[a-hA-H])[\)\]）】]?[.、：\s]")
+
+# ---- v0.8.3 ②：链接重映射（reflow 与 faithful 的最大单项体验差距收口）----
+# 实测探针（本文件写入路径 + pymupdf 1.28.2）：
+# - Story 手动 place/draw 循环不物化 <a> 链接（0 注释）；
+#   story.write(writer, rectfn, positionfn) + 位置后处理才产链接；
+# - <a href="URI"> → LINK_URI；<a href="#锚"> → LINK_GOTO 指向 id=锚
+#   元素 rect 左上角（Story.add_pdf_links 语义，探针实测命中）；
+# - insert_pdf 携带链接注释跨段合并（GoTo 页码重映射正确）；
+#   save(garbage=4, deflate) 存活。
+# 上游 add_pdf_links 对「#锚 无对应 id」直接 raise——本文件自实现
+# 可控版本（缺失目标跳过计数，绝不阻塞出片）。
+
+def _collect_page_links(page, n_layout_pages: int) -> list[dict]:
+    """源页链接 → 归一化记录（几何归属在调用方做）。
+
+    记录字段：rect（源矩形）/ href_kind（"uri"|"goto"）/ uri / dest
+    （goto 的 (目标页号, Point)）/ src（矩形下源文本，去空白归一化）/
+    owner（段落索引，调用方回填）/ field（"text"|"caption"，回填）。
+    仅收录 URI 与已解析的 GOTO/NAMED；LAUNCH/GOTOR/空 URI/越界目标
+    不进（调用方按 unsupported 计数）。
+    """
+    out: list[dict] = []
+    try:
+        raw = page.get_links()
+    except Exception:
+        return out
+    for l in raw:
+        # v0.8.3: 单条防御——奇形 PDF 的链接字段缺 to/from 或类型意外时
+        # 跳过该条，绝不让一条坏链接炸掉整个 reflow 渲染
+        try:
+            rec = _normalize_link(l, n_layout_pages)
+        except Exception:
+            continue
+        if rec is None:
+            continue
+        try:
+            rec["src"] = "".join(
+                ch for ch in (page.get_text("text", clip=rec["rect"]) or "")
+                if not ch.isspace())
+        except Exception:
+            rec["src"] = ""
+        rec["owner"] = None
+        rec["field"] = "text"
+        out.append(rec)
+    return out
+
+
+def _normalize_link(l: dict, n_layout_pages: int) -> "dict | None":
+    """get_links 单条 → 归一化记录（URI / 已解析 GOTO·NAMED；其余 None）。
+
+    记录自带 rect（源矩形）。
+    """
+    r = l.get("from")
+    if r is None or getattr(r, "is_empty", True):
+        return None
+    k = l.get("kind")
+    if k == pymupdf.LINK_URI:
+        uri = (l.get("uri") or "").strip()
+        if uri:
+            return {"href_kind": "uri", "uri": uri,
+                    "rect": pymupdf.Rect(r)}
+        return None
+    if k in (pymupdf.LINK_GOTO, pymupdf.LINK_NAMED):
+        tp, to = l.get("page"), l.get("to")
+        if tp is not None and 0 <= int(tp) < n_layout_pages \
+                and to is not None:
+            return {"href_kind": "goto",
+                    "dest": (int(tp), pymupdf.Point(to.x, to.y)),
+                    "rect": pymupdf.Rect(r)}
+    return None
+
+
+def _norm_find(text: str, pat: str, start: int = 0) -> "tuple[int, int] | None":
+    """去空白归一化子串定位 → 原文字符区间（译文内链接文本定位）。
+
+    链接文本（"[22]" 引文标记 / URL / DOI）在译文里保形，但重排后
+    空白/换行位置漂移——按去空白序列匹配；引文/公式编号的括号常被
+    译者写成全角（"(3)"→"（3）"），折叠成半角再比（实测真译 56/64 →
+    恢复率受此影响）。start 为原文侧搜索起点（多链接单调游标，同段
+    重复引文序匹配）。
+    """
+    if not pat or not text:
+        return None
+    fold = str.maketrans("（）［］｛｝", "()[]{}")
+    idx: list[int] = []
+    buf: list[str] = []
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            continue
+        buf.append(ch.translate(fold))
+        idx.append(i)
+    t_norm = "".join(buf)
+    p_norm = "".join(ch for ch in pat if not ch.isspace()).translate(fold)
+    m = t_norm.find(p_norm, sum(1 for c in text[:start] if not c.isspace()))
+    if m < 0 and start > 0:                 # 游标后未见：回退全文找首现
+        m = t_norm.find(p_norm)
+    if m < 0 or m + len(p_norm) > len(idx):
+        return None
+    return idx[m], idx[m + len(p_norm) - 1] + 1
+
+
+def _attr_escape(s: str) -> str:
+    """href 属性值转义（_html_escape 不转引号，属性上下文必须处理）。"""
+    return (s.replace("&", "&amp;").replace('"', "&quot;")
+             .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _link_wrap(text: str, links: list, field: str) -> str:
+    """按已定位 span 把链接文本包 <a href>（blocks_to_html 段落/图注出口）。
+
+    span 未定位（None）的链接不包（静默丢该链接，计数在渲染汇总）；
+    区间按起点排序 + 重叠守卫（理论不重叠，防御性跳过）。
+    """
+    ls = [l for l in links
+          if l.get("field", "text") == field and l.get("span")]
+    if not ls:
+        return _html_escape(text)
+    out, pos = "", 0
+    for l in sorted(ls, key=lambda x: x["span"][0]):
+        s, e = l["span"]
+        if s < pos:
+            continue
+        out += (_html_escape(text[pos:s])
+                + f'<a href="{_attr_escape(l["href"])}">'
+                + _html_escape(text[s:e]) + "</a>")
+        pos = e
+    return out + _html_escape(text[pos:])
+
 
 # 伪代码碎片形态（Algorithm 框判定漏网块——faithful 原位无感，reflow
 # 拆位图后成散落文本行，实测 paper3 p4 'action = {ak, Lk}' 等）
@@ -191,13 +325,16 @@ def _strip_marker(text: str) -> str:
 _BULLET_SPLIT_RE = re.compile(r"[•◦‣▪●▸]")
 
 
-def _group_lists(blocks: list[Block]) -> list[Block]:
+def _group_lists(blocks: list[Block]) -> "tuple[list[Block], int]":
     """连续 list-item 段合成语义列表块（任务 1.5 在 reflow 落地）。
 
     并段残留的句中项目符号（源 PDF 贡献列表多符号并入一块）拆成多个
     <li>——悬挂缩进与符号由引擎生成。
+    v0.8.3 ②: 返回值追加被吸收段落携带的链接数（<li> 文本与段落文本
+    剥标记后不一致，span 定位不迁移——按已知限制计数丢弃）。
     """
     out: list[Block] = []
+    n_links = 0
     i = 0
     while i < len(blocks):
         b = blocks[i]
@@ -210,6 +347,7 @@ def _group_lists(blocks: list[Block]) -> list[Block]:
                     and bool(_ORDERED_MARKER_RE.match(
                         blocks[j].text)) == ordered:
                 bj = blocks[j]
+                n_links += len(bj.links)
                 if ordered:
                     texts.append(_strip_marker(bj.text))
                 else:
@@ -226,7 +364,7 @@ def _group_lists(blocks: list[Block]) -> list[Block]:
         else:
             out.append(b)
             i += 1
-    return out
+    return out, n_links
 
 
 def build_document_model(page_layouts: list[dict], doc,
@@ -235,19 +373,26 @@ def build_document_model(page_layouts: list[dict], doc,
                          formula_pixmaps: dict, typo,
                          warnings: "list | None" = None,
                          dcache=None, doc_fp: "str | None" = None) \
-        -> tuple[list[Block], dict[str, bytes], list[dict]]:
+        -> tuple[list[Block], dict[str, bytes], list[dict], dict]:
     """layout 全输出 → 跨页阅读序统一块流。
 
-    返回 (blocks, images{name: png_bytes}, bookmarks[{level, text}])；
-    书签页码由写入循环回填。公式位图复用 pipeline 预裁 PNG（与 faithful
-    同源，reflow 不重复裁剪）；图区/表格/verbatim 位图此处从原 doc 裁剪
-    （reflow 不 redact，原像素完整）。
+    返回 (blocks, images{name: png_bytes}, bookmarks[{level, text}],
+    link_stats)；书签页码由写入循环回填。公式位图复用 pipeline 预裁 PNG
+    （与 faithful 同源，reflow 不重复裁剪）；图区/表格/verbatim 位图此处
+    从原 doc 裁剪（reflow 不 redact，原像素完整）。
     v0.8.1 S4: dcache/doc_fp 提供时全部 300dpi 裁图入项目位图缓存
     （(指纹,页,区域,dpi) 内容寻址——重跑/调开关重渲染场景免重裁）。
+    v0.8.3 ②: 源页链接按几何归属挂块（Block.links）——链接矩形与段落
+    bbox 最大相交者为归属；跨页合并 B 半句的链接改挂 A 段块（整段译文
+    在 A）；内部跳转目标（引文→文献条目/图注）按 dest 点位在区域登记
+    表解析。link_stats: {total, unowned, no_target, grouped}。
     """
     warn = warnings if warnings is not None else []
     images: dict[str, bytes] = {}
     bm_by_block: dict[int, dict] = {}
+    link_stats = {"total": 0, "unowned": 0, "no_target": 0, "grouped": 0}
+    para_blocks: dict[tuple[int, int], Block] = {}   # (pno, para_i) → 块
+    regions: list[tuple[int, pymupdf.Rect, Block]] = []   # 跳转目标解析用
 
     def _crop(page, rect: "pymupdf.Rect", name: str, dpi: int = 300) -> str:
         png = None
@@ -272,6 +417,41 @@ def build_document_model(page_layouts: list[dict], doc,
                 (lay.get("figure_regions") or [])]
         tabs = lay.get("tables") or []
         formulas = lay.get("formulas") or []
+
+        # --- v0.8.3 ②：源页链接收集 + 段落几何归属（阅读序） ---
+        plinks = _collect_page_links(page, len(page_layouts))
+        link_stats["total"] += len(plinks)
+        owned: dict[int, list] = {}
+        for lk in plinks:
+            best_i, best_a = None, 0.0
+            for i, p in enumerate(paras):
+                pb = pymupdf.Rect(p["bbox"])
+                ir = pymupdf.Rect(lk["rect"])
+                ir.intersect(pb)
+                a = ir.get_area()
+                if a > best_a:
+                    best_a, best_i = a, i
+            if best_i is not None and (pno, best_i) in cross_skip:
+                # 跨页合并 B 半句：整段译文在 A 段块（cross_full 的 key）
+                cand = [pi for (pa, pi) in cross_full if pa == pno - 1]
+                ab = para_blocks.get((pno - 1, max(cand))) if cand else None
+                if ab is not None:
+                    ab.links.append(lk)      # A 块已在早前页建好
+                    lk["owner"] = -1        # 已归属标记（计数豁免）
+                    best_i = None
+            if best_i is not None:
+                lk["owner"] = best_i
+                owned.setdefault(best_i, []).append(lk)
+        plinks.sort(key=lambda l: (l["rect"].y0, l["rect"].x0))
+        for ls in owned.values():
+            ls.sort(key=lambda l: (l["rect"].y0, l["rect"].x0))
+
+        def _take_links(i: int, field: str = "text") -> list:
+            """取出归属段落 i 的链接（标记 field：text/caption）。"""
+            ls = owned.pop(i, [])
+            for lk in ls:
+                lk["field"] = field
+            return ls
 
         # --- 图注绑定：图下注（Fig.）吸附图区；表上注吸附表区 ---
         # 注可位于区 y 范围之外（下方贴邻）或区内下半部（源排版把注
@@ -335,6 +515,7 @@ def build_document_model(page_layouts: list[dict], doc,
                           width_pt=grow.width)
                 baked_rects.append(pymupdf.Rect(grow))
                 entries.append((grow.y0, grow.x0, p.get("col", 0), b, None))
+                regions.append((pno, pymupdf.Rect(grow), b))
                 continue
             style = typo.resolve(p, _doc_body_size(page_layouts))
             kind_cls = style.kind
@@ -344,6 +525,9 @@ def build_document_model(page_layouts: list[dict], doc,
                 kind_cls = "list_item"
             b = Block(kind="para", text=txt, kind_cls=kind_cls,
                       src_text=p["text"])
+            b.links = _take_links(i)
+            para_blocks[(pno, i)] = b
+            regions.append((pno, r, b))
             if kind_cls in ("title", "sec_title", "subsec_title"):
                 # 书签元数据挂块上——最终书签序由文档流序推导（entries
                 # 构建序是栏序，直接 append 会把右栏标题排到节标题后）
@@ -368,6 +552,7 @@ def build_document_model(page_layouts: list[dict], doc,
             b = Block(kind="formula", img_name=name, width_pt=fr.width)
             entries.append((fr.y0, fr.x0, -1, b, fr))
             baked_rects.append(fr)
+            regions.append((pno, fr, b))
 
         # 图区（+绑定图注；裁剪修整见 _trim_region——区域检测 bbox 可能
         # 吞进邻接作者块/正文边缘，faithful 原位无感而 reflow 搬运后
@@ -385,8 +570,11 @@ def build_document_model(page_layouts: list[dict], doc,
             b = Block(kind="figure", img_name=name, width_pt=fr.width)
             if ci is not None:
                 b.caption = _clean_zh_text(ptext(ci))
+                b.links = _take_links(ci, "caption")
+                regions.append((pno, cap_r, b))   # 图注点位 → 图块锚
             entries.append((fr.y0, fr.x0, -1, b, fr))
             baked_rects.append(pymupdf.Rect(fr))
+            regions.append((pno, fr, b))
 
         # 表格（高置信 HTML 重排 / 低置信整表位图，任务 3.3）
         cell_off = 0
@@ -430,8 +618,11 @@ def build_document_model(page_layouts: list[dict], doc,
             ci = tab_caps.get(ti)
             if ci is not None:
                 b.caption = _clean_zh_text(ptext(ci))
+                b.links = _take_links(ci, "caption")
+                regions.append((pno, pymupdf.Rect(paras[ci]["bbox"]), b))
             entries.append((tr.y0, tr.x0, -1, b, tr))
             cell_off += len(cells)
+            regions.append((pno, pymupdf.Rect(tr0), b))
 
         # 被吞文字带回归文流：未烘焙进任何位图区域的 fig_text_blocks。
         # 自然语言（作者块/机构行）→ 原文文本块回流；伪代码形态碎片
@@ -466,11 +657,20 @@ def build_document_model(page_layouts: list[dict], doc,
         for m in _merge_adjacent_bands(nat_bands):
             b = Block(kind="para", text=_clean_zh_text(m["t"]),
                       kind_cls="body", src_text=m["t"])
+            # v0.8.3 ②：无段落归属的链接（作者 ORCID/邮箱等图区带内链接）
+            # 按与并块带的相交归属兜底——带文本即原文，src 直接可匹配
+            rest = [lk for lk in plinks
+                    if lk["owner"] is None and lk["field"] == "text"
+                    and pymupdf.Rect(lk["rect"]).intersects(m["r"])]
+            b.links = rest
+            for lk in rest:
+                lk["owner"] = -1           # 标记已归属（band 兜底）
             # geo=None：自然语言带按列项参与栏序（hint 已按 x 中点定栏）。
             # 传 rect 会让 _is_fullwidth 把跨几何中线的带升级成全宽分带
             # ——作者区横跨中线的带会把同 y 左栏第一作者段落挤到后面
             # （实测 paper3 p1 作者序 3rd/2nd/1st 错乱根因）
             entries.append((m["r"].y0, m["r"].x0, m["hint"], b, None))
+            regions.append((pno, m["r"], b))
         for r, t, hint in frag_bands:
             grow = pymupdf.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2)
             name = _crop(page, grow, f"ft{pno}_{len(baked_rects)}")
@@ -478,13 +678,50 @@ def build_document_model(page_layouts: list[dict], doc,
                       width_pt=grow.width)
             baked_rects.append(pymupdf.Rect(grow))
             entries.append((r.y0, r.x0, hint, b, r))
+            regions.append((pno, pymupdf.Rect(grow), b))
 
         blocks.extend(_order_page(entries, page, page_layouts))
+        # 无文本块可挂（位图区/verbatim 段）的链接计数——band 兜底已
+        # 打过 owner=-1 标记，此处剩的是真丢弃
+        link_stats["unowned"] += sum(len(v) for v in owned.values()) \
+                                 + sum(1 for lk in plinks
+                                       if lk["owner"] is None)
+
+    # v0.8.3 ②：内部跳转目标解析（dest 点位 → 目标块引用）。
+    # 优先包含 dest 点的最小区域（段/图/表/公式/图注登记表）；无包含时
+    # 取 dest 下方最近区域。包含判定带 2pt 容差——实测 named dest 的
+    # to 点常落在段落 bbox 边界外 1e-5pt（x=54.0 vs bbox.x0=54.000011），
+    # 纯浮点边界差不容差会误判无目标。
+    def _resolve_target(dest: tuple) -> "Block | None":
+        tp, to = dest
+        cands = [(rr, b) for (pp, rr, b) in regions if pp == tp]
+        best = None
+        for rr, b in cands:
+            grown = pymupdf.Rect(rr.x0 - 2, rr.y0 - 2, rr.x1 + 2, rr.y1 + 2)
+            if grown.contains(to) and (best is None
+                                       or rr.get_area() < best[0].get_area()):
+                best = (rr, b)
+        if best is not None:
+            return best[1]
+        below = [(rr.y0 - to.y, abs((rr.x0 + rr.x1) / 2 - to.x), rr, b)
+                 for rr, b in cands if rr.y0 >= to.y - 2]
+        if below:
+            below.sort(key=lambda t: (t[0], t[1]))
+            return below[0][3]
+        return None
+
+    for b in blocks:
+        for lk in b.links:
+            if lk.get("href_kind") == "goto":
+                lk["target"] = _resolve_target(lk["dest"])
+                if lk["target"] is None:
+                    link_stats["no_target"] += 1
 
     # 书签按最终文档流序推导（跨页 + 页内分带序）
     bookmarks = [bm_by_block[id(b)] for b in blocks if id(b) in bm_by_block]
-    blocks = _group_lists(blocks)
-    return blocks, images, bookmarks
+    blocks, n_grouped_links = _group_lists(blocks)
+    link_stats["grouped"] += n_grouped_links
+    return blocks, images, bookmarks, link_stats
 
 
 def _x_overlap(a: "pymupdf.Rect", b: "pymupdf.Rect") -> float:
@@ -768,7 +1005,12 @@ _KIND_TAG = {"title": "h1", "sec_title": "h2", "subsec_title": "h3"}
 
 
 def blocks_to_html(blocks: list[Block], col_width: float, cjk: bool) -> str:
-    """块流 → 单 Story HTML（顶级块元素序列；样式全在预设样式表）。"""
+    """块流 → 单 Story HTML（顶级块元素序列；样式全在预设样式表）。
+
+    v0.8.3 ②: 带链接块的文本按已定位 span 包 <a href>（URI 直通 /
+    内部跳转 #锚）；跳转目标块元素携带 id（ltN，标题块复用书签 hd 锚）
+    ——story.write 的位置回调会记录锚点，出墨后据此重插链接注释。
+    """
     parts: list[str] = []
     for b in blocks:
         if b.kind == "list":
@@ -780,10 +1022,12 @@ def blocks_to_html(blocks: list[Block], col_width: float, cjk: bool) -> str:
                          f'style="width:{w:.1f}pt"></p>')
             continue
         if b.kind in ("figure", "verbatim", "table"):
-            cap = (f'<p class=caption>{_html_escape(b.caption)}</p>'
+            cap = (f'<p class=caption>'
+                   f'{_link_wrap(b.caption, b.links, "caption")}</p>'
                    if b.caption else "")
             if b.kind == "table" and b.html_extra:
-                parts.append(f'<div class=fig>{cap}{b.html_extra}</div>')
+                parts.append(f'<div class=fig{_id_attr(b)}>{cap}'
+                             f'{b.html_extra}</div>')
             else:
                 w = min(b.width_pt, col_width)
                 img = (f'<p class=fc><img src="{b.img_name}" '
@@ -791,7 +1035,7 @@ def blocks_to_html(blocks: list[Block], col_width: float, cjk: bool) -> str:
                 # 表注在表上方（学术惯例），图注在图下方
                 inner = f"{cap}{img}" if b.kind == "table" else \
                     f"{img}{cap}"
-                parts.append(f'<div class=fig>{inner}</div>')
+                parts.append(f'<div class=fig{_id_attr(b)}>{inner}</div>')
             continue
         # 段落
         tag = _KIND_TAG.get(b.kind_cls, "p")
@@ -808,56 +1052,149 @@ def blocks_to_html(blocks: list[Block], col_width: float, cjk: bool) -> str:
             elif cjk and b.kind_cls == "body":
                 extra = ' class="ti"'
         hid = f" {b.html_id}" if b.html_id else ""
-        parts.append(f"<{tag}{extra}{hid}>{_html_escape(b.text)}</{tag}>")
+        aid = "" if hid else _id_attr(b)
+        parts.append(f"<{tag}{extra}{hid}{aid}>"
+                     f"{_link_wrap(b.text, b.links, 'text')}</{tag}>")
     return "".join(parts)
+
+
+def _id_attr(b: Block) -> str:
+    """跳转目标锚属性（空串=无）。标题块的书签 html_id 优先（复用锚）。"""
+    if b.html_id:
+        return f" {b.html_id}"
+    return f" id={b.anchor_id}" if b.anchor_id else ""
 
 
 # ---- 任务 3.3：整文档流式写入 ----
 
+# 写入循环保险丝：正常文档远达不到（模板框无限供给自动断页），
+# 防御性兜底（旧版手动循环同款无界风险）
+_MAX_FRAMES = 20000
+
+
 def _write_segment(html: str, css: str, template: Template, archive,
-                   heading_ids: set) -> tuple[bytes, list[dict]]:
-    """单段 Story → PDF bytes + 书签落位 [{id, page, y}]。"""
+                   heading_ids: set) -> "tuple[bytes, list]":
+    """单段 Story → PDF bytes + element_positions（书签/链接定位源）。
+
+    v0.8.3 ②: 手动 place/draw 循环换 Story.write——与旧循环同构
+    （mediabox 真值开新页、frame 无限供给、not more 终止），但
+    positionfn 收集的 ElementPosition 带 href 字段（<a> 元素才有），
+    出墨后 _add_story_links 据此物化链接注释（旧循环 0 链接，探针实测）。
+    书签 marks（hd 锚 → 页号+y）由调用方从 positions 提取（语义与
+    旧循环一致：首 open 事件）。
+    """
     story = pymupdf.Story(html=html, user_css=css, archive=archive)
     stream = io.BytesIO()
     writer = pymupdf.DocumentWriter(stream)
-    dev = None
-    rect_num = 0
-    page_no = -1
-    filled = pymupdf.Rect(0, 0, 0, 0)
-    marks: list[dict] = []
-    seen: set = set()
-    while 1:
+    positions: list = []
+
+    def _rectfn(rect_num: int, filled):
+        if rect_num > _MAX_FRAMES:
+            raise RuntimeError("reflow story exceeded frame fuse")
         mediabox, rect = template.frame(rect_num)
-        rect_num += 1
-        if mediabox:
-            if dev is not None:
-                writer.end_page()
-            page_no += 1
-            dev = writer.begin_page(mediabox)
-        more, filled = story.place(rect)
-        got: list = []
-        story.element_positions(lambda p: got.append(p))
-        for p in got:
-            hid = getattr(p, "id", None)
-            if hid in heading_ids and hid not in seen \
-                    and getattr(p, "open_close", 0) == 1:
-                seen.add(hid)
-                r = getattr(p, "rect", None)
-                if r is None:
-                    y = 0.0
-                elif hasattr(r, "y0"):
-                    y = r.y0
-                else:
-                    y = r[1]
-                marks.append({"id": hid, "page": page_no, "y": y})
-        story.draw(dev, None)
-        if not more:
-            if dev is not None:
-                writer.end_page()
-            break
+        return mediabox, rect, None
+
+    story.write(writer, _rectfn, positionfn=positions.append)
     writer.close()
     stream.seek(0)
-    return stream.read(), marks
+    return stream.read(), positions
+
+
+def _extract_bookmark_marks(positions: list, heading_ids: set) -> list[dict]:
+    """positions → 书签落位 [{id, page, y}]（首 open 事件，同旧循环）。"""
+    marks: list[dict] = []
+    seen: set = set()
+    for p in positions:
+        hid = getattr(p, "id", None)
+        if hid in heading_ids and hid not in seen \
+                and getattr(p, "open_close", 0) == 1:
+            seen.add(hid)
+            r = getattr(p, "rect", None)
+            if r is None:
+                y = 0.0
+            elif hasattr(r, "y0"):
+                y = r.y0
+            else:
+                y = r[1]
+            marks.append({"id": hid, "page": p.page_num - 1, "y": y})
+    return marks
+
+
+def _add_story_links(pdf_doc, positions: list) -> "set[str]":
+    """ElementPosition → 输出 PDF 链接注释（v0.8.3 ②：reflow 链接重插）。
+
+    Story.add_pdf_links 的可控版：语义相同（<a href="URI"> → LINK_URI；
+    <a href="#锚"> → LINK_GOTO 指向 id=锚 元素 rect 左上角），差异：
+    - 内部锚缺失（目标块被分段/列表吸收/文本未定位）→ 跳过不 raise
+      ——上游直接 RuntimeError，任一坏锚会废掉全部链接；
+    - 逐条 try/except：单条插入失败只丢该条，绝不阻塞出片；
+    - 同一 <a> 的行内碎片合并为单条注释——碎片 rect 可为零宽（探针
+      实测首碎片 x0==x1），逐条插会产生不可点空链接。合并仅限「同页
+      同 href 同行且水平间隙 ≤12pt」：普通文本不产 positions，同段两处
+      独立引文在流里相邻，无条件并会把两引文之间的正文全圈进链接；
+      跨行换行的 URL 碎片各成一条注释（PDF 惯例，语义不变）。
+    返回 (成功落锚的 href 集, 实插注释数)——渲染层据此核算恢复率。
+    """
+    id_to_pos: dict = {}
+    for p in positions:
+        if (getattr(p, "open_close", 0) & 1) and getattr(p, "id", None) \
+                and p.id not in id_to_pos:
+            id_to_pos[p.id] = p
+    runs: list = []       # [page_num, href, rect]
+    for pf in positions:
+        href = getattr(pf, "href", None)
+        if not href or not (getattr(pf, "open_close", 0) & 1):
+            continue
+        pg = getattr(pf, "page_num", 0)
+        r = pymupdf.Rect(pf.rect)
+        if runs:
+            pg0, h0, r0 = runs[-1]
+            if pg0 == pg and h0 == href:
+                same_line = (min(r0.y1, r.y1) - max(r0.y0, r.y0)
+                             > 0.5 * min(r0.height, r.height, 1.0))
+                if same_line and -2 <= r.x0 - r0.x1 <= 12:
+                    runs[-1][2] = r0 | r
+                    continue
+        runs.append([pg, href, r])
+    placed: set = set()
+    n_ann = 0
+    for pg, href, rect in runs:
+        if rect.is_empty or rect.get_area() <= 1.0:
+            continue                       # 独立零宽碎片：不可点，丢弃
+        try:
+            link = {"from": rect}
+            if href.startswith("#"):
+                tgt = id_to_pos.get(href[1:])
+                if tgt is None:
+                    continue               # 坏锚：跳过（上游会 raise）
+                x0, y0 = tgt.rect[0], tgt.rect[1]
+                link["kind"] = pymupdf.LINK_GOTO
+                link["to"] = pymupdf.Point(x0, y0)
+                link["page"] = tgt.page_num - 1
+            else:
+                link["kind"] = pymupdf.LINK_URI
+                link["uri"] = href
+            pdf_doc[pg - 1].insert_link(link)
+            placed.add(href[1:] if href.startswith("#") else href)
+            n_ann += 1
+        except Exception:
+            continue
+    return placed, n_ann
+
+
+def _split_segments(blocks: list[Block], limit: int) -> list["list[Block]"]:
+    """章节边界分段（超长文档防内存）：满 limit 且块尾是标题时切。
+
+    limit 来自 reflow.segment_blocks 配置（v0.8.3 修复：旧版配置键
+    存在但渲染层读的是模块常量 SEGMENT_BLOCKS，配置改了不生效）。
+    """
+    segments: list[list[Block]] = [[]]
+    for b in blocks:
+        segments[-1].append(b)
+        if len(segments[-1]) >= limit and b.kind_cls in \
+                ("title", "sec_title"):
+            segments.append([])
+    return [s for s in segments if s]
 
 
 def render_reflow_document(page_layouts: list[dict], doc,
@@ -874,13 +1211,13 @@ def render_reflow_document(page_layouts: list[dict], doc,
                                               "auto") or "auto")
     body_size = float(getattr(reflow_cfg, "body_size", 0.0) or 0.0) \
         or _doc_body_size(page_layouts)
-    blocks, images, bookmarks = build_document_model(
+    blocks, images, bookmarks, link_stats = build_document_model(
         page_layouts, doc, texts_by_page, cell_texts, cross_full,
         cross_skip, formula_pixmaps, typo, warnings=warnings,
         dcache=dcache, doc_fp=doc_fp)
     log(f"reflow: template {template.page_w:.0f}x{template.page_h:.0f}pt "
         f"x {len(template.cols)} col(s); {len(blocks)} block(s), "
-        f"{len(images)} bitmap(s)")
+        f"{len(images)} bitmap(s), {link_stats['total']} source link(s)")
 
     archive, font_css = _build_font_archive(
         font_path, typo.heading_path if typo else None)
@@ -893,14 +1230,10 @@ def render_reflow_document(page_layouts: list[dict], doc,
     col_w = min(x1 - x0 for x0, x1 in template.cols)
     cjk = lang_info(lang).script == "cjk"
 
-    # 章节边界分段（超长文档防内存）：满 SEGMENT_BLOCKS 且块尾是标题时切
-    segments: list[list[Block]] = [[]]
-    for b in blocks:
-        segments[-1].append(b)
-        if len(segments[-1]) >= SEGMENT_BLOCKS and b.kind_cls in \
-                ("title", "sec_title"):
-            segments.append([])
-    segments[:] = [s for s in segments if s]
+    # 章节边界分段（超长文档防内存）：满 segment_blocks 且块尾是标题时切
+    seg_limit = max(50, int(getattr(reflow_cfg, "segment_blocks", 500)
+                            or 500))
+    segments = _split_segments(blocks, seg_limit)
 
     # 书签锚 id 对齐：blocks 顺序 = bookmarks 顺序
     hi = 0
@@ -912,21 +1245,75 @@ def render_reflow_document(page_layouts: list[dict], doc,
                 hi += 1
     heading_ids = {f"hd{i}" for i in range(len(bookmarks))}
 
+    # ---- v0.8.3 ②：链接 href 构造 + 译文内定位（失败退化不阻塞出片）----
+    # 跳转目标锚分配（标题块复用 hd 锚）→ href 定型 → src 文本 span 定位
+    n_link_ok = 0
+    try:
+        targets = set()
+        for b in blocks:
+            for lk in b.links:
+                t = lk.get("target")
+                if lk.get("href_kind") == "goto" and t is not None:
+                    targets.add(id(t))
+        n_anchor = 0
+        for b in blocks:
+            if id(b) in targets and not b.html_id:
+                b.anchor_id = f"lt{n_anchor}"
+                n_anchor += 1
+        for b in blocks:
+            cursors = {"text": 0, "caption": 0}
+            for lk in b.links:
+                field = lk.get("field", "text")
+                text = b.caption if field == "caption" else b.text
+                span = _norm_find(text, lk.get("src") or "",
+                                  cursors.get(field, 0))
+                if lk.get("href_kind") == "uri":
+                    lk["href"] = lk.get("uri") or ""
+                    # src 是 clip 提取（rect 边界偏一点就抓残串）；URL 在
+                    # 译文里保形——src 定位失败时直接用 URI 文本兜底
+                    if not span and lk["href"]:
+                        span = _norm_find(text, lk["href"],
+                                          cursors.get(field, 0))
+                elif lk.get("href_kind") == "goto":
+                    t = lk.get("target")
+                    aid = (t.html_id or t.anchor_id) if t is not None else ""
+                    lk["href"] = f"#{aid}" if aid else ""
+                else:
+                    lk["href"] = ""
+                if span and lk["href"]:
+                    lk["span"] = span
+                    cursors[field] = span[1]
+                    n_link_ok += 1
+                else:
+                    lk["span"] = None
+    except Exception as e:
+        n_link_ok = 0
+        for b in blocks:
+            b.links = []
+        warnings.append(f"reflow links: prepare failed ({e}); "
+                        f"links disabled for this output")
+
     all_pdf = pymupdf.open()
     page_base = 0
     toc: list[list] = []
+    all_positions: list = []
     for seg in segments:
         html = blocks_to_html(seg, col_w, cjk)
-        data, marks = _write_segment(html, css, template, archive,
-                                     heading_ids)
+        data, positions = _write_segment(html, css, template, archive,
+                                         heading_ids)
         seg_doc = pymupdf.open("pdf", data)
         all_pdf.insert_pdf(seg_doc)
+        marks = _extract_bookmark_marks(positions, heading_ids)
         for m in marks:
             idx = int(m["id"][2:])
             if 0 <= idx < len(bookmarks):
                 meta = bookmarks[idx]
                 toc.append([meta["level"], meta["text"],
                             page_base + m["page"] + 1])
+        # 链接定位的页号对齐到全文档坐标（段内 page_num 是 1-based 段内值）
+        for p in positions:
+            p.page_num += page_base
+        all_positions.extend(positions)
         page_base += len(seg_doc)
         seg_doc.close()
 
@@ -957,6 +1344,30 @@ def render_reflow_document(page_layouts: list[dict], doc,
             norm.append([lvl, txt, pg])
             prev_lvl = lvl
         all_pdf.set_toc(norm)
+    # ---- v0.8.3 ②：链接注释物化（页码/书签之后，坐标系一致）----
+    n_restored = 0
+    try:
+        placed, n_ann = _add_story_links(all_pdf, all_positions)
+        # 恢复核算：href 目标锚实际落位（URI 恒可插，goto 需锚在 placed）
+        n_restored = sum(
+            1 for b in blocks for lk in b.links
+            if lk.get("span")
+            and (not lk["href"].startswith("#") or lk["href"][1:] in placed))
+        n_src = link_stats["total"]
+        n_drop = n_src - n_restored
+        log(f"reflow links: {n_restored}/{n_src} restored"
+            f" ({n_ann} annotation(s))"
+            + (f", {n_drop} dropped"
+               f" (bitmap/list/no-text-match: {link_stats['unowned']}"
+               f" no-target: {link_stats['no_target']}"
+               f" grouped: {link_stats['grouped']})" if n_drop else ""))
+        if n_drop and n_src:
+            warnings.append(
+                f"reflow links: {n_restored}/{n_src} restored, {n_drop} "
+                f"dropped (in-bitmap/list-item/no-text-match/no-target)")
+    except Exception as e:
+        warnings.append(f"reflow links: insertion failed ({e}); "
+                        f"output kept without links")
     log(f"reflow: wrote {n_out} page(s), {len(toc)} bookmark(s)")
     data = all_pdf.tobytes(deflate=True, garbage=3)
     all_pdf.close()

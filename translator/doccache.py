@@ -38,9 +38,17 @@ PIXMAP_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
 
 def resolve_cache_root(explicit: str, src: Path, out_dir: Path) -> tuple[Path, str]:
-    """缓存根目录解析。返回 (root, 来源标签)（日志用）。"""
+    """缓存根目录解析。返回 (root, 来源标签)（日志用）。
+
+    显式路径若已指向缓存目录名本身（.pdf_translator_cache），回退到
+    其父目录——否则会在缓存目录里再嵌一层同名目录（实测配置拷贝时
+    踩中，产生 .pdf_translator_cache/.pdf_translator_cache/cache.db）。
+    """
     if explicit:
-        return Path(explicit).expanduser(), "config"
+        p = Path(explicit).expanduser()
+        if p.name == CACHE_DIR_NAME:
+            p = p.parent
+        return p, "config"
     cand = src.parent
     try:
         d = cand / CACHE_DIR_NAME

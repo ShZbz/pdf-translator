@@ -89,11 +89,13 @@ try:
     base_url, api_key = cfg.llm.resolve()
     client = None
     if base_url:
-        from openai import OpenAI
         # v0.5.1: 超时透传——旧版不传 timeout（SDK 默认 600s），UI 里
         # 配的「请求超时」对 UI 任务不生效，只有 validate-key 用自己的 15s
-        client = OpenAI(base_url=base_url, api_key=api_key or "sk-noop",
-                        timeout=float(getattr(cfg.llm, "timeout", 120.0)))
+        # v0.8.3: 与 CLI 同款 LLMClientPool——自持连接池（楔死终结器）
+        # + SDK max_retries=0（重试单层化，见 llm.LLMClientPool）
+        from translator.llm import LLMClientPool
+        client = LLMClientPool(base_url, api_key or "sk-noop",
+                               float(getattr(cfg.llm, "timeout", 120.0)))
     stats = translate_document(cfg, client=client, sink=sink, control=control)
     flush({{"kind": "exit", "code": 0, "output": stats["output"],
             "pages": stats["pages"], "calls": stats["calls"]}})
@@ -383,7 +385,16 @@ class JobManager:
                 continue       # 排队期间被取消的直接跳过
             nxt.on_terminal = self._on_terminal
             nxt.on_event = self._on_job_event
-            nxt.start(self.project_root)
+            try:
+                nxt.start(self.project_root)
+            except Exception as e:
+                # v0.8.3: 起跑失败（配置临时文件/控制文件写不进等）标记
+                # error 后继续推进——旧版异常沿 _on_terminal 冒泡被
+                # _fire_terminal 吞掉，队列从这里开始永久卡死
+                nxt.status = "error"
+                nxt.error = f"failed to start worker: {e}"
+                self._persist(nxt)
+                continue
             self.job = nxt
             self._persist(nxt, seq=None)
             return

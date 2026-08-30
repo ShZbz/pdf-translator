@@ -149,15 +149,23 @@ def _layout_parallel(doc, tmp_path: Path, workers: int, sink: EventSink,
                 initializer=_layout_worker_init,
                 initargs=(str(tmp_path), engine)) as pool:
             futs = {pool.submit(_layout_worker_task, p): p for p in range(n_pages)}
-            for fut in as_completed(futs):
-                if control is not None:
-                    control.checkpoint()
-                pno = futs[fut]
-                layouts[pno], pixmaps[pno] = fut.result()
-                done.add(pno)
-                while next_emit in done and next_emit < n_pages:
-                    sink.page_done(next_emit, n_pages)
-                    next_emit += 1
+            try:
+                for fut in as_completed(futs):
+                    if control is not None:
+                        control.checkpoint()
+                    pno = futs[fut]
+                    layouts[pno], pixmaps[pno] = fut.result()
+                    done.add(pno)
+                    while next_emit in done and next_emit < n_pages:
+                        sink.page_done(next_emit, n_pages)
+                        next_emit += 1
+            except BaseException:
+                # v0.8.3: 取消/worker 崩溃时撤销未起跑的页——旧版 with 退出
+                # 的 shutdown(wait=True) 会把全部排队页跑完才返回（取消
+                # 100 页文档要干等整套布局；worker 崩溃也要等完全部队列
+                # 才回退串行路径）。running 中的页等其自然结束。
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
     except JobCancelled:
         raise          # with 退出时 shutdown(wait=True)：等在飞页收尾后干净退出
     except Exception as e:
@@ -255,6 +263,19 @@ def _unit_char_budgets(merge_groups: list[list[int]], pending: list,
     return budgets
 
 
+def _qualify_fp(doc_fp: "str | None", sel: str) -> "str | None":
+    """io.pages 子集运行的缓存指纹限定（v0.8.3 收口）。
+
+    doc.select 后页码重编号：位图缓存 key（指纹|页|区域|dpi）若沿用
+    全文档指纹，子集运行的 p0 与全量运行的 p0 是不同源页——矩形巧合
+    相同时会静默串图。子集运行把 sel 限定符混入指纹，位图缓存互不
+    污染（全量运行 key 不变，旧缓存条目照常命中）。
+    """
+    if not doc_fp or not sel:
+        return doc_fp
+    return f"{doc_fp}|sel{sel}"
+
+
 def _crop_formulas_cached(doc, pno: int, formulas: list[dict],
                           dcache, doc_fp) -> dict[int, bytes]:
     """公式位图裁剪（v0.8.1 S4：doccache 位图缓存）。
@@ -263,7 +284,7 @@ def _crop_formulas_cached(doc, pno: int, formulas: list[dict],
     （0.1-0.5s/张）——位图由 (指纹,页,区域,dpi) 内容寻址，跨运行
     字节一致，入项目缓存库。缓存不可用时退直裁（行为不回退）。
     仅主进程调用（并行布局 worker 内不接缓存——重跑场景布局缓存命中
-    本就不走并行路径）。
+    本就不走并行路径）。doc_fp 传 _qualify_fp 产物（子集运行带 sel）。
     """
     if dcache is None or doc_fp is None:
         return crop_formula_pixmaps(doc, pno, formulas)
@@ -404,7 +425,8 @@ def _group_budget(g: list[int], pending: list, page_layouts: list, typo,
 
 def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
                          glossary, cache, sink, control, fit_cfg,
-                         layout_engine, dcache, doc_fp, out_dir, all_warnings):
+                         layout_engine, dcache, doc_fp, out_dir, all_warnings,
+                         sel: str = ""):
     """v0.7.0 布局-翻译流水线重叠路径（任务 2-2b）。
 
     布局在后台线程逐页产出（布局线程持有独立打开的 Document——
@@ -413,6 +435,11 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
     缓存 → 未命中进 StreamingTranslator 开批——批满即发车，布局继续
     跑下一页。页 N 布局完 → 该页段落立即进组批队列，50+ 页大文档
     省整段布局时间（与版面缓存互补：缓存命中时页瞬间产出）。
+
+    sel: io.pages 原始串——版面缓存 load/save 带同一 sel（v0.8.3 收口：
+    旧版流式路径 save 漏传 sel，子集试译会用子集版面覆盖全量版面
+    缓存条目；load 侧两路径也从未带 sel，sel 后缀条目永远读不到）。
+    位图缓存指纹按 _qualify_fp 限定（页码重编号防串图）。
 
     返回 dict（与非流式路径同构的下游状态）：
     page_layouts / page_pixmaps / texts_by_page / cell_texts /
@@ -435,9 +462,11 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
     layout_tmp = Path(tmp_name)
     q: "_queue.Queue" = _queue.Queue()
 
-    cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER) \
+    cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
+                                sel=sel) \
         if (dcache is not None and doc_fp is not None) else None
     cache_hit = cached is not None and len(cached) == n_pages
+    pix_fp = _qualify_fp(doc_fp, sel)
 
     def _producer():
         pdoc = None
@@ -453,7 +482,7 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
                     lay = layout_page(pdoc[pno], engine=layout_engine)
                 # v0.8.1 S4: 公式裁图走项目位图缓存（重跑 0 调用也不再重裁）
                 pixmaps = _crop_formulas_cached(
-                    pdoc, pno, lay.get("formulas") or [], dcache, doc_fp) \
+                    pdoc, pno, lay.get("formulas") or [], dcache, pix_fp) \
                     if lay.get("formulas") else {}
                 q.put((pno, lay, pixmaps))
             q.put(None)
@@ -615,21 +644,28 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
 
     _log(f"layout: streaming overlap on ({n_pages} page(s), "
          f"engine={layout_engine})")
-    err: "BaseException | None" = None
     try:
         while True:
             item = q.get()
             if item is None:
                 break
             if isinstance(item, BaseException):
-                err = item
-                break
+                # producer 异常（布局失败/取消）就地 raise——与循环内其他
+                # 异常统一走 except：先终结未跑完的翻译批再向上传播
+                # （v0.8.3 前经 err 变量绕过 except，批线程池不收口）
+                raise item
             if control is not None:
                 control.checkpoint()
             _feed_page(*item)
-        if err is None and open_group is not None:
+        if open_group is not None:
             _emit_para_group(open_group)
             open_group = None
+    except BaseException:
+        # v0.8.3: 失败/取消时终结未跑完的批——旧版直接 raise，streamer 的
+        # 线程池既不 shutdown 也不 cancel：排队批继续烧 LLM 调用，回退
+        # 顺序路径后新旧两条路并发请求（预算/缓存记账互不知情）。
+        streamer.abort()
+        raise
     finally:
         # OCR 线程收尾（join 必须先于 layout_tmp 删除——worker 的 odoc 句柄
         # 开着时 Windows unlink 会失败留残文件；异常路径同样要收口）
@@ -640,35 +676,39 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
         layout_tmp.unlink(missing_ok=True)
     except OSError:
         pass
-    if err is not None:
-        raise err
-    if ocr_err:
-        raise ocr_err[0]
-    # OCR 结果按页序补进翻译队列（布局/翻译全程与 OCR 并行——旧版同步
-    # 提取逐页阻塞主循环）；ocr_jobs 的构造顺序与 unit_targets 对齐
-    for pno in sorted(ocr_results):
-        job = ocr_results[pno]
-        if job is None:
-            w = f"OCR page {pno + 1}: no text recognized; kept as-is"
-            _log(f"WARNING: {w}")
-            all_warnings.append(w)
-            continue
-        ocr_jobs.append(job)
-        jidx = len(ocr_jobs) - 1
-        if job["mode"] in ("inplace", "reconstruct"):
-            for bi, (_r, t) in enumerate(job["blocks"]):
-                unit_targets.append(("ocr", jidx, bi))
-                streamer.add_unit(t)
-        else:
-            unit_targets.append(("ocr", jidx, None))
-            streamer.add_unit(job["text"])
-    if not cache_hit and dcache is not None and doc_fp is not None \
-            and page_layouts and len(page_layouts) == n_pages:
-        dcache.save_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
-                           Path(cfg.io.input), n_pages, page_layouts)
+    try:
+        if ocr_err:
+            raise ocr_err[0]
+        # OCR 结果按页序补进翻译队列（布局/翻译全程与 OCR 并行——旧版同步
+        # 提取逐页阻塞主循环）；ocr_jobs 的构造顺序与 unit_targets 对齐
+        for pno in sorted(ocr_results):
+            job = ocr_results[pno]
+            if job is None:
+                w = f"OCR page {pno + 1}: no text recognized; kept as-is"
+                _log(f"WARNING: {w}")
+                all_warnings.append(w)
+                continue
+            ocr_jobs.append(job)
+            jidx = len(ocr_jobs) - 1
+            if job["mode"] in ("inplace", "reconstruct"):
+                for bi, (_r, t) in enumerate(job["blocks"]):
+                    unit_targets.append(("ocr", jidx, bi))
+                    streamer.add_unit(t)
+            else:
+                unit_targets.append(("ocr", jidx, None))
+                streamer.add_unit(job["text"])
+        if not cache_hit and dcache is not None and doc_fp is not None \
+                and page_layouts and len(page_layouts) == n_pages:
+            dcache.save_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
+                               Path(cfg.io.input), n_pages, page_layouts,
+                               sel=sel)
 
-    sink.stage("translate")
-    translated, total_calls = streamer.finish()
+        sink.stage("translate")
+        translated, total_calls = streamer.finish()
+    except BaseException:
+        # OCR 失败/finish 中取消等：同布局循环失败纪律——先终结批再传播
+        streamer.abort()
+        raise
     all_warnings.extend(tc.warnings)
     if tc.sent_cache_hits:
         _log(f"cache: {tc.sent_cache_hits} template unit(s) served by "
@@ -1096,11 +1136,38 @@ def _append_ocr_original(doc, pno: int, text: str, font_path: str,
     return 1
 
 
+def _subset_fonts_try(doc, log) -> bool:
+    """v0.8.3 ③: 按文档字体子集化（fontTools 可选依赖）。
+
+    实测（paper3 v0.8.2 输出）：两个模式都嵌入完整 SimSun 17.47MB +
+    SimHei 9.29MB（原文 CM/Nimbus 字体全是 ~0.01MB 子集）——8 页译文
+    实际用字仅千余 CJK 字形，子集化后字体数据 27MB → 1-3MB，输出文件
+    15MB → 2-4MB。fontTools 未安装 / subset 失败均跳过并提示（行为
+    不回退，绝不阻塞出片）。
+    """
+    try:
+        import fontTools  # noqa: F401
+    except ImportError:
+        log("fonts: subset skipped (fontTools not installed; "
+            "pip install fonttools to shrink output ~5x)")
+        return False
+    try:
+        doc.subset_fonts()
+        log("fonts: subset done")
+        return True
+    except Exception as e:
+        log(f"fonts: subset failed ({e}); keeping full fonts")
+        return False
+
+
 def translate_document(cfg: Config, client=None, verbose: bool = False,
                        sink: "EventSink | None" = None,
                        control: "JobControl | None" = None) -> dict:
     """整册翻译。client 为注入的 OpenAI 兼容实例（None=跳过翻译只测管线）。
 
+    v0.8.3: 生产入口传 LLMClientPool（llm.py）——请求墙钟楔死终结
+    （rebuild 连接池）与 SDK max_retries=0 单层重试都依赖池协议；
+    注入裸 OpenAI 实例/mock 仍可用（墙钟生效，无池可终结）。
     v0.4.0: sink=进度事件流（None=纯 CLI 模式零开销）；
             control=暂停/取消控制（None=不可控，原行为）。
     返回统计：{pages, paragraphs, calls, warnings, output, ocr_pages}
@@ -1273,7 +1340,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             state = _translate_streaming(
                 doc, cfg, client, typo, font_path, tgt_lang, glossary,
                 cache, sink, control, fit_cfg, layout_engine, dcache,
-                doc_fp, out_dir, all_warnings)
+                doc_fp, out_dir, all_warnings, sel=sel_spec)
         except JobCancelled:
             raise
         except Exception as e:
@@ -1282,7 +1349,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             state = None
     if state is None:
         # ---- v0.4.3 布局本体：缓存命中 → 并行 → 串行回退 ----
-        cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER) \
+        cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
+                                    sel=sel_spec) \
             if (dcache is not None and doc_fp is not None) else None
         layout_cache_hit = False
         if cached is not None and len(cached) == n_pages:
@@ -1292,10 +1360,11 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                  f"for {n_pages} page(s)")
             sink.emit("layout_cache_hit", pages=n_pages)
             sink.progress(done=n_pages, total=n_pages, unit="page")
+            pix_fp = _qualify_fp(doc_fp, sel_spec)
             for pno in range(n_pages):
                 page_pixmaps.append(
                     _crop_formulas_cached(
-                        doc, pno, page_layouts[pno]["formulas"], dcache, doc_fp)
+                        doc, pno, page_layouts[pno]["formulas"], dcache, pix_fp)
                     if page_layouts[pno].get("formulas") else {})
         if not page_layouts and workers > 1:
             fd, layout_tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
@@ -1317,12 +1386,13 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             if workers > 1:
                 sink.warning("parallel layout failed; sequential fallback "
                              "(progress counter restarts)")
+            pix_fp = _qualify_fp(doc_fp, sel_spec)
             for pno in range(n_pages):
                 if control:
                     control.checkpoint()
                 lay = layout_page(doc[pno], engine=layout_engine)
                 pixmaps = _crop_formulas_cached(
-                    doc, pno, lay["formulas"], dcache, doc_fp) \
+                    doc, pno, lay["formulas"], dcache, pix_fp) \
                     if lay["formulas"] else {}
                 page_layouts.append(lay)
                 page_pixmaps.append(pixmaps)
@@ -1697,7 +1767,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 page_layouts, doc, texts_by_page, cell_texts,
                 cross_full, cross_skip, pixmaps_by_page, typo, font_path,
                 tgt_lang, cfg.reflow, reflow_warns, _log,
-                dcache=dcache, doc_fp=doc_fp)
+                dcache=dcache, doc_fp=_qualify_fp(doc_fp, sel_spec))
             all_warnings.extend(reflow_warns)
             out_path = out_dir / output_pdf_name(
                 src.stem, tgt_lang, False, extra="-reflow" + sel_extra)
@@ -1711,7 +1781,16 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                 except Exception:
                     pass
             tmp_path = out_path.with_suffix(".pdf.tmp")
-            tmp_path.write_bytes(pdf_bytes)
+            # v0.8.3 ③: 旧版裸 write_bytes 连 deflate/garbage 都没有
+            # （完整 SimSun+SimHei 26.8MB 原样入库）——与 faithful 同纪律
+            # 收口：开 bytes → 字体子集化 → save(garbage=4, deflate=True)
+            rdoc = pymupdf.open("pdf", pdf_bytes)
+            try:
+                if getattr(cfg.performance, "subset_fonts", True):
+                    _subset_fonts_try(rdoc, _log)
+                rdoc.save(str(tmp_path), garbage=4, deflate=True)
+            finally:
+                rdoc.close()
             os.replace(tmp_path, out_path)
         finally:
             # v0.8.1: 资源收口（旧版 reflow 路径直接 return——dcache 的
@@ -1729,6 +1808,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
              f"{time.time() - t0:.1f}s")
         sink.emit("done", output=str(out_path), pages=n_pages,
                   paragraphs=n_paras, calls=total_calls,
+                  ocr_pages=0, ocr_inplace_blocks=0,
                   cache_hits=cache_hits,
                   cache_saved_calls=cache_saved_calls,
                   cache_entries=cache_entries,
@@ -1909,6 +1989,9 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             pass
     try:
         tmp_path = out_path.with_suffix(".pdf.tmp")
+        # v0.8.3 ③: 存盘前按文档字体子集化（可选依赖，详见 _subset_fonts_try）
+        if getattr(cfg.performance, "subset_fonts", True):
+            _subset_fonts_try(doc, _log)
         doc.save(str(tmp_path), garbage=4, deflate=True)
         doc.close()
         os.replace(tmp_path, out_path)
