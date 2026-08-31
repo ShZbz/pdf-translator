@@ -23,6 +23,7 @@ v0.7.0:
 """
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -96,10 +97,16 @@ def _get_engine(engine: str, lang: str):
 
 
 def _render_png(page, dpi: int) -> Path:
-    """页面渲染临时 PNG（各引擎统一走文件路径输入——版本兼容最大公约数）。"""
-    pix = page.get_pixmap(dpi=dpi)
-    tmp = Path(tempfile.mkstemp(suffix=".png")[1])
-    tmp.write_bytes(pix.tobytes("png"))
+    """页面渲染临时 PNG（各引擎统一走文件路径输入——版本兼容最大公约数）。
+
+    v0.8.4 修复：mkstemp 返回的 fd 必须即刻关闭——旧版只取文件名，
+    泄漏的打开句柄在 Windows 上令 finally 里的 unlink 报 WinError 32
+    （被 OSError 吞掉），每 OCR 一页×每引擎永久泄漏一个 %TEMP% PNG。
+    """
+    fd, name = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    tmp = Path(name)
+    tmp.write_bytes(page.get_pixmap(dpi=dpi).tobytes("png"))
     return tmp
 
 
@@ -122,7 +129,6 @@ def _paddle_lines(page, src_lang: str, dpi: int):
 
 def _extract_paddle(result) -> list:
     """paddle 2.x/3.x 结果 → [(Rect, text, score)]。"""
-    import numpy as _np  # paddleocr 依赖链自带；仅 3.x 分支触达
     out: list[tuple[pymupdf.Rect, str, float]] = []
 
     def _rect_from_pts(pts) -> pymupdf.Rect:
@@ -132,6 +138,10 @@ def _extract_paddle(result) -> list:
 
     def _scan(r):
         if isinstance(r, dict):
+            # numpy 只在 paddleocr 3.x 的 dict 分支需要（依赖链自带）——
+            # 2.x 列表分支不触达；旧版函数级 import 令无 numpy 环境连
+            # 2.x 解析都 ImportError（v0.8.4 修复）
+            import numpy as _np
             texts = r.get("rec_texts")
             if texts:
                 boxes = r.get("rec_boxes") or r.get("rec_polys")

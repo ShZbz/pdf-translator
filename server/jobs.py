@@ -93,9 +93,19 @@ try:
         # 配的「请求超时」对 UI 任务不生效，只有 validate-key 用自己的 15s
         # v0.8.3: 与 CLI 同款 LLMClientPool——自持连接池（楔死终结器）
         # + SDK max_retries=0（重试单层化，见 llm.LLMClientPool）
+        # v0.8.4: timeout=0 兜底 120（显式 0 会让池超时 0s 全部请求
+        # 立即失败；CLI 侧同款 or 兜底，此处对齐）
         from translator.llm import LLMClientPool
         client = LLMClientPool(base_url, api_key or "sk-noop",
-                               float(getattr(cfg.llm, "timeout", 120.0)))
+                               float(getattr(cfg.llm, "timeout", 120.0)
+                                     or 120.0))
+    else:
+        # v0.8.4: 静默干跑显式化——provider 拼错/漏配 base_url 时任务会
+        # 以 client=None 跑完整管线（输出全原文）且无任何提示，用户以为
+        # 翻译完成（CLI 侧 v0.8.3 已加同款告警，worker 侧漏了）。
+        # 经 sink 发 warning 事件 → UI 警告面板/历史面板可见
+        flush({{"kind": "warning", "msg": "无法确定 API 地址（llm.base_url "
+               "为空且 provider 无预设）——本次按 dry-run 运行，输出保留原文"}})
     stats = translate_document(cfg, client=client, sink=sink, control=control)
     flush({{"kind": "exit", "code": 0, "output": stats["output"],
             "pages": stats["pages"], "calls": stats["calls"]}})
@@ -131,6 +141,10 @@ class Job:
         self.paragraphs = 0
         self.calls = 0
         self.cache_hits = 0         # v0.5.1: 缓存命中段数（节省报表）
+        # v0.8.4: 命中段折算批次数——pipeline done 事件带 cache_saved_calls，
+        # 旧版 Job 丢弃该字段且 snapshot/DB 均无，前端「省约 N 次调用」
+        # （完成行+历史面板）永远不显示
+        self.cache_saved_calls = 0
         self.elapsed = 0.0
         self.warnings: list[str] = []   # v0.5.0: 最近 N 条管线警告
         self._proc: subprocess.Popen | None = None
@@ -160,6 +174,7 @@ class Job:
                 self.paragraphs = ev.get("paragraphs", 0)
                 self.calls = ev.get("calls", 0)
                 self.cache_hits = ev.get("cache_hits", 0)
+                self.cache_saved_calls = ev.get("cache_saved_calls", 0)
                 self.elapsed = ev.get("elapsed", 0.0)
             elif kind == "exit":
                 code = ev.get("code", 1)
@@ -238,6 +253,7 @@ class Job:
                 "paragraphs": self.paragraphs,
                 "calls": self.calls,
                 "cache_hits": self.cache_hits,
+                "cache_saved_calls": self.cache_saved_calls,
                 "elapsed": self.elapsed,
                 "created": round(self.created, 3),
                 "config_path": self.config_path,
@@ -489,9 +505,22 @@ class JobManager:
                 queued = True
                 seq = len(self.queue) - 1
             else:
-                # 槽位空闲（首次提交或上个任务已终态）：先归档旧的再开跑
+                # 槽位空闲（首次提交或上个任务已终态）：先归档旧的再开跑。
+                # v0.8.4：start 失败（临时/控制文件写不进、进程起不来等）
+                # 按失败返回——旧版异常直接冒到 API 层变 500，且 app.py
+                # 的临时运行配置清理只认 ok=False 分支，会留孤儿
+                # .ui_run_config_*.yaml（v0.5.1 只修了队列满的 409 路径）。
                 self._archive_locked()
-                job.start(self.project_root)
+                try:
+                    job.start(self.project_root)
+                except Exception as e:
+                    job.status = "error"
+                    job.error = f"failed to start worker: {e}"
+                    self._persist(job, seq=None)
+                    self._broadcast({"kind": "manager", "action": "submit",
+                                     "job_id": job.id, "queued": False})
+                    return {"ok": False,
+                            "error": f"任务起跑失败: {e}"}
                 self.job = job
                 queued = False
                 seq = None

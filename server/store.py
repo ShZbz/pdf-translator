@@ -46,21 +46,26 @@ _SCHEMA_MIGRATIONS = (
     ("output_dir", "TEXT DEFAULT ''"),
     ("warnings", "TEXT DEFAULT '[]'"),
     ("cache_hits", "INTEGER DEFAULT 0"),
+    # v0.8.4: 命中段折算批次数（节省报表——前端历史面板「省约 N 次」）
+    ("cache_saved_calls", "INTEGER DEFAULT 0"),
 )
 
 _SNAP_COLS = ("id", "status", "config_path", "output_path", "error", "stage",
               "pages", "paragraphs", "calls", "elapsed", "created",
-              "input", "output_dir", "warnings", "cache_hits")
+              "input", "output_dir", "warnings", "cache_hits",
+              "cache_saved_calls")
 
 # SELECT 列序（_row_to_snap 按此取列；progress 是 JSON 列，单独处理）
 _SELECT_COLS = ("id", "status", "config_path", "output_path", "error",
                 "stage", "progress", "pages", "paragraphs", "calls",
                 "elapsed", "created", "updated", "seq",
-                "input", "output_dir", "warnings", "cache_hits")
+                "input", "output_dir", "warnings", "cache_hits",
+                "cache_saved_calls")
 
 _SELECT_SQL = ("SELECT id,status,config_path,output_path,error,stage,progress,"
                "pages,paragraphs,calls,elapsed,created,updated,seq,"
-               "input,output_dir,warnings,cache_hits FROM jobs")
+               "input,output_dir,warnings,cache_hits,cache_saved_calls "
+               "FROM jobs")
 
 
 class JobStore:
@@ -94,13 +99,15 @@ class JobStore:
                float(snap.get("created") or time.time()), time.time(), seq,
                snap.get("input") or "", snap.get("output_dir") or "",
                json.dumps(warnings, ensure_ascii=False),
-               int(snap.get("cache_hits") or 0))
+               int(snap.get("cache_hits") or 0),
+               int(snap.get("cache_saved_calls") or 0))
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO jobs (id,status,config_path,output_path,"
                 "error,stage,progress,pages,paragraphs,calls,elapsed,created,"
-                "updated,seq,input,output_dir,warnings,cache_hits) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+                "updated,seq,input,output_dir,warnings,cache_hits,"
+                "cache_saved_calls) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
             self._conn.commit()
 
     def _row_to_snap(self, row) -> dict:

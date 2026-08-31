@@ -320,6 +320,18 @@ def load_config(path: str | Path) -> Config:
             f"当前 {ocr.mode!r}")
     if not isinstance(ocr.engines, list):
         raise ValueError(f"ocr.engines 必须是列表，当前 {ocr.engines!r}")
+    # v0.8.4: 引擎名白名单——拼错（'paddel'）旧版要到运行期才以
+    # 「未安装引擎（pip install paddleocr）」警告出场，误导排查；
+    # 配置期即报与 renderer/mode 同款错误
+    _engines = ("paddle", "rapidocr", "tesseract")
+    if ocr.engine and ocr.engine != "none" and ocr.engine not in _engines:
+        raise ValueError(
+            f"ocr.engine 必须是 {'/'.join(_engines)} 或 none，"
+            f"当前 {ocr.engine!r}")
+    for _e in ocr.engines:
+        if _e not in _engines:
+            raise ValueError(
+                f"ocr.engines 项必须是 {'/'.join(_engines)}，当前 {_e!r}")
     perf = _filtered(PerformanceConfig, raw.get("performance") or {})
     if perf.layout_engine not in ("heuristic", "pymupdf-layout"):
         raise ValueError(

@@ -63,20 +63,45 @@
 - 字体：按目标语言自动探测（Windows 自带宋体/黑体/times 即可；Linux 需 Noto CJK / Noto Serif / DejaVu 任一；macOS 用系统字体）；找不到时可在 config `fonts:` 段显式指定
 - 一个 LLM API key（任选一家，见下文 provider 配置）
 
-## 安装
+## 环境搭建
+
+工具链统一用 [uv](https://docs.astral.sh/uv/)（Windows 原生 / WSL / macOS·Linux 三种环境同一套命令）。
+没有 uv 时用系统 `python -m venv` 等价替代。**不要混用系统 Python 裸装**——
+pymupdf/openai 版本固定性对渲染结果有影响。
+
+### Windows 原生（PowerShell / Git Bash）
+
+```powershell
+uv venv .venv                                # 创建 .venv（Windows 结构 Scripts\）
+.venv\Scripts\activate                       # 激活；Git Bash 用 source .venv/Scripts/activate
+uv pip install pymupdf openai pyyaml pytest fastapi uvicorn
+
+python -m pytest tests/ -q                   # 验证安装：全绿即环境就绪（无需网络/key）
+.venv\Scripts\python run_ui.py               # 起图形界面，或直接用系统 python 跑 CLI
+```
+
+### WSL / Linux / macOS
 
 ```bash
-# 推荐用 uv 或 venv
-uv venv .venv && source .venv/bin/activate    # Linux/macOS
-uv pip install pymupdf openai pyyaml pytest
-
-# Windows
-uv venv .venv && .venv\Scripts\activate
-uv pip install pymupdf openai pyyaml pytest
-
-# 可选：输出字体子集化（默认开启；未装则跳过并提示，输出体积约大 15 倍）
-uv pip install fonttools
+uv venv .venv && source .venv/bin/activate
+uv pip install pymupdf openai pyyaml pytest fastapi uvicorn
+python -m pytest tests/ -q                   # 环境自检
 ```
+
+### 常见坑
+
+- **venv 跨系统失效**：`.venv` 是按创建时的操作系统生成的（Windows 侧是
+  `Scripts\`，Linux/WSL 侧是 `bin/` + `lib64 -> lib` 软链）。在 WSL 里建的
+  `.venv` 拷到/切到 Windows 侧直接失效（`pyvenv.cfg` 的 home 指向 Linux 路径）
+  ——此时删掉 `.venv` 整目录按上面对应平台的命令重建即可，缓存与输出不受影响。
+- **可选依赖**：`fonttools`（输出字体子集化，默认开启；未装自动跳过并提示，
+  输出体积约大 15 倍）、`paddleocr` / `rapidocr-onnxruntime` / `tesseract`
+  （扫描页 OCR，按需安装）、`pymupdf-layout`（GNN 版面检测，按需）。
+- **UI 与 CLI 依赖差异**：纯 CLI 只需 `pymupdf openai pyyaml`；图形界面另需
+  `fastapi uvicorn`（上面的安装命令已包含）。
+- **跨平台字体**：正文/标题字体按目标语言自动探测（Windows 自带宋体/黑体/
+  times 即可；Linux 需 Noto CJK / Noto Serif / DejaVu 任一；macOS 用系统字体）。
+  找不到时在 config `fonts:` 段显式指定（如 `C:/Windows/Fonts/simsun.ttc`）。
 
 ## 快速开始
 
@@ -255,7 +280,7 @@ Weyl semimetal: 外尔半金属
 python -m pytest tests/ -q
 ```
 
-251 个单测覆盖核心逻辑：流式增量解析与断流、批内分段重试、句子级缓存、术语确定性修复、多引擎投票、几何版面分割、影子页 GNN、流水线重叠端到端一致性（含 v0.8.2 跨页合并修复回归）、嵌套表地狱样张（合并表头/右对齐数字列/跨页延续）与置信度分级、批字符预算组批、缓存容量淘汰与命中统计、单元格原文回灌与 htmlbox 单元格回灌、扫描页 OCR（附录/原位）、布局并行与串行一致性、任务队列/history 归档/重启恢复/历史字段迁移、SSE 端点帧契约与 Last-Event-ID 重放、配额自适应换算、htmlbox/ writer 双渲染路径与 RTL 样张、排版自适配（测量基座/样式级因子/降级阶梯/扩框零重叠/微升/丢段兜底）、源头控长（预算规则/单段重问/预算档缓存）、small caps 节标题与整块粗体摘要的样式回归、OCR 行分组/图形避让/原位回贴、pymupdf-layout 适配层（1.28.x 五元组 + 未装回退）、provider 参数透传、页级 Story 整页落位/溢出回退/开关组合/局部收缩收编/单元格并入（v0.8.2）、流式停顿墙钟与看门狗（滴漏/静默两型）、双语表格语义布局（两行同框/紧框回退/标题豁免）、redaction 链接存活（重插持久化/不重复）、请求墙钟楔死终结（流式/非流式头部/裸 client/池代数防护，v0.8.3）、reflow 链接重映射（URI 直通/引文 GoTo 锚点解析/译文内定位/退化不阻塞，v0.8.3）、reflow 模板统计与文档模型（栏数/书签流序/列表语义化/图注绑定/文献悬挂缩进）、reflow 端到端流式写入（多页断页/页码/书签/位图守恒）、跨页合并整段、超页高表缩放、RTL 方向、项目级缓存库（跨输出目录共享/legacy 迁移/指纹索引/热跑不重写布局/io.pages 子集版面条目隔离，v0.8.3）、io.pages 子集、命令总线（stage 标签/订阅/检查点消费）、validate-key 成功分支、config 空节点容错（v0.8.2）、跨页断句拆分（含边界标点与连字符合并）、公式编号剥离、Algorithm 框判定、三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行、服务端目录浏览与输出预览、key 回填、reflow 分段配置生效/畸形链接防御/流式失败批终结（v0.8.3）等。
+267 个单测覆盖核心逻辑：流式增量解析与断流、批内分段重试、句子级缓存、术语确定性修复、多引擎投票、几何版面分割、影子页 GNN、流水线重叠端到端一致性（含 v0.8.2 跨页合并修复回归）、嵌套表地狱样张（合并表头/右对齐数字列/跨页延续）与置信度分级、批字符预算组批、缓存容量淘汰与命中统计、单元格原文回灌与 htmlbox 单元格回灌、扫描页 OCR（附录/原位）、布局并行与串行一致性、任务队列/history 归档/重启恢复/历史字段迁移、SSE 端点帧契约与 Last-Event-ID 重放、配额自适应换算、htmlbox/ writer 双渲染路径与 RTL 样张、排版自适配（测量基座/样式级因子/降级阶梯/扩框零重叠/微升/丢段兜底）、源头控长（预算规则/单段重问/预算档缓存）、small caps 节标题与整块粗体摘要的样式回归、OCR 行分组/图形避让/原位回贴、pymupdf-layout 适配层（1.28.x 五元组 + 未装回退）、provider 参数透传、页级 Story 整页落位/溢出回退/开关组合/局部收缩收编/单元格并入（v0.8.2）、流式停顿墙钟与看门狗（滴漏/静默两型）、双语表格语义布局（两行同框/紧框回退/标题豁免）、redaction 链接存活（重插持久化/不重复）、请求墙钟楔死终结（流式/非流式头部/裸 client/池代数防护，v0.8.3）、reflow 链接重映射（URI 直通/引文 GoTo 锚点解析/译文内定位/退化不阻塞，v0.8.3）、reflow 模板统计与文档模型（栏数/书签流序/列表语义化/图注绑定/文献悬挂缩进）、reflow 端到端流式写入（多页断页/页码/书签/位图守恒）、跨页合并整段、超页高表缩放、RTL 方向、项目级缓存库（跨输出目录共享/legacy 迁移/指纹索引/热跑不重写布局/io.pages 子集版面条目隔离，v0.8.3）、io.pages 子集、命令总线（stage 标签/订阅/检查点消费）、validate-key 成功分支、config 空节点容错（v0.8.2）、跨页断句拆分（含边界标点与连字符合并）、公式编号剥离、Algorithm 框判定、三线表检测、页脚阈值、渲染回灌、多语言注册表/跨平台字体解析/Unicode 断行、服务端目录浏览与输出预览、key 回填、reflow 分段配置生效/畸形链接防御/流式失败批终结（v0.8.3）、reflow×Typography 缺失兜底/零内容空白页守卫/模板退化栏守卫/OCR 临时文件句柄收口/队列起跑失败返回/空段节点容错/OCR 引擎名白名单（v0.8.4）、单栏文档栏型误判（整宽段腰斩根因修复）/单栏整宽三线表与算法框检出/窄小单元格不 redact 原像素保留/UI 缓存节省报表字段全链路（Job→snapshot→DB 迁移）/PUT config 空段节点/UI worker 干跑告警与超时兜底（v0.8.4 终检）等。
 测试不需要网络和 API key。
 
 ## 项目结构
@@ -290,7 +315,7 @@ web/
   index.html     # Liquid Glass 单文件前端（含任务历史面板）
 run_ui.py        # 一键启动（uvicorn + 自动开浏览器）
 tests/           # 单元测试
-tools/           # 开发工具（Story CSS 能力探针 / 抖动量化对比 / 全流程分阶段计时）
+tools/           # 开发工具（Story CSS 能力探针 / 抖动量化对比 / 全流程分阶段计时 / 配置键端到端审计 config_audit.py）
 config.example.yaml  # 配置模板
 glossary-physics-example.yaml  # 物理/量子材料术语表示例
 ```

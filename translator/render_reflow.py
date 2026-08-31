@@ -114,6 +114,13 @@ def build_template(page_layouts: list[dict], doc, columns: str = "auto") \
         r1 = max(_quantile(col1_x1, 0.94, page_w / 2 + 30), l1 + 40)
         r1 = min(r1, page_w - mr)
         cols = [(min(l0, page_w / 2 - 10), r0), (l1, r1)]
+        # v0.8.4 退化守卫：栏归属错标/极端布局的量化统计可能产出
+        # 极窄（统计挤压）或空（Rect 归一化后 x1≤x0）栏框——空框喂
+        # story.write 会一路空转到 _MAX_FRAMES 保险丝整个任务报错。
+        # 窄于 24pt 的栏不可读也无意义，剔除；两栏全退化退单栏。
+        cols = [c for c in cols if c[1] - c[0] >= 24.0]
+        if not cols:
+            cols = [(ml, page_w - mr)]
     return Template(page_w, page_h, mt, mb, cols)
 
 
@@ -997,7 +1004,10 @@ def build_reflow_css(body_size: float, dir_css: str, font_css: str) -> str:
               "margin:0;padding:2pt 3pt;border:0.5px solid #999;"
               "text-align:left;}"
             + " ol,ul{margin:0 0 6pt 0;padding-left:22pt;}"
-            + " li{font-family:ptbody,serif;font-size:10.5pt;line-height:1.4;"
+            # v0.8.4: li 字号随 body_size（沿用原文档正文字号）——旧版硬编码
+            # 10.5pt，小字号文档（body 9pt）下列表项比正文大 1.5pt
+            + f" li{{font-family:ptbody,serif;font-size:{body:.2f}pt;"
+              "line-height:1.4;"
               "margin:0 0 2pt 0;text-align:justify;}")
 
 
@@ -1205,7 +1215,14 @@ def render_reflow_document(page_layouts: list[dict], doc,
                            log, dcache=None, doc_fp: "str | None" = None) \
         -> bytes:
     """翻译完成的文档模型 → reflow PDF bytes（不触碰原 doc 页面）。
-    v0.8.1 S4: dcache/doc_fp 提供时图/表/verbatim 位图裁剪入项目缓存。"""
+    v0.8.1 S4: dcache/doc_fp 提供时图/表/verbatim 位图裁剪入项目缓存。
+    v0.8.4 修复：typo=None（features.preserve_formatting: false 或
+    Typography 初始化失败）时 reflow 崩溃——build_document_model 的
+    段落样式分类离不开 Typography，这里兜底构造默认实例（Font 懒加载，
+    构造只解析字体路径串，零额外成本）。"""
+    if typo is None:
+        from .typography import Typography
+        typo = Typography({}, lang=lang)
     template = build_template(page_layouts, doc,
                               columns=getattr(reflow_cfg, "columns",
                                               "auto") or "auto")

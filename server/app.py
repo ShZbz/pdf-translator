@@ -98,11 +98,19 @@ def _build_run_config(req: "TranslateReq", src: Path) -> dict:
     """
     # 由 UI 配置合成临时运行配置
     cfg_data = req.config or {}
+    # v0.8.4: 空节点容错（与 load_config 的 or {} 同纪律）——API 调用方
+    # 传 {"io": null} 这类显式空段时，旧版 setdefault 不替换已存在的
+    # None 键，随后 ["input"] 赋值直接 TypeError 变 500
+    for _k in ("io", "llm"):
+        if cfg_data.get(_k) is None:
+            cfg_data[_k] = {}
     cfg_data.setdefault("io", {})
     cfg_data["io"]["input"] = str(src)
     out_dir = req.output_dir or cfg_data["io"].get("output_dir") or str(src.parent)
     cfg_data["io"]["output_dir"] = out_dir
-    llm_data = cfg_data.get("llm") or {}
+    # 归一化后 llm 必为 dict——`or {}` 会把空 dict 再绕成新对象，回填
+    # 写进脱离 cfg_data 的副本（key 静默丢失）
+    llm_data = cfg_data["llm"]
     if not (llm_data.get("api_key") or "").strip() \
             or "***" in llm_data.get("api_key", ""):
         stored = _stored_llm()
@@ -278,8 +286,13 @@ def put_config(req: ConfigReq) -> dict:
     old = {}
     if UI_CONFIG_PATH.exists():
         old = yaml.safe_load(UI_CONFIG_PATH.read_text(encoding="utf-8")) or {}
-    new_llm = cfg.get("llm", {})
-    old_llm = old.get("llm", {})
+    # v0.8.4: 空节点容错（与 _build_run_config / load_config 同纪律）——
+    # API 调用方传 {"llm": null} 这类显式空段时，cfg.get("llm", {}) 拿到
+    # None，后续 .get 直接 AttributeError 变 500
+    if cfg.get("llm") is None:
+        cfg["llm"] = {}
+    new_llm = cfg["llm"]
+    old_llm = old.get("llm") or {}
     # 打码 key 检测用子串匹配（_mask 长键格式 sk-xxx***xxxx 并不以 ***
     # 结尾——endswith 判不出，会把打码串当真 key 存进去毁掉旧值）
     if "***" in new_llm.get("api_key", "") or (

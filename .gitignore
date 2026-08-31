@@ -42,3 +42,15 @@ ui_config.yaml
 
 # v0.8.3 测试工作区（含 key 的本地测试配置与产物）
 .v083_test/
+
+# v0.8.4 测试工作区（含 key 的本地测试配置与产物）
+.v084_test/
+out_dry/
+out_small/
+.v084_test2/
+
+# v0.8.4 测试工作区（含 key 的本地测试配置与产物）
+.v084_test/
+out_dry/
+out_small/
+.v084_test2/

@@ -49,7 +49,9 @@ _VERBOSE_TS = False
 
 # ---- v0.5.1: 版面结果落盘缓存（段落级断点续跑）----
 # 版面启发式变更时 bump 此版本号（旧缓存 key 不同自动失效）
-_LAYOUT_CACHE_VER = 2
+# v3（v0.8.4）: detect_columns 单栏误判修复（整宽段不再被竖中线腰斩）
+#              + 三线表/Algorithm 框检测栏带随页栏型走（单栏整宽带）
+_LAYOUT_CACHE_VER = 3
 
 
 def _layout_cache_encode(o):
@@ -1303,7 +1305,6 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             # ~2s；校验只读字体文件与目标语言字符表，与布局/翻译无依赖，
             # 放后台线程跑完汇入警告（渲染前 join 收口，零等待重叠）
             import threading as _threading
-            _cov_warns: list[str] = []
 
             def _coverage_worker():
                 try:

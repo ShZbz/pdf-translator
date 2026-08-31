@@ -118,29 +118,6 @@ def measure_fit_factor(rect: "pymupdf.Rect", html: str, css: str,
     return f, bool(fit.big_enough)
 
 
-def measure_fill_ratio(rect: "pymupdf.Rect", html: str, css: str,
-                       archive: "pymupdf.Archive | None") -> float:
-    """段填充率（内容高度/框高，≤1 封顶）——正文微升（body_boost）的门槛。
-
-    fit_scale 结果的 filled 元组即基准字号下的实际内容高度（零额外成本）。
-    """
-    import pymupdf._mupdf as mupdf
-    if rect.height < 5 or not html.strip():
-        return 0.0
-    story = pymupdf.Story(html=html, user_css="body {margin:1px;}" + css,
-                          archive=archive)
-    try:
-        fit = story.fit_scale(pymupdf.Rect(0, 0, rect.width, rect.height),
-                              scale_min=1.0, scale_max=1.0,
-                              flags=mupdf.FZ_PLACE_STORY_FLAG_NO_OVERFLOW)
-    except Exception:
-        return 1.0
-    filled = getattr(fit, "filled", None)
-    if not filled or len(filled) < 4:
-        return 1.0
-    return min(filled[3] / max(rect.height, 1.0), 1.0)
-
-
 def _quantile(sorted_vals: list[float], q: float) -> float:
     """已排序列表的分位数（线性插值）。"""
     if not sorted_vals:

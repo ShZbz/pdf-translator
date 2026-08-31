@@ -182,30 +182,6 @@ def find_cjk_font(explicit: str | None = None, lang: str = "zh") -> str:
     return ""   # 西文：内置衬线兜底（覆盖率告警由 pipeline 补发）
 
 
-def _fit_fontsize(rect: pymupdf.Rect, text: str, font: pymupdf.Font,
-                  base_size: float) -> float:
-    """试排降字号：从 base_size 起，每次 -0.25pt，直到装得下或到 MIN_FONT。"""
-    fs = max(base_size, MIN_FONT)
-    while fs > MIN_FONT:
-        if _fits(rect, text, font, fs):
-            return fs
-        fs -= 0.25
-    return MIN_FONT
-
-
-def _fits(rect: pymupdf.Rect, text: str, font: pymupdf.Font, fs: float) -> bool:
-    """粗判：文本总宽（含换行展开）在 rect 面积约束内可排。"""
-    # 每行可用宽度 = rect 宽；估算行数 = ceil(total_advance / line_width)
-    total = sum(font.text_length(ch, fontsize=fs) for ch in text if ch != "\n")
-    nlines_needed = 0
-    for para in text.split("\n"):
-        w = sum(font.text_length(ch, fontsize=fs) for ch in para)
-        lw = rect.width or 1.0
-        nlines_needed += max(1, int(w // lw) + (1 if w % lw else 0))
-    lh = fs * 1.35          # CJK 行高经验值
-    return nlines_needed * lh <= rect.height * 1.02   # 2% 容差
-
-
 def render_page(page, layout: dict, translated: list[dict],
                 font_path: str, formula_pixmaps: dict[int, bytes] | None = None,
                 bilingual: bool = False,
@@ -267,9 +243,16 @@ def render_page(page, layout: dict, translated: list[dict],
         page.add_redact_annot(p["bbox"])
     # v0.2.3: 表格单元格文字 redact（译文回灌用）——表区边框线不受影响
     # （redaction 只删文字对象，graphics=NONE 保线段）
+    # v0.8.4 修复：redact 与回灌的尺寸门槛必须一致——collect_cell_specs/
+    # writer 路径都跳过 width<8/height<5 的窄格（不重排），旧版却照样
+    # redact 它们 → 窄数字格（单字符行号列实测宽 ~5-7pt）原文被删、
+    # 译文不补，输出静默缺格。窄格不 redact，原像素保留。
     cells = layout.get("tables_cells") or []
     for cell in cells:
-        page.add_redact_annot(pymupdf.Rect(cell["bbox"]))
+        cr = pymupdf.Rect(cell["bbox"])
+        if cr.width < 8 or cr.height < 5:
+            continue
+        page.add_redact_annot(cr)
     # v0.8.0 P2 任务 2.3：redaction 会摧毁重叠区链接注释——先存后补
     links_before = page.get_links()
     page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
@@ -518,16 +501,6 @@ def _wrap_to_width(text: str, font: pymupdf.Font, fs: float, width: float) -> st
                 cur = word
         lines.append(cur)
     return "\n".join(lines)
-
-
-def _bilingual_rect(rect: pymupdf.Rect, zh_fs: float, zh_len: int,
-                    font: pymupdf.Font, en_len: int) -> pymupdf.Rect | None:
-    """双语原文区：段落底部预留 min(需高, 段高40%)。放不下返回 None（放弃原文）。"""
-    est_lines = max(1, int(en_len / max(1.0, rect.width / 6.0)) + 1)
-    need_h = min(est_lines * MIN_FONT * 1.2, rect.height * 0.4)
-    if need_h < MIN_FONT * 1.2:
-        return None
-    return pymupdf.Rect(rect.x0, rect.y1 - need_h, rect.x1, rect.y1)
 
 
 def crop_formula_pixmaps(doc, page_no: int, formulas: list[dict]) -> dict[int, bytes]:

@@ -47,7 +47,19 @@ _LIST_MARKER_RE = re.compile(
 
 
 def detect_columns(page, blocks: list[dict]) -> str:
-    """双栏检测：body 区文字块 x 中位数分布，中央 [0.45,0.55] 页宽内块 <5% 判双栏。"""
+    """双栏检测：跨中线块占比低且左右两半各有实质栏块才判双栏。
+
+    v0.8.4 修复：旧判据统计「完全落在中央 [45%,55%] 页宽窄带内的块」
+    占比 <5% 判 two——双栏文档的栏间隙无块（判 two 恰好正确），但单栏
+    文档的整宽块同样不在窄带内（x0 < mid_lo），同样被判 two →
+    split_crossing_blocks 把每个整宽段按竖中线腰斩成左右两半碎片送译
+    （真实单栏论文 ≥4 个 body 块即触发；合成测试样张块数 <4 走早退，
+    从未暴露；历史 e2e 均为双栏论文）。
+    正解：统计「跨中线块」（x0 < mid−δ 且 x1 > mid+δ）——单栏文档绝
+    大多数块跨线（整宽正文行），双栏文档只有通栏标题/作者/图注跨线。
+    跨线占比 ≥35% 判 one；否则要求左右两半各有 ≥2 个不跨线的块（真
+    栏块）才判 two（防止窄内容页/纯标题页误判）。
+    """
     pw = page.rect.width
     body = [
         b for b in blocks
@@ -55,12 +67,17 @@ def detect_columns(page, blocks: list[dict]) -> str:
     ]
     if len(body) < 4:
         return "one"
-    mid_lo, mid_hi = 0.45 * pw, 0.55 * pw
-    in_gap = sum(
+    mid = pw / 2.0
+    delta = 0.02 * pw
+    crossing = sum(
         1 for b in body
-        if b["bbox"].x0 >= mid_lo and b["bbox"].x1 <= mid_hi
+        if b["bbox"].x0 < mid - delta and b["bbox"].x1 > mid + delta
     )
-    return "two" if in_gap / len(body) < 0.05 else "one"
+    if crossing / len(body) >= 0.35:
+        return "one"
+    left = sum(1 for b in body if b["bbox"].x1 <= mid)
+    right = sum(1 for b in body if b["bbox"].x0 >= mid)
+    return "two" if left >= 2 and right >= 2 else "one"
 
 
 def split_crossing_blocks(page, blocks: list[dict]) -> list[dict]:
@@ -287,7 +304,7 @@ def _is_math_fragment(text: str) -> bool:
     return not re.search(r"[a-zA-Z]{4,}", t)   # 无长单词=纯符号/单字母
 
 
-def _algorithm_box_regions(page) -> list[pymupdf.Rect]:
+def _algorithm_box_regions(page, mode: str = "two") -> list[pymupdf.Rect]:
     """v0.2.3: Algorithm 伪代码框区域检测（顶线+题注+底线三线结构）。
 
     伪代码主体常被 PyMuPDF 拆成多个文本块（paper3 p4 实测：行 1-6 一块
@@ -295,9 +312,10 @@ def _algorithm_box_regions(page) -> list[pymupdf.Rect]:
     几何判定：同栏内全宽横线对，且首条线下方 25pt 内有 'Algorithm'
     题注词 → 两线之间整块是算法框。框内段落全部 verbatim（含标题行，
     整框语言统一不混杂）。
+    v0.8.4: mode 参数——单栏页整宽栏带（旧版硬编码双栏分带，同
+    find_tables 的单栏漏检问题）。
     """
     pw = page.rect.width
-    mid = pw / 2.0
     hlines: list[pymupdf.Rect] = []
     try:
         for d in page.get_drawings():
@@ -313,7 +331,7 @@ def _algorithm_box_regions(page) -> list[pymupdf.Rect]:
     if not alg_words:
         return []
     boxes: list[pymupdf.Rect] = []
-    for x_lo, cap_x in ((0.0, mid), (mid, pw)):
+    for x_lo, cap_x in _col_bands(page, mode):
         col_w = cap_x - x_lo
         wide = sorted(
             (r for r in hlines
@@ -526,7 +544,23 @@ def _detected_tables(page) -> list:
         return []
 
 
-def find_tables(page, detected: list | None = None) -> list[pymupdf.Rect]:
+def _col_bands(page, mode: str) -> "list[tuple[float, float]]":
+    """栏带迭代：(x_lo, cap_x) 序列——双栏页左右两半，单栏页整宽一条。
+
+    v0.8.4：三线表/Algorithm 框检测旧版硬编码双栏分带
+    `((0.0, mid), (mid, pw))`，单栏页的整宽表线/框线起点落不进左栏带
+    （x0 > 0.15×半页宽）→ 检不出（detect_columns 单栏误判修复前该路径
+    不可见——单栏文档本来就被判成双栏）。
+    """
+    pw = page.rect.width
+    if mode == "two":
+        mid = pw / 2.0
+        return [(0.0, mid), (mid, pw)]
+    return [(0.0, pw)]
+
+
+def find_tables(page, detected: list | None = None,
+                mode: str = "two") -> list[pymupdf.Rect]:
     """D3: 表格区域圈定。
 
     v0.2.3: find_tables() 对无竖线三线表（IEEE/学术排版主流）检出 0 张
@@ -535,13 +569,14 @@ def find_tables(page, detected: list | None = None) -> list[pymupdf.Rect]:
     >70% 栏宽、间距 8-80pt）围出的区域判为表区。
 
     v0.4.2: detected 参数透传预检测结果（_detected_tables），避免重复分析。
+    v0.8.4: mode 参数——单栏页用整宽栏带（旧版硬编码双栏分带，单栏页
+    整宽三线表检不出，见 _col_bands）。
     """
     rects: list[pymupdf.Rect] = []
     for t in (detected if detected is not None else _detected_tables(page)):
         rects.append(pymupdf.Rect(t.bbox))
     # ---- 三线表启发式（find_tables 检不出时兜底）----
     pw, ph = page.rect.width, page.rect.height
-    mid = pw / 2.0
     # 收集横线（细高比极端的水平线段）
     hlines: list[pymupdf.Rect] = []
     try:
@@ -551,7 +586,7 @@ def find_tables(page, detected: list | None = None) -> list[pymupdf.Rect]:
                 hlines.append(pymupdf.Rect(r))
     except Exception:
         hlines = []
-    for x_lo, cap in ((0.0, mid), (mid, pw)):
+    for x_lo, cap in _col_bands(page, mode):
         # 该栏的全宽横线：x 覆盖 >70% 栏宽（paper3 表 I 实测 79.7%，
         # 旧 0.98 页宽判定漏检；IEEE 三线表通常与最宽内容行等宽）
         col_w = cap - x_lo
@@ -1194,10 +1229,12 @@ def layout_page(page, engine: str = "heuristic") -> dict:
     assign_columns(body, page.rect.width, mode)
 
     figs = figure_regions(page)
-    detected = _detected_tables(page)
     formulas: list[dict] = []
     layout_engine_used = "heuristic"
     ext = external_layout_regions(page) if engine == "pymupdf-layout" else None
+    # v0.8.4: ext 命中时表区由 GNN 给出、detected 置空——把 find_tables
+    # （全页文本+线条重分析）挪到命中失败的分支之后，该引擎不再白跑
+    detected = [] if ext is not None else _detected_tables(page)
     if ext is not None:
         # GNN 版面检测接管图/表/公式区（结构化区域替代 bbox 启发式）；
         # 段落切分/合并/栏检测仍走内置管线（GNN 文本区粒度不含阅读序）
@@ -1210,14 +1247,15 @@ def layout_page(page, engine: str = "heuristic") -> dict:
     else:
         if engine == "pymupdf-layout":
             layout_engine_used = "pymupdf-layout-fallback"
-        tables = [pymupdf.Rect(t) for t in find_tables(page, detected=detected)]
+        tables = [pymupdf.Rect(t) for t in find_tables(page, detected=detected,
+                                                        mode=mode)]
         # P3: display 公式区先于段落收集（基于原始 body 块），文字块受保护：
         # 公式区内的 span/碎片不进翻译队列、原文不抹除，仅裁图回贴（D6 完整闭环）。
         formulas = collect_display_formulas(page, body)
     formula_rects = [pymupdf.Rect(f["bbox"]) for f in formulas]
     # v0.2.3: Algorithm 伪代码框几何检测——框内段落全部 verbatim
     # （主体被拆成多块时 span 启发式必漏，实测 paper3 p4 行 7-9 独立成块）
-    alg_boxes = _algorithm_box_regions(page)
+    alg_boxes = _algorithm_box_regions(page, mode=mode)
     # v0.2.2: 保护判定从"块中心"改为"块与公式区相交"——混合块
     # （如 'dt .\n(6)'，一半公式碎片一半编号）中心在区外会被漏保护，
     # 导致 redact 抹掉编号+碎片重灌成乱码（实测 page3 (6)(7) 被吞根因）。

@@ -142,9 +142,6 @@ class Typography:
             # 侵入的盒高;更小的起排字号给试排降字号留出空间）
             return ParaStyle("ref_entry", size=min(size, 8.2) * 0.9, indent=0)
 
-        if _ABSTRACT_RE.match(txt) or _INDEX_TERMS_RE.match(txt):
-            return ParaStyle("abstract", size=size * 0.95, indent=0, bold_lead=True)
-
         # v0.4.2: 首行缩进 2 字符仅 CJK 目标语言（中文期刊惯例），
         # 西文/西里尔按学术惯例顶格
         return ParaStyle("body", size=size, indent=2 if self.cjk else 0)
