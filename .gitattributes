@@ -1,0 +1,31 @@
+# Windows 工具链（编辑器/opencode 等）会把文件写成 CRLF，污染 git diff。
+# v0.5.0 后统一强制 LF（2026-08-28）：文本文件入库/检出均为 LF。
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.sh text eol=lf
+*.txt text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+
+# 归档快照冻结：Release/ 目录不做任何行尾转换，历史快照保持入库原样
+Release/** -text
+
+# 二进制（禁止行尾转换）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.otf binary
+*.ttf binary
+*.ttc binary
+*.db binary
+*.pyc binary
