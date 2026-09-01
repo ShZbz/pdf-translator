@@ -38,11 +38,19 @@ class JobControl:
         # v0.7.1: 命令总线绑定（EventSink.drain）——checkpoint 在每个
         # 检查点消费命令通道，命令粒度=检查点粒度（页级循环即页间）
         self._command_source = None
+        # v0.8.5: 未知命令转发钩子（actor 化页级命令入口）——pause/
+        # resume/cancel 之外的命令（如 retranslate）经此交给管线处理，
+        # 命令通道因此对任意页级指令可扩展（不在 JobControl 里硬编码）
+        self._extra_handler = None
 
     # ---- v0.7.1: 命令总线绑定（任务 2-4 预备）----
     def bind_commands(self, drain: "callable") -> None:
         """绑定命令源（如 EventSink.drain）；checkpoint 检查点消费。"""
         self._command_source = drain
+
+    def bind_command_handler(self, fn: "callable") -> None:
+        """注册未知命令处理器 fn(cmd_dict)（v0.8.5 页级命令入口）。"""
+        self._extra_handler = fn
 
     def _apply_commands(self) -> None:
         """消费命令通道（幂等：与直接调用 pause/resume/cancel 同语义）。"""
@@ -61,6 +69,11 @@ class JobControl:
                 self.resume()
             elif cmd == "cancel":
                 self.cancel()
+            elif cmd and self._extra_handler is not None:
+                try:
+                    self._extra_handler(c)
+                except Exception:
+                    pass       # 页级命令处理故障不拖垮控制通道
 
     # ---- UI 线程侧 ----
     def pause(self) -> bool:

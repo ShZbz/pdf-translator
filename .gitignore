@@ -54,3 +54,6 @@ out_small/
 out_dry/
 out_small/
 .v084_test2/
+
+# v0.8.5 测试工作区（含 key 的本地测试配置与产物）
+.v085_test/

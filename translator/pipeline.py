@@ -51,7 +51,15 @@ _VERBOSE_TS = False
 # 版面启发式变更时 bump 此版本号（旧缓存 key 不同自动失效）
 # v3（v0.8.4）: detect_columns 单栏误判修复（整宽段不再被竖中线腰斩）
 #              + 三线表/Algorithm 框检测栏带随页栏型走（单栏整宽带）
-_LAYOUT_CACHE_VER = 3
+# v4（v0.8.5 终检）: _is_algorithm_remnant 粗体豁免——粗体主导块（标题
+#              续行等）不再被 for/if/Sample 伪代码关键词误判 verbatim
+_LAYOUT_CACHE_VER = 4
+
+# v0.8.5: 整页渲染结果缓存版本。渲染代码/样式（render.py/render_story.py/
+# render_reflow.py 的版式语义）变更时 bump——旧缓存 key 不同自动失效，
+# 否则热跑回放旧版式。key 组成见 _render_cache_key。
+# v2: reflow 伪代码框吸收框内公式条（旧版框拆碎为头块+公式条+尾块）。
+_RENDER_CACHE_VER = 2
 
 
 def _layout_cache_encode(o):
@@ -278,6 +286,75 @@ def _qualify_fp(doc_fp: "str | None", sel: str) -> "str | None":
     return f"{doc_fp}|sel{sel}"
 
 
+# ---- v0.8.5: 整页渲染结果缓存（候选池 S4 推广，热跑重渲染 → 0 计算）----
+
+def _render_payload_hash(state: dict) -> str:
+    """渲染输入负载哈希：全部译文/原文对照/OCR 内容的确定性摘要。
+
+    渲染输出由「布局几何 × 译文内容 × 渲染配置」唯一决定——布局几何由
+    布局缓存 key 身份代劳（_render_cache_key 混入 layout_key），这里
+    只需摘要译文侧。fit 因子由布局+译文+fit 配置确定性推导，无需单列。
+    """
+    def _r(v) -> str:
+        return f"{v.x0:.2f},{v.y0:.2f},{v.x1:.2f},{v.y1:.2f}"
+
+    payload = {
+        "texts": {str(p): ts for p, ts in (state["texts_by_page"] or {}).items()},
+        "cells": {f"{p}.{ci}": t
+                  for (p, ci), t in (state["cell_texts"] or {}).items()},
+        "cross_full": {f"{p}.{i}": t
+                       for (p, i), t in (state.get("cross_full") or {}).items()},
+        "cross_skip": sorted(f"{p}.{i}"
+                             for p, i in (state.get("cross_skip") or set())),
+        "ocr_jobs": [[jb["pno"], jb["mode"], jb.get("text", ""),
+                      [[_r(rect), t] for rect, t in (jb.get("blocks") or [])]]
+                     for jb in (state["ocr_jobs"] or [])],
+        "ocr_out": list(state["ocr_translations"] or []),
+    }
+    return hashlib.md5(json.dumps(payload, ensure_ascii=False)
+                       .encode("utf-8")).hexdigest()
+
+
+def _render_cache_key(cfg, dcache, doc_fp: "str | None", sel: str,
+                      layout_engine: str, state: dict, typo, font_path: str,
+                      tgt_lang: str) -> "str | None":
+    """渲染结果缓存 key：文档指纹|页码子集|布局身份|渲染配置哈希|译文哈希。
+
+    任一渲染输入变化（双语/字号/字体/栏结构/译文/引擎版本…）key 不同
+    自动 miss 重渲染——静默出旧版式的风险由全覆盖 key 消除（候选池
+    评估时点名的失败模式）。任何一项拿不到（无缓存库/显式关闭）返回
+    None（走全量渲染，行为不回退）。
+    """
+    if dcache is None or not doc_fp:
+        return None
+    if not bool(getattr(cfg.performance, "render_cache", True)):
+        return None
+    from .doccache import DocumentCache
+    fit_cfg = cfg.fit
+    comp = [
+        f"v{_RENDER_CACHE_VER}",
+        f"mupdf{pymupdf.__version__}",
+        # 布局身份：文档指纹+引擎+版面缓存版本+页码子集（几何由此唯一）
+        DocumentCache.layout_key(doc_fp, layout_engine, _LAYOUT_CACHE_VER, sel),
+        cfg.output.mode, tgt_lang,
+        bool(cfg.features.bilingual), cfg.features.renderer,
+        bool(cfg.features.preserve_formatting),
+        bool(cfg.features.watermark_removal),
+        font_path or "",
+        (typo.heading_path if typo is not None else "") or "",
+        (typo.en_body_path if typo is not None else "") or "",
+        repr(fit_cfg) if fit_cfg is not None else "off",
+        getattr(cfg.render, "page_story", "auto"),
+        bool(getattr(cfg.performance, "subset_fonts", True)),
+        getattr(cfg.ocr, "mode", "appendix"),
+        getattr(cfg.ocr, "min_chars", 50),
+        cfg.reflow.columns, cfg.reflow.body_size, cfg.reflow.segment_blocks,
+        _render_payload_hash(state),
+    ]
+    raw = "|".join(str(c) for c in comp)
+    return "rnd:" + hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
 def _crop_formulas_cached(doc, pno: int, formulas: list[dict],
                           dcache, doc_fp) -> dict[int, bytes]:
     """公式位图裁剪（v0.8.1 S4：doccache 位图缓存）。
@@ -428,74 +505,53 @@ def _group_budget(g: list[int], pending: list, page_layouts: list, typo,
 def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
                          glossary, cache, sink, control, fit_cfg,
                          layout_engine, dcache, doc_fp, out_dir, all_warnings,
-                         sel: str = ""):
-    """v0.7.0 布局-翻译流水线重叠路径（任务 2-2b）。
+                         sel: str = "", force_pages: "set[int] | None" = None):
+    """v0.7.0 布局-翻译流水线重叠路径（任务 2-2b；v0.8.5 actor 化）。
 
-    布局在后台线程逐页产出（布局线程持有独立打开的 Document——
-    PyMuPDF 非线程安全，主线程的 doc 只做 OCR 渲染/公式裁图）；
-    主线程每收到一页：收集段/格 → 跨页合并判定（1 页前视）→ 预算 →
-    缓存 → 未命中进 StreamingTranslator 开批——批满即发车，布局继续
-    跑下一页。页 N 布局完 → 该页段落立即进组批队列，50+ 页大文档
-    省整段布局时间（与版面缓存互补：缓存命中时页瞬间产出）。
+    布局/OCR 阶段跑在 StageActor（translator.actors）里：布局 actor
+    逐页产出（缓存命中直接回放），主线程每收到一页：收集段/格 →
+    跨页合并判定（1 页前视）→ 预算 → 缓存 → 未命中进 StreamingTranslator
+    开批——批满即发车，布局继续跑下一页。页 N 布局完 → 该页段落立即
+    进组批队列，50+ 页大文档省整段布局时间（与版面缓存互补：缓存命中
+    时页瞬间产出）。
 
     sel: io.pages 原始串——版面缓存 load/save 带同一 sel（v0.8.3 收口：
     旧版流式路径 save 漏传 sel，子集试译会用子集版面覆盖全量版面
     缓存条目；load 侧两路径也从未带 sel，sel 后缀条目永远读不到）。
     位图缓存指纹按 _qualify_fp 限定（页码重编号防串图）。
+    force_pages: 页级重译集合（v0.8.5）——页号在集合内的单元绕过
+    翻译缓存强制重译（跨页合并组任一半被点名即整组重译）。
 
     返回 dict（与非流式路径同构的下游状态）：
     page_layouts / page_pixmaps / texts_by_page / cell_texts /
     ocr_jobs / ocr_translations / n_paras / total_calls / tc
     """
-    import queue as _queue
-    import threading as _threading
+    from .actors import LayoutActor, OcrActor
     from .langs import lang_info as _lang_info
     from .llm import StreamingTranslator
     from . import ocr as ocr_mod
 
     n_pages = len(doc)
+    # v0.8.5 审查修复：必须保留传入集合的对象身份（旧版 `or set()` 在
+    # 初始空集时重建对象）——translate_document 的命令总线钩子
+    # _on_page_cmd 向外层 force_pages 添加运行中到达的 retranslate 页，
+    # 引用断开则命令被消费并打出日志但永不生效（页喂入读的是本函数
+    # 的局部绑定）
+    force_pages = force_pages if force_pages is not None else set()
     cjk = _lang_info(tgt_lang).script == "cjk"
     budget_font = _budget_font(font_path, cjk) if fit_cfg.mode == "auto" else None
     budgets_on = fit_cfg.mode == "auto"
 
-    # 布局线程的独立 Document（水印清理只发生在主 doc，落盘后重开）
+    # 布局 actor 的独立 Document（水印清理只发生在主 doc，落盘后重开）
     fd, tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(out_dir))
     os.close(fd)
     layout_tmp = Path(tmp_name)
-    q: "_queue.Queue" = _queue.Queue()
 
     cached = dcache.load_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
                                 sel=sel) \
         if (dcache is not None and doc_fp is not None) else None
     cache_hit = cached is not None and len(cached) == n_pages
     pix_fp = _qualify_fp(doc_fp, sel)
-
-    def _producer():
-        pdoc = None
-        try:
-            doc.save(str(layout_tmp))
-            pdoc = pymupdf.open(str(layout_tmp))
-            for pno in range(n_pages):
-                if control is not None:
-                    control.checkpoint()
-                if cache_hit:
-                    lay = cached[pno]
-                else:
-                    lay = layout_page(pdoc[pno], engine=layout_engine)
-                # v0.8.1 S4: 公式裁图走项目位图缓存（重跑 0 调用也不再重裁）
-                pixmaps = _crop_formulas_cached(
-                    pdoc, pno, lay.get("formulas") or [], dcache, pix_fp) \
-                    if lay.get("formulas") else {}
-                q.put((pno, lay, pixmaps))
-            q.put(None)
-        except BaseException as e:      # JobCancelled/布局异常都交给消费侧
-            q.put(e)
-        finally:
-            if pdoc is not None:
-                try:
-                    pdoc.close()
-                except Exception:
-                    pass
 
     llm_eff = cfg.llm.effective()
     if (llm_eff.min_call_interval, llm_eff.batch_char_budget) != \
@@ -548,8 +604,13 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
                 else "caption" if para.get("is_caption") else None
         budget = _group_budget(g, pending, page_layouts, typo, budget_font,
                                cjk) if budgets_on else None
+        # v0.8.5 页级重译：组内任一段归属页被点名即整组绕过缓存
+        # （合并单元是原子翻译单元，不能半组缓存半组重译）
+        force = bool(force_pages) and any(pending[fi][0] in force_pages
+                                          for fi in g)
         unit_targets.append(("para", g))
-        streamer.add_unit(_join_group_parts(parts), budget=budget, kind=kind)
+        streamer.add_unit(_join_group_parts(parts), budget=budget, kind=kind,
+                          force=force)
 
     def _feed_page(pno: int, lay: dict, pixmaps: dict) -> None:
         nonlocal open_group, n_paras
@@ -571,13 +632,14 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
                 pymupdf.Rect(cell["bbox"]), 8.0, 1.25, budget_font, cjk
             ) if budgets_on else None
             unit_targets.append(("cell", pno, ci))
-            streamer.add_unit(cell["text"], budget=budget or None)
+            streamer.add_unit(cell["text"], budget=budget or None,
+                              force=pno in force_pages)
         # OCR 扫描页（v0.8.1: 提取派给后台单线程——paddle 1-3s/页、多引擎
         # 投票 ×2-3，同步执行会卡住主循环的翻译喂批；引擎实例非线程安全，
         # 单 worker 串行消费。结果在布局全部到齐后按页序补进翻译队列）
         if client is not None and engines_avail \
                 and not page_has_text_layer(doc[pno], cfg.ocr.min_chars):
-            ocr_q.put(pno)
+            ocr_actor.send(pno)
         # 段落：先登记本页非 verbatim 段，再决上一页遗留的跨页合并组
         # v0.8.2 修复：旧版先查 flat_idx_of[(pno, 0)] 后登记本页段——
         # 索引必不存在，跨页合并判定永远走 else 单段发射（v0.7.0 起
@@ -609,56 +671,24 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
             else:
                 _emit_para_group([fi])
 
-    t_prod = _threading.Thread(target=_producer, daemon=True)
-    t_prod.start()
-
-    # v0.8.1: OCR 后台单线程（引擎实例非线程安全→单 worker；独立 Document
-    # ——PyMuPDF 非线程安全，与布局线程的 pdoc 同款纪律。layout_tmp 由
-    # _producer 在首个 q.put 前落盘，首个 OCR 任务入队时必然已存在）
-    ocr_q: "_queue.Queue" = _queue.Queue()
-    ocr_results: dict[int, "dict | None"] = {}
-    ocr_err: list = []
-
-    def _ocr_worker():
-        odoc = None
-        try:
-            while True:
-                pno = ocr_q.get()
-                if pno is None:
-                    break
-                if odoc is None:
-                    odoc = pymupdf.open(str(layout_tmp))
-                ocr_results[pno] = _ocr_page_job(
-                    odoc, pno, cfg, ocr_mode, engines_avail, all_warnings)
-        except BaseException as e:      # 引擎崩溃/取消交主线程统一处理
-            ocr_err.append(e)
-        finally:
-            if odoc is not None:
-                try:
-                    odoc.close()
-                except Exception:
-                    pass
-
-    t_ocr = None
-    if client is not None and engines_avail:
-        t_ocr = _threading.Thread(target=_ocr_worker, daemon=True)
-        t_ocr.start()
+    # v0.8.5 actor 化：布局阶段（自驱逐页产出；缓存命中回放）+ OCR 阶段
+    # （单 worker 串行消费页号，与旧线程对纪律一致）
+    layout_actor = LayoutActor(doc, layout_tmp, n_pages,
+                               cached if cache_hit else None,
+                               layout_engine, dcache, pix_fp,
+                               control=control).start()
+    ocr_actor = None
 
     _log(f"layout: streaming overlap on ({n_pages} page(s), "
          f"engine={layout_engine})")
     try:
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            if isinstance(item, BaseException):
-                # producer 异常（布局失败/取消）就地 raise——与循环内其他
-                # 异常统一走 except：先终结未跑完的翻译批再向上传播
-                # （v0.8.3 前经 err 变量绕过 except，批线程池不收口）
-                raise item
+        if client is not None and engines_avail:
+            ocr_actor = OcrActor(layout_tmp, cfg, ocr_mode, engines_avail,
+                                 all_warnings, control=control).start()
+        for pno, lay, pixmaps in layout_actor.results():
             if control is not None:
                 control.checkpoint()
-            _feed_page(*item)
+            _feed_page(pno, lay, pixmaps)
         if open_group is not None:
             _emit_para_group(open_group)
             open_group = None
@@ -669,18 +699,26 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
         streamer.abort()
         raise
     finally:
-        # OCR 线程收尾（join 必须先于 layout_tmp 删除——worker 的 odoc 句柄
-        # 开着时 Windows unlink 会失败留残文件；异常路径同样要收口）
-        if t_ocr is not None:
-            ocr_q.put(None)
-            t_ocr.join()
+        # OCR actor 收尾（join 必须先于 layout_tmp 删除——actor 的 odoc
+        # 句柄开着的 Windows unlink 会失败留残文件；异常路径同样要收口）。
+        # 布局 actor 异常路径不 join（daemon，与旧 producer 线程同时序：
+        # 取消不该等完全部队局）；正常路径 results() 耗尽即已收尾。
+        if ocr_actor is not None:
+            ocr_actor.close()
+            ocr_actor.join()
+    try:
+        layout_actor.join(timeout=5.0)   # pdoc.close 先于 tmp 删除（Windows 句柄）
+    except Exception:
+        pass
     try:
         layout_tmp.unlink(missing_ok=True)
     except OSError:
         pass
     try:
-        if ocr_err:
-            raise ocr_err[0]
+        if ocr_actor is not None and ocr_actor.errors:
+            raise ocr_actor.errors[0]
+        ocr_results: dict[int, "dict | None"] = dict(ocr_actor.drain()) \
+            if ocr_actor is not None else {}
         # OCR 结果按页序补进翻译队列（布局/翻译全程与 OCR 并行——旧版同步
         # 提取逐页阻塞主循环）；ocr_jobs 的构造顺序与 unit_targets 对齐
         for pno in sorted(ocr_results):
@@ -695,10 +733,10 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
             if job["mode"] in ("inplace", "reconstruct"):
                 for bi, (_r, t) in enumerate(job["blocks"]):
                     unit_targets.append(("ocr", jidx, bi))
-                    streamer.add_unit(t)
+                    streamer.add_unit(t, force=pno in force_pages)
             else:
                 unit_targets.append(("ocr", jidx, None))
-                streamer.add_unit(job["text"])
+                streamer.add_unit(job["text"], force=pno in force_pages)
         if not cache_hit and dcache is not None and doc_fp is not None \
                 and page_layouts and len(page_layouts) == n_pages:
             dcache.save_layout(doc_fp, layout_engine, _LAYOUT_CACHE_VER,
@@ -797,7 +835,6 @@ def _translate_streaming(doc, cfg, client, typo, font_path, tgt_lang,
         "total_calls": total_calls,
         "tc": tc,
     }
-
 
 def _append_ocr_pages(doc, ocr_units: list[tuple[int, str]],
                       translations: list[str], font_path: str,
@@ -1164,7 +1201,9 @@ def _subset_fonts_try(doc, log) -> bool:
 
 def translate_document(cfg: Config, client=None, verbose: bool = False,
                        sink: "EventSink | None" = None,
-                       control: "JobControl | None" = None) -> dict:
+                       control: "JobControl | None" = None,
+                       retranslate_pages: "set[int] | list[int] | None" = None
+                       ) -> dict:
     """整册翻译。client 为注入的 OpenAI 兼容实例（None=跳过翻译只测管线）。
 
     v0.8.3: 生产入口传 LLMClientPool（llm.py）——请求墙钟楔死终结
@@ -1172,6 +1211,10 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     注入裸 OpenAI 实例/mock 仍可用（墙钟生效，无池可终结）。
     v0.4.0: sink=进度事件流（None=纯 CLI 模式零开销）；
             control=暂停/取消控制（None=不可控，原行为）。
+    v0.8.5: retranslate_pages=页级重译集合（0-based 页号）——这些页的
+            翻译单元绕过翻译缓存强制重译（CLI --retranslate 入口）；
+            运行中亦可经 sink.post({"cmd":"retranslate","pages":[...]})
+            到达（control 命令通道转发，流式路径页粒度生效）。
     返回统计：{pages, paragraphs, calls, warnings, output, ocr_pages}
     """
     global _VERBOSE_TS
@@ -1190,6 +1233,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     # 输出名带 -p<sel> 标记，试译不覆盖全量输出
     sel_spec = (getattr(cfg.io, "pages", "") or "").strip()
     sel_extra = ""
+    sel_map: "dict[int, int] | None" = None   # 原始页号 → select 后页码
     if sel_spec:
         from .config import parse_page_ranges
         sel_idx = parse_page_ranges(sel_spec, n_pages)
@@ -1197,6 +1241,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             raise ValueError(
                 f"io.pages 未选中任何有效页（共 {n_pages} 页）: {sel_spec!r}")
         if len(sel_idx) < n_pages:
+            sel_map = {orig: new for new, orig in enumerate(sel_idx)}
             doc.select(sel_idx)
             n_pages = len(doc)
             sel_extra = "-p" + sel_spec.replace(",", "-").replace(" ", "")
@@ -1208,6 +1253,48 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
     # v0.8.1: 警告收集器升级——入列即转发 sink.warning（UI 可见），
     # CLI stats["warnings"] 行为不变
     all_warnings: list[str] = _WarningList(sink)
+
+    # ---- v0.8.5: 页级重译集合（参数 + 命令总线两个入口合一）----
+    # retranslate_pages 按原始文档页号表达（CLI --retranslate 与 io.pages
+    # 同风格）；io.pages 子集运行时映射到 select 后页码——旧版按原始页号
+    # 直接过滤（0 <= p < n_pages），子集不从头起时点名页全部越界被静默
+    # 丢弃（--retranslate 5 × io.pages 4-6 实证无效）
+    force_pages: set[int] = set()
+    for _p in (retranslate_pages or []):
+        try:
+            _p = int(_p)
+        except (TypeError, ValueError):
+            continue
+        if sel_map is not None:
+            _p = sel_map.get(_p)
+            if _p is None:
+                continue          # 点名页不在子集内：忽略
+        if 0 <= _p < n_pages:
+            force_pages.add(_p)
+    if force_pages:
+        _log(f"retranslate: page(s) "
+             f"{sorted(p + 1 for p in force_pages)} will bypass cache")
+
+    def _on_page_cmd(c: dict) -> None:
+        """命令总线页级命令入口（EventSink.post retranslate，0-based 页号；
+        流式路径在页喂入粒度消费——见 actors 模块 docstring）"""
+        if (c.get("cmd") or "").strip().lower() != "retranslate":
+            return
+        for _p in (c.get("pages") or []):
+            try:
+                _p = int(_p)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= _p < n_pages and _p not in force_pages:
+                force_pages.add(_p)
+                _log(f"retranslate: page {_p + 1} marked (cache bypass)")
+
+    if control is not None:
+        control.bind_command_handler(_on_page_cmd)
+        if sink is not None:
+            # v0.7.1 命令通道设计语义的生产接线：checkpoint 消费
+            # sink 命令队列（pause/resume/cancel 幂等，其余转 _on_page_cmd）
+            control.bind_commands(sink.drain)
 
     # v0.5.1: 渲染器选择 + RTL/天城文强制 htmlbox（writer 逐字排印无
     # shaping/bidi，阿拉伯语/希伯来语/天城文输出不可读——自动切换并告警）
@@ -1231,7 +1318,13 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
              f"lead={fit_cfg.lead_steps} tracking={fit_cfg.tracking} "
              f"min_scale={fit_cfg.min_scale} boost={fit_cfg.body_boost})")
 
-    font_path = find_cjk_font(cfg.fonts.get("cjk"), lang=tgt_lang)
+    # v0.8.5 审查修复：fonts 覆盖优先级与 langs.resolve_output_fonts 对齐
+    # （body > cjk_body > cjk）——旧版只传 cjk 键，显式配置 fonts.body 的
+    # 用户实际渲染用的是自动探测字体（Typography 覆盖率校验读 body、
+    # 渲染却读 cjk，配置被静默忽略；config.example.yaml 文档化了该键）
+    _body_exp = (cfg.fonts.get("body") or cfg.fonts.get("cjk_body")
+                 or cfg.fonts.get("cjk") or None)
+    font_path = find_cjk_font(_body_exp, lang=tgt_lang)
     glossary = Glossary.load(cfg.glossary_file) if cfg.glossary_file else None
     # ---- v0.7.1: 项目级缓存库（翻译缓存 + 文档指纹索引 + 版面缓存）----
     # 默认随输入文件目录（可写探测失败退输出目录）——同一输入译到不同
@@ -1341,7 +1434,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             state = _translate_streaming(
                 doc, cfg, client, typo, font_path, tgt_lang, glossary,
                 cache, sink, control, fit_cfg, layout_engine, dcache,
-                doc_fp, out_dir, all_warnings, sel=sel_spec)
+                doc_fp, out_dir, all_warnings, sel=sel_spec,
+                force_pages=force_pages)
         except JobCancelled:
             raise
         except Exception as e:
@@ -1586,6 +1680,26 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             unit_kinds.extend([None] * len(ocr_flat))
             all_flat = unit_texts + cell_flat + ocr_flat
 
+            # v0.8.5 页级重译：all_flat 索引 → force_units（页号在集合内的
+            # 单元绕过缓存；跨页合并组任一半被点名即整组重译）
+            force_units: set[int] = set()
+            if force_pages:
+                for gi, g in enumerate(merge_groups):
+                    if any(pending[fi][0] in force_pages for fi in g):
+                        force_units.add(gi)
+                base = len(merge_groups)
+                for k, (pno, _ci) in enumerate(cell_pending):
+                    if pno in force_pages:
+                        force_units.add(base + k)
+                base += len(cell_flat)
+                k = 0
+                for jb in ocr_jobs:
+                    n = len(jb["blocks"]) if jb["mode"] in ("inplace",
+                                                            "reconstruct") else 1
+                    if jb["pno"] in force_pages:
+                        force_units.update(range(base + k, base + k + n))
+                    k += n
+
             # v0.5.0: llm.effective()——rpm/tpm 配额自动换算 interval/batch
             # （显式配置优先；dry-run 日志里能看到实际生效值）
             llm_eff = cfg.llm.effective()
@@ -1636,7 +1750,8 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
                     unit_budgets = None
             translated_flat, total_calls = tc.translate_paragraphs(
                 all_flat, cache=cache, budgets=unit_budgets,
-                unit_kinds=unit_kinds)
+                unit_kinds=unit_kinds,
+                force_units=force_units or None)
             all_warnings.extend(tc.warnings)
             if tc.sent_cache_hits:
                 _log(f"cache: {tc.sent_cache_hits} template unit(s) served by "
@@ -1743,6 +1858,80 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         control.checkpoint()
     sink.stage("render")
 
+    # ---- v0.8.5: 整页渲染结果缓存（候选池 S4 推广）----
+    # 热跑（布局/翻译全缓存命中）场景渲染+落盘占九成耗时（Story 落墨+save
+    # ~1s+/页）——最终输出 PDF 字节由（文档指纹|页码子集|布局缓存身份|
+    # 渲染相关配置哈希|译文负载哈希）内容寻址入项目库（doccache.renders），
+    # 全命中时直接原子回放（热跑 ~10s → 接近 0）。任一输入变化 key 不同
+    # 自动 miss 重渲染——静默出旧版式的风险由全覆盖 key 消除（候选池
+    # 评估点名的失败模式）。reflow×扫描页的防御性 raise 留在 miss 分支
+    # （命中条目只能来自无 OCR 的成功 reflow 运行，payload 哈希含 OCR
+    # 内容，两者不可能同 key）。
+    render_ck = _render_cache_key(cfg, dcache, doc_fp, sel_spec,
+                                  layout_engine, state, typo, font_path,
+                                  tgt_lang)
+    cached_render, cached_meta = (dcache.load_render(render_ck)
+                                  if render_ck else (None, {}))
+    if cached_render is not None:
+        final_path = out_path if cfg.output.mode != "reflow" else (
+            out_dir / output_pdf_name(src.stem, tgt_lang, False,
+                                      extra="-reflow" + sel_extra))
+        _log(f"render: cache hit ({len(cached_render) / 1048576:.1f} MiB) — "
+             f"skip render+save for {n_pages} page(s)")
+        sink.emit("render_cache_hit", pages=n_pages)
+        ocr_pages_added = int(cached_meta.get("ocr_pages", 0) or 0)
+        ocr_inplace_blocks = int(cached_meta.get("ocr_inplace_blocks", 0) or 0)
+        cache_hits = getattr(tc, "cache_hits", 0) if client is not None else 0
+        cache_saved_calls = 0
+        if cache_hits:
+            bs = max(1, int(getattr(cfg.llm, "batch_size", 6) or 6))
+            cache_saved_calls = -(-cache_hits // bs)
+        cache_entries = 0
+        if cache is not None:
+            try:
+                cache_entries = cache.count()
+            except Exception:
+                pass
+        tmp_path = final_path.with_suffix(".pdf.tmp")
+        try:
+            tmp_path.write_bytes(cached_render)
+            os.replace(tmp_path, final_path)
+        finally:
+            try:
+                if not doc.is_closed:
+                    doc.close()
+            except Exception:
+                pass
+            if dcache is not None:
+                dcache.close()
+            elif cache:
+                cache.close()
+        _log(f"done: {n_paras} paras, {total_calls} LLM calls, "
+             f"{cache_hits} cache hits, {len(all_warnings)} warnings, "
+             f"{time.time() - t0:.1f}s (render cache hit)")
+        sink.emit("done", output=str(final_path), pages=n_pages,
+                  paragraphs=n_paras, calls=total_calls,
+                  ocr_pages=ocr_pages_added,
+                  ocr_inplace_blocks=ocr_inplace_blocks,
+                  cache_hits=cache_hits,
+                  cache_saved_calls=cache_saved_calls,
+                  cache_entries=cache_entries,
+                  elapsed=round(time.time() - t0, 1))
+        return {
+            "pages": n_pages,
+            "paragraphs": n_paras,
+            "calls": total_calls,
+            "warnings": all_warnings,
+            "output": str(final_path),
+            "cache_db": (str(dcache.path) if dcache is not None else ""),
+            "ocr_pages": ocr_pages_added,
+            "ocr_inplace_blocks": ocr_inplace_blocks,
+            "cache_hits": cache_hits,
+            "cache_saved_calls": cache_saved_calls,
+            "cache_entries": cache_entries,
+            "render_cache_hit": True,
+        }
+
     # ---- v0.8.0 P3: reflow 整文档重排（output.mode: reflow）----
     # 文档模型 → 新模板 → Story 流式写入（render_reflow.py）；不 redact
     # 原 doc、无 fit 因子/降级阶梯（框跟内容走）；翻译层与 faithful 完全
@@ -1793,6 +1982,15 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             finally:
                 rdoc.close()
             os.replace(tmp_path, out_path)
+            # v0.8.5: 整页渲染结果缓存写入（miss 路径）
+            if render_ck is not None:
+                try:
+                    dcache.save_render(
+                        render_ck, doc_fp or "", cfg.output.mode,
+                        out_path.read_bytes(),
+                        meta={"ocr_pages": 0, "ocr_inplace_blocks": 0})
+                except Exception:
+                    pass
         finally:
             # v0.8.1: 资源收口（旧版 reflow 路径直接 return——dcache 的
             # SQLite 连接与 doc 句柄从未关闭，Windows 上锁库锁文件）
@@ -1826,6 +2024,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
             "cache_hits": cache_hits,
             "cache_saved_calls": cache_saved_calls,
             "cache_entries": cache_entries,
+            "render_cache_hit": False,
         }
 
     if renderer == "writer":
@@ -1994,9 +2193,27 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         if getattr(cfg.performance, "subset_fonts", True):
             _subset_fonts_try(doc, _log)
         doc.save(str(tmp_path), garbage=4, deflate=True)
-        doc.close()
         os.replace(tmp_path, out_path)
+        # v0.8.5: 整页渲染结果缓存写入（miss 路径——OCR 页统计随 meta
+        # 入库，命中回放时报表与真实渲染一致）
+        if render_ck is not None:
+            try:
+                dcache.save_render(
+                    render_ck, doc_fp or "", cfg.output.mode,
+                    out_path.read_bytes(),
+                    meta={"ocr_pages": ocr_pages_added,
+                          "ocr_inplace_blocks": ocr_inplace_blocks})
+            except Exception:
+                pass
     finally:
+        # v0.8.5: doc 句柄无条件收口——旧版只在成功路径 close，渲染/保存
+        # 中途异常时源 PDF 句柄泄漏到进程结束（Windows 上锁文件），长驻
+        # 进程（测试/嵌入式调用）会累积
+        try:
+            if not doc.is_closed:
+                doc.close()
+        except Exception:
+            pass
         # v0.7.1: 项目级缓存库统一收口（dcache.close 同时关翻译缓存表）
         if dcache is not None:
             dcache.close()
@@ -2025,6 +2242,7 @@ def translate_document(cfg: Config, client=None, verbose: bool = False,
         "cache_hits": cache_hits,
         "cache_saved_calls": cache_saved_calls,
         "cache_entries": cache_entries,
+        "render_cache_hit": False,
     }
     sink.emit("done", output=str(out_path), pages=n_pages,
               paragraphs=n_paras, calls=total_calls,

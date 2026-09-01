@@ -270,17 +270,22 @@ def _is_algorithm_remnant(text: str, spans: list | None = None) -> bool:
     特征：以 Break/End/for/if/while/return 开头的 ≤60 字符短行,
     或纯编号+数学符号。
 
-    v0.2.3: 伪代码主体常被 PyMuPDF 拆成多块（paper3 p4 实测：框内
+    v0.8.3: 伪代码主体常被 PyMuPDF 拆成多块（paper3 p4 实测：框内
     行 1-6 是一块 y77-184，行 7-9 是独立块 y210-258，含 NimbusMonL
     等宽字体但不以 'Algorithm N:' 开头 → _is_algorithm_block 判 False
     被送译，中文回灌后框内中英混杂）。补判定：①块内含等宽字体 span；
     ②行号数字/% 注释开头。
+    v0.8.5 终检：粗体主导块豁免——伪代码从不加粗，而标题续行可以
+    小写/关键词开头（真网关小测实证：两行大标题的第二行
+    'for Spintronic Device Fabrication' 命中 for\\s 关键词被整行保留
+    原文，页首最显眼处中英夹杂）。粗体份额 ≥50% 不判 remnant。
     """
     t = text.strip()
     if len(t) > 200:
         return False
     if re.match(r"^(Break out of|End (for|while|if)|for\s|if\s|while\s|return\s|else\b|Sample\b|Initialise\b)", t):
-        return True
+        if not _bold_dominant(spans):
+            return True
     if _is_math_fragment(t):
         return True
     # v0.2.3: 等宽字体 span（伪代码主体拆块的强信号；IEEE 正文不用等宽字体）
@@ -289,6 +294,18 @@ def _is_algorithm_remnant(text: str, spans: list | None = None) -> bool:
             return True
     # 行号数字开头 / % 注释开头
     return bool(re.match(r"^\d+\s*[%\s]|^%\s", t))
+
+
+def _bold_dominant(spans: list | None) -> bool:
+    """span 字符量粗体份额 ≥50%（标题/强调块判定，remnant 豁免用）。"""
+    total = bold = 0
+    for s in spans or []:
+        n = max(len(s.get("text") or ""), 1)
+        total += n
+        if re.search(r"(CMBX|Bold|-B$|Hei|SimHei|MT-B)", s.get("font", ""),
+                     re.I) or (s.get("flags", 0) & 16):
+            bold += n
+    return total > 0 and bold / total >= 0.5
 
 
 def _is_math_fragment(text: str) -> bool:

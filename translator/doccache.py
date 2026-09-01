@@ -35,6 +35,8 @@ from .cache import TranslationCache
 CACHE_DIR_NAME = ".pdf_translator_cache"
 # v0.8.1: 位图缓存总字节上限（300dpi 裁图单张 0.1-3MB，超限按 LRU 淘汰）
 PIXMAP_CACHE_MAX_BYTES = 512 * 1024 * 1024
+# v0.8.5: 整页渲染结果缓存总字节上限（子集化后输出 1-15MB/文档）
+RENDER_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
 
 def resolve_cache_root(explicit: str, src: Path, out_dir: Path) -> tuple[Path, str]:
@@ -99,8 +101,17 @@ class DocumentCache:
             "CREATE TABLE IF NOT EXISTS pixmaps ("
             " key TEXT PRIMARY KEY, fp TEXT, page INTEGER,"
             " data BLOB, updated REAL)")
+        # v0.8.5: 整页渲染结果缓存（BLOB，最终输出 PDF 字节）。key 覆盖
+        # 文档指纹|页码子集|布局缓存身份|渲染相关配置哈希|译文负载哈希
+        # （pipeline._render_cache_key 构造）——任一变化自动 miss 重渲染。
+        # meta 存 done 统计 JSON（ocr_pages 等——命中回放时报表不失真）
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS renders ("
+            " key TEXT PRIMARY KEY, fp TEXT, mode TEXT,"
+            " data BLOB, meta TEXT DEFAULT '', updated REAL)")
         self._conn.commit()
         self._pixmap_puts = 0
+        self._render_puts = 0
         self.migrated = 0
         if legacy_sources:
             self.migrated = self._migrate_legacy(
@@ -239,6 +250,84 @@ class DocumentCache:
         except sqlite3.Error:
             return 0
 
+    # ---- v0.8.5: 整页渲染结果缓存（候选池 S4 推广）----
+
+    def load_render(self, key: str) -> "tuple[bytes | None, dict]":
+        """渲染结果缓存读：(最终 PDF 字节, done 统计 meta)。
+
+        坏条目按 miss 处理（重渲染即可，行为不回退）。
+        """
+        try:
+            with self._conn_lock:
+                row = self._conn.execute(
+                    "SELECT data, meta FROM renders WHERE key=?",
+                    (key,)).fetchone()
+            if not row:
+                return None, {}
+            blob = bytes(row[0])
+            if not blob.startswith(b"%PDF"):
+                return None, {}      # 坏/非 PDF 条目按 miss 处理
+            meta: dict = {}
+            try:
+                meta = json.loads(row[1] or "{}")
+            except (ValueError, TypeError):
+                meta = {}
+            return blob, (meta if isinstance(meta, dict) else {})
+        except (sqlite3.Error, TypeError, IndexError):
+            return None, {}
+
+    def save_render(self, key: str, fp: str, mode: str, blob: bytes,
+                    meta: "dict | None" = None) -> None:
+        """渲染结果缓存写（最终输出 PDF 字节，已完成子集化/save）。
+
+        meta：done 统计快照（ocr_pages/ocr_inplace_blocks——命中回放时
+        报表与真实渲染一致）。条目大（MB 级）：每 4 次写入检查一次容量
+        （LRU 淘汰最旧）。
+        """
+        if not blob:
+            return
+        try:
+            with self._conn_lock:
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO renders"
+                        " (key, fp, mode, data, meta, updated)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (key, fp, mode, blob,
+                         json.dumps(meta or {}, ensure_ascii=False),
+                         time.time()))
+            self._render_puts += 1
+            if self._render_puts % 4 == 0:
+                self._prune_renders()
+        except Exception:
+            pass              # 缓存写失败不影响主流程
+
+    def _prune_renders(self, force: bool = False) -> int:
+        """渲染缓存总字节超上限时按 updated LRU 淘汰（与位图缓存同纪律）。"""
+        try:
+            with self._conn_lock:
+                total = self._conn.execute(
+                    "SELECT COALESCE(SUM(LENGTH(data)),0) FROM renders"
+                ).fetchone()[0]
+                if total <= RENDER_CACHE_MAX_BYTES and not force:
+                    return 0
+                over = total - RENDER_CACHE_MAX_BYTES
+                n = 0
+                while over > 0:
+                    row = self._conn.execute(
+                        "SELECT key, LENGTH(data) FROM renders"
+                        " ORDER BY updated ASC, rowid ASC LIMIT 1").fetchone()
+                    if not row:
+                        break
+                    self._conn.execute("DELETE FROM renders WHERE key=?",
+                                       (row[0],))
+                    over -= (row[1] or 0)
+                    n += 1
+                self._conn.commit()
+                return n
+        except sqlite3.Error:
+            return 0
+
     # ---- 旧库迁移 ----
     def _migrate_legacy(self, legacy_paths: list[Path]) -> int:
         """同输出目录旧 .translation_cache.db → 项目库（首次且空库时）。
@@ -269,6 +358,10 @@ class DocumentCache:
     def close(self) -> None:
         try:
             self._prune_pixmaps()
+        except Exception:
+            pass
+        try:
+            self._prune_renders()
         except Exception:
             pass
         for c in (self.tc, self._conn):

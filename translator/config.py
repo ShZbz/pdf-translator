@@ -242,6 +242,10 @@ class PerformanceConfig:
     # 实测输出嵌完整 SimSun 17.5MB + SimHei 9.3MB——子集化后输出文件
     # 约 15MB → 2-4MB。false=保持旧版完整字体嵌入
     subset_fonts: bool = True
+    # v0.8.5: 整页渲染结果缓存（内容寻址）。翻译/布局全缓存命中的重跑，
+    # 渲染+落盘直接回放缓存的最终 PDF 字节（热跑 ~10s → 接近 0）；改任何
+    # 渲染相关配置（字号/双语/栏结构/字体等）或译文变化自动失效重渲染
+    render_cache: bool = True
 
 
 @dataclass
@@ -297,6 +301,22 @@ class Config:
     render: RenderConfig = field(default_factory=RenderConfig)
     # v0.8.0 P3: reflow 模板/样式选项
     reflow: ReflowConfig = field(default_factory=ReflowConfig)
+
+
+def _norm_fonts(raw_fonts) -> dict:
+    """fonts 段归一（v0.8.5）：标量视为正文字体（fonts: simsun.ttc 是
+    用户手写最小配置的自然形态——旧版直接把 str 塞进 cfg.fonts，
+    下游 fonts.get("cjk") AttributeError 崩）；非法类型配置期报错。"""
+    if raw_fonts is None:
+        return {"cjk": ""}
+    if isinstance(raw_fonts, str):
+        v = raw_fonts.strip()
+        return {"body": v, "cjk": v} if v else {"cjk": ""}
+    if isinstance(raw_fonts, dict):
+        return raw_fonts
+    raise ValueError(
+        f"fonts 必须是映射（如 fonts: {{cjk: simsun.ttc}}）或字体路径字符串，"
+        f"当前是 {type(raw_fonts).__name__}")
 
 
 def load_config(path: str | Path) -> Config:
@@ -384,7 +404,7 @@ def load_config(path: str | Path) -> Config:
             f"当前 {render_cfg.page_story!r}")
     cfg = Config(io=io_, llm=llm, features=feat, performance=perf, ocr=ocr,
                  glossary_file=raw.get("glossary_file", ""),
-                 fonts=raw.get("fonts") or {"cjk": ""},
+                 fonts=_norm_fonts(raw.get("fonts")),
                  fit=fit_cfg, output=out_cfg, render=render_cfg,
                  reflow=reflow_cfg)
     # 硬校验：输入输出路径必填

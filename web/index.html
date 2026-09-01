@@ -403,7 +403,7 @@ body.dragging::after {
 <!-- 主卡片 -->
 <div class="card">
   <h1>PDF 翻译器</h1>
-  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · <span id="uiVersion">v0.8.4</span></div>
+  <div class="sub">学术 PDF 整册翻译 · 版面保留 · 公式/表格原位回贴 · <span id="uiVersion">v0.8.5</span></div>
 
   <div class="field">
     <input type="text" id="inputPath" placeholder="翻译原文件路径 (.pdf)" spellcheck="false">
@@ -958,12 +958,21 @@ function wizShow(n) {
     const p = $('wiz-provider').value;
     const m = $('wiz-model').value.trim() || '(待填模型名)';
     const t = wizRecommendTimeout();
-    $('wizSummary').innerHTML =
-      `服务商 <b>${p}</b> · 模型 <b>${m}</b> · Key <b>已保存</b>` +
-      (WIZ_LATENCY != null ? ` · 实测延迟 <b>${WIZ_LATENCY}s</b>` : '') +
-      `<br>完成时将按该档位自动写入推荐调优参数` +
-      (t ? `，请求超时按实测延迟设为 <b>${t}s</b>` : '') +
-      `。<br>之后在 ⚙ 设置里可随时微调。`;
+    // v0.8.5: DOM/textContent 组装（模型名是自由输入，含尖括号时
+    // innerHTML 破版式——与其余面板同纪律）
+    const b = s => { const e = document.createElement('b'); e.textContent = s; return e; };
+    const box = $('wizSummary');
+    box.textContent = '';
+    const line1 = document.createElement('div');
+    line1.append('服务商 ', b(p), ' · 模型 ', b(m), ' · Key ', b('已保存'));
+    if (WIZ_LATENCY != null) line1.append(` · 实测延迟 ${WIZ_LATENCY}s`);
+    const line2 = document.createElement('div');
+    line2.append('完成时将按该档位自动写入推荐调优参数');
+    if (t) line2.append(`，请求超时按实测延迟设为 ${t}s`);
+    line2.append('。');
+    const line3 = document.createElement('div');
+    line3.textContent = '之后在 ⚙ 设置里可随时微调。';
+    box.append(line1, line2, line3);
   }
 }
 
@@ -1178,9 +1187,20 @@ async function browseTo(path) {
       const it = document.createElement('div');
       it.className = 'item file-item';
       const isGlz = browseTarget === 'glossary';
-      const chk = e.dir || isGlz
-        ? '' : `<span class="chk${browseChecked.has(d.path + '/' + e.name) ? ' on' : ''}">${browseChecked.has(d.path + '/' + e.name) ? '✓' : ''}</span>`;
-      it.innerHTML = `${chk}<span class="ic">${e.dir ? '📁' : '📄'}</span><span>${e.name}</span>`;
+      // v0.8.5: DOM/textContent 组装——e.name 是磁盘上的真实文件名，
+      // 含引号/尖括号时经 innerHTML 会破版式并构成注入面（与
+      // renderHistItem/renderGlzChips 同纪律，此处是 v0.8.5 首轮漏网处）
+      const chk = document.createElement('span');
+      if (!e.dir && !isGlz) {
+        chk.className = 'chk' + (browseChecked.has(d.path + '/' + e.name) ? ' on' : '');
+        chk.textContent = browseChecked.has(d.path + '/' + e.name) ? '✓' : '';
+      }
+      const ic = document.createElement('span');
+      ic.className = 'ic';
+      ic.textContent = e.dir ? '📁' : '📄';
+      const nm = document.createElement('span');
+      nm.textContent = e.name;
+      it.append(chk, ic, nm);
       if (!e.dir && !e.name.toLowerCase().endsWith('.pdf') && !isGlz) {
         it.style.opacity = '.4';   // 非PDF淡化但可选目录进入
       }
@@ -1231,12 +1251,19 @@ let glzPaths = [];     // 已选术语表文件路径（合并顺序=数组顺�
 let glzContent = '';
 
 function renderGlzChips() {
-  const host = $('glzChips'); host.innerHTML = '';
+  // v0.8.5: textContent 组装（文件名含引号/尖括号时 innerHTML 破版式）
+  const host = $('glzChips'); host.textContent = '';
   glzPaths.forEach((p, i) => {
     const c = document.createElement('span');
     c.className = 'chip';
-    c.innerHTML = `<b>${p.split(/[\\/]/).pop()}</b><span class="x" title="移除">✕</span>`;
-    c.querySelector('.x').onclick = () => { glzPaths.splice(i, 1); renderGlzChips(); };
+    const b = document.createElement('b');
+    b.textContent = p.split(/[\\/]/).pop();
+    const x = document.createElement('span');
+    x.className = 'x';
+    x.title = '移除';
+    x.textContent = '✕';
+    x.onclick = () => { glzPaths.splice(i, 1); renderGlzChips(); };
+    c.append(b, x);
     c.title = p;
     host.appendChild(c);
   });
@@ -1250,10 +1277,27 @@ async function openGlossaryManager() {
   glzPaths = existing ? (glzSources.length ? [...glzSources] : [existing]) : [];
   glzContent = '';
   $('glossaryBox').value = '';
-  $('glzIssues').innerHTML = '';
+  $('glzIssues').textContent = '';
   renderGlzChips();
   openModal($('glossaryModal'), $('glossaryBackdrop'));
   if (glzPaths.length) await glzPreview();
+}
+
+function renderGlzIssues(issues) {
+  // v0.8.5: textContent 组装（issue 的 file/msg 含用户路径，经 innerHTML 有注入面）
+  const host = $('glzIssues'); host.textContent = '';
+  issues.forEach(iss => {
+    const row = document.createElement('div');
+    row.className = 'issue-row ' + iss.kind;
+    const ln = document.createElement('span');
+    ln.className = 'ln';
+    ln.textContent = `${iss.file}${iss.line > 0 ? ':' + iss.line : ''}`;
+    const msg = document.createElement('span');
+    msg.className = 'msg';
+    msg.textContent = iss.msg;
+    row.append(ln, msg);
+    host.appendChild(row);
+  });
 }
 
 async function glzPreview() {
@@ -1262,13 +1306,7 @@ async function glzPreview() {
     const d = await api('/api/glossary/preview', { method:'POST', body: JSON.stringify({ paths: glzPaths }) });
     glzContent = d.merged_text || '';
     $('glossaryBox').value = glzContent;
-    const host = $('glzIssues'); host.innerHTML = '';
-    (d.issues || []).forEach(iss => {
-      const row = document.createElement('div');
-      row.className = 'issue-row ' + iss.kind;
-      row.innerHTML = `<span class="ln">${iss.file}${iss.line > 0 ? ':' + iss.line : ''}</span><span class="msg">${iss.msg}</span>`;
-      host.appendChild(row);
-    });
+    renderGlzIssues(d.issues || []);
     if (d.ok) {
       toast(`合并预览 OK：${d.term_count} 条术语`);
       $('glzMeta').textContent = `${d.term_count} 条`;
@@ -1297,13 +1335,7 @@ async function glzSave() {
     toast(`已保存：${d.term_count} 条术语`);
     closeModal($('glossaryModal'), $('glossaryBackdrop'));
   } else if (d.issues) {
-    const host = $('glzIssues'); host.innerHTML = '';
-    d.issues.forEach(iss => {
-      const row = document.createElement('div');
-      row.className = 'issue-row ' + iss.kind;
-      row.innerHTML = `<span class="ln">${iss.line > 0 ? 'L' + iss.line : ''}</span><span class="msg">${iss.msg}</span>`;
-      host.appendChild(row);
-    });
+    renderGlzIssues(d.issues.map(iss => ({ ...iss, file: '' })));
     toast(`校验未通过：${d.issues.filter(i => i.kind === 'error').length} 个错误`, true);
   } else {
     toast(d.detail || '保存失败', true);
@@ -1594,7 +1626,14 @@ async function openHistory() {
   host.innerHTML = '<div class="hist-empty">加载中…</div>';
   let d;
   try { d = await api('/api/jobs'); }
-  catch (e) { host.innerHTML = `<div class="hist-empty">${e.message}</div>`; return; }
+  catch (e) {
+    host.textContent = '';
+    const em = document.createElement('div');
+    em.className = 'hist-empty';
+    em.textContent = e.message;
+    host.appendChild(em);
+    return;
+  }
   const hist = d.history || [];
   if (!hist.length) {
     host.innerHTML = '<div class="hist-empty">暂无历史任务</div>';
@@ -1605,6 +1644,9 @@ async function openHistory() {
 }
 
 function renderHistItem(h) {
+  /* v0.8.5: DOM/textContent 组装（旧版 innerHTML 直插 h.input/h.error/warns——
+     含引号/尖括号的路径会破 title 属性与版式，属注入面；本地单用户风险低，
+     但 textContent 组装零成本且永远正确） */
   const it = document.createElement('div');
   it.className = 'hist-item';
   const file = (h.input || '').split(/[\\/]/).pop() || h.input || '(未知输入)';
@@ -1618,21 +1660,64 @@ function renderHistItem(h) {
   }
   if (h.elapsed) meta.push(`${h.elapsed}s`);
   meta.push(fmtTime(h.created));
-  it.innerHTML = `
-    <div class="hist-top">
-      <span class="hist-file" title="${h.input || ''}">${file}</span>
-      <span class="hist-badge ${h.status}">${HIST_STATUS[h.status] || h.status}</span>
-    </div>
-    ${h.error ? `<div class="hist-meta" style="color:#ff9a8b;">${h.error}</div>` : ''}
-    <div class="hist-meta"><span>${meta.join(' · ')}</span></div>
-    <div class="hist-actions">
-      ${h.input ? '<button data-act="rerun">↻ 重跑</button>' : ''}
-      ${h.output_path ? '<button data-act="open">📄 打开输出</button>' : ''}
-      ${warns.length ? `<button data-act="warns">⚠ 警告 (${warns.length})</button>` : ''}
-    </div>
-    <div class="hist-warns" style="display:none;">${
-      warns.map(w => `<div>⚠ ${w}</div>`).join('')}</div>`;
-  const btnRerun = it.querySelector('[data-act=rerun]');
+
+  const top = document.createElement('div');
+  top.className = 'hist-top';
+  const fspan = document.createElement('span');
+  fspan.className = 'hist-file';
+  fspan.textContent = file;
+  if (h.input) fspan.title = h.input;
+  const badge = document.createElement('span');
+  badge.className = 'hist-badge ' + h.status;
+  badge.textContent = HIST_STATUS[h.status] || h.status;
+  top.append(fspan, badge);
+  it.appendChild(top);
+
+  if (h.error) {
+    const err = document.createElement('div');
+    err.className = 'hist-meta';
+    err.style.color = '#ff9a8b';
+    err.textContent = h.error;
+    it.appendChild(err);
+  }
+  const mrow = document.createElement('div');
+  mrow.className = 'hist-meta';
+  const mspan = document.createElement('span');
+  mspan.textContent = meta.join(' · ');
+  mrow.appendChild(mspan);
+  it.appendChild(mrow);
+
+  const acts = document.createElement('div');
+  acts.className = 'hist-actions';
+  const addBtn = (act, label) => {
+    const b = document.createElement('button');
+    b.dataset.act = act;
+    b.textContent = label;
+    acts.appendChild(b);
+    return b;
+  };
+  let btnRerun = null;
+  if (h.input) btnRerun = addBtn('rerun', '↻ 重跑');
+  let btnOpen = null;
+  if (h.output_path) btnOpen = addBtn('open', '📄 打开输出');
+  let btnWarns = null;
+  if (warns.length) btnWarns = addBtn('warns', `⚠ 警告 (${warns.length})`);
+  it.appendChild(acts);
+
+  if (btnWarns) {
+    const wdiv = document.createElement('div');
+    wdiv.className = 'hist-warns';
+    wdiv.style.display = 'none';
+    warns.forEach(w => {
+      const wl = document.createElement('div');
+      wl.textContent = '⚠ ' + w;
+      wdiv.appendChild(wl);
+    });
+    it.appendChild(wdiv);
+    btnWarns.onclick = () => {
+      wdiv.style.display = wdiv.style.display === 'none' ? 'block' : 'none';
+    };
+  }
   if (btnRerun) btnRerun.onclick = async () => {
     // 重跑：沿用历史任务的输入/输出目录 + 当前 UI 配置（模型/语言等）
     try {
@@ -1647,14 +1732,8 @@ function renderHistItem(h) {
       startPolling();
     } catch (e) { toast(e.message, true); }
   };
-  const btnOpen = it.querySelector('[data-act=open]');
   if (btnOpen) btnOpen.onclick = () => {
     window.open('/api/output?path=' + encodeURIComponent(h.output_path), '_blank');
-  };
-  const btnWarns = it.querySelector('[data-act=warns]');
-  if (btnWarns) btnWarns.onclick = () => {
-    const el = it.querySelector('.hist-warns');
-    el.style.display = el.style.display === 'none' ? 'block' : 'none';
   };
   return it;
 }

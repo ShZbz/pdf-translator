@@ -283,16 +283,25 @@ _PSEUDO_RE = re.compile(
     r"sample|Input|Output|Require|Ensure|Initialize)\b")
 
 
-def _pseudo_clusters(paras: list[dict]) -> "list[tuple[set, pymupdf.Rect]]":
+def _pseudo_clusters(paras: list[dict],
+                     formulas: "list[dict] | None" = None
+                     ) -> "list[tuple[set, set, pymupdf.Rect]]":
     """Algorithm 框聚类：每个 verbatim 种子迭代吸收「相交且形似伪代码」
     的碎片段（faithful 原位无感，reflow 拆位图后散落文本行——实测
-    paper3 p4 'action = {ak, Lk}' 等）。返回 [(索引集, 联合框)]。"""
-    clusters: list[tuple[set, pymupdf.Rect]] = []
+    paper3 p4 'action = {ak, Lk}' 等）。返回 [(段落索引集, 公式索引集,
+    联合框)]。
+    v0.8.5 终检：框内数学行（'sample nk+1 ∼p(...)' 这类）被
+    collect_display_formulas 抢先判成独立显示公式——伪代码框被拆成
+    「头块位图+公式条+尾块位图」散落文流（实测 paper3 p5 Algorithm 2
+    行 4-6）。补几何吸收：与联合框相交的公式条并入框位图，吸收后
+    联合框长高再回吸原不相交的尾块（'Break out of for loop'）。"""
+    clusters: list[tuple[set, set, pymupdf.Rect]] = []
     used: set = set()
     for s, p in enumerate(paras):
         if not p.get("is_verbatim") or s in used:
             continue
         idx = {s}
+        fidx: set = set()
         u = pymupdf.Rect(p["bbox"])
         changed = True
         while changed:
@@ -308,8 +317,16 @@ def _pseudo_clusters(paras: list[dict]) -> "list[tuple[set, pymupdf.Rect]]":
                 idx.add(i)
                 u |= r
                 changed = True
+            for fi, f in enumerate(formulas or []):
+                if fi in fidx:
+                    continue
+                r = pymupdf.Rect(f["bbox"])
+                if u.intersects(r):
+                    fidx.add(fi)
+                    u |= r
+                    changed = True
         used |= idx
-        clusters.append((idx, u))
+        clusters.append((idx, fidx, u))
     return clusters
 
 
@@ -490,10 +507,12 @@ def build_document_model(page_layouts: list[dict], doc,
         # Algorithm 框聚类：代表块（簇内最小索引）出联合框位图，碎片随框
         v_rep: dict[int, pymupdf.Rect] = {}
         v_absorbed: set = set()
-        for idx, u in _pseudo_clusters(paras):
+        v_absorbed_f: set = set()          # 已烘进框位图的公式条（不再独立出块）
+        for idx, fidx, u in _pseudo_clusters(paras, formulas):
             rep = min(idx)
             v_rep[rep] = u
             v_absorbed |= (idx - {rep})
+            v_absorbed_f |= fidx
 
         def ptext(i: int) -> str:
             if (pno, i) in cross_skip:
@@ -549,6 +568,8 @@ def build_document_model(page_layouts: list[dict], doc,
         # 漏登记会令这些碎片以原文段落重复回归文流（位图已含其像素）
         page_pms = (formula_pixmaps or {}).get(pno) or {}
         for fi, f in enumerate(formulas):
+            if fi in v_absorbed_f:
+                continue    # 已随伪代码框位图烘焙（union 裁剪含其像素）
             fr = pymupdf.Rect(f["bbox"])
             png = page_pms.get(fi)
             name = f"x{pno}_{fi}"
@@ -1238,6 +1259,12 @@ def render_reflow_document(page_layouts: list[dict], doc,
 
     archive, font_css = _build_font_archive(
         font_path, typo.heading_path if typo else None)
+    # v0.8.5 审查修复：无字体环境（拉丁目标且候选链全空）时
+    # _build_font_archive 返回 (None, "")——有位图要进 Archive 的文档
+    # 在 archive.add 直接 AttributeError（实证无字体容器 reflow×图必崩）。
+    # 建空 Archive 承载位图，CSS 落 serif 兜底（字体由引擎内置衬线顶上）
+    if archive is None and images:
+        archive = pymupdf.Archive()
     for name, png in images.items():
         archive.add(png, name)
     from .langs import is_rtl, lang_info

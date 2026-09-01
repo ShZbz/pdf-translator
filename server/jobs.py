@@ -112,7 +112,16 @@ try:
 except JobCancelled:
     flush({{"kind": "exit", "code": 2, "cancelled": True}})
 except Exception as e:
-    flush({{"kind": "exit", "code": 1, "error": str(e)}})
+    # v0.8.5: 错误附最快定位行（worker 的 stderr 是 DEVNULL，traceback
+    # 无处可打——UI 只拿到 str(e) 时「ValueError: xxx」无从下手；附上
+    # 最内层帧 file:line in func 一行，排障入口立刻有了）
+    import traceback
+    at = ""
+    tb = traceback.extract_tb(e.__traceback__)
+    if tb:
+        _f = tb[-1]
+        at = f"\n    at {{_f.filename}}:{{_f.lineno}} in {{_f.name}}"
+    flush({{"kind": "exit", "code": 1, "error": str(e) + at}})
 '''
 
 _TERMINAL = ("done", "cancelled", "error")

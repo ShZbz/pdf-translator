@@ -815,15 +815,18 @@ class TranslationClient:
                     self._sentence_cache_put(cache, paras[j], dst, model_used)
 
     def _cache_first(self, cache, i: int, t: str,
-                     budget: "int | None", kind: "str | None") -> str | None:
+                     budget: "int | None", kind: "str | None",
+                     force: bool = False) -> "str | None":
         """缓存先行统一出口：句级（模板文本）→ 预算档 → 主缓存。
 
+        force=True 绕过全部缓存档（v0.8.5 页级重译命令：该单元强制
+        重付调用；翻译成功后 _store_cache_many 照常覆盖写回缓存）。
         v0.6.0: 预算档重译结果 key 加 |#b{N} 后缀——先查预算档（此前
         超预算重译过的短版），再查主缓存（旧命中译文仍有效，只是
         可能超长触发渲染阶梯）
         命中计数（cache_hits/sent_cache_hits）由调用方累加。
         """
-        if cache is None:
+        if cache is None or force:
             return None
         if self.sentence_cache and kind in _TEMPLATE_KINDS:
             hit = self._sentence_cache_get(cache, t, self.model)
@@ -842,7 +845,8 @@ class TranslationClient:
     def translate_paragraphs(self, paras: list[str],
                              cache=None,
                              budgets: "list[int | None] | None" = None,
-                             unit_kinds: "list[str | None] | None" = None
+                             unit_kinds: "list[str | None] | None" = None,
+                             force_units: "set[int] | None" = None
                              ) -> tuple[list[str], int]:
         """翻译段落数组，返回 (译文数组, 实际调用次数)。
 
@@ -854,6 +858,8 @@ class TranslationClient:
         unit_kinds: v0.7.0 与 paras 对齐的单元类型（"ref"/"caption"/None）。
         ref 条目/图注是模板化文本，启用句子级缓存跨文档复用；其余单元
         上下文依赖性强，只走整段主缓存。
+        force_units: v0.8.5 页级重译——索引在集合里的单元绕过缓存
+        查询强制重译（CLI --retranslate / EventSink retranslate 命令）。
         """
         results: list[str | None] = [None] * len(paras)
         budgets = list(budgets) if budgets else None
@@ -869,7 +875,7 @@ class TranslationClient:
         miss = []
         for i, t in enumerate(paras):
             kind = unit_kinds[i] if unit_kinds and i < len(unit_kinds) else None
-            if cache is not None:
+            if cache is not None and not (force_units and i in force_units):
                 budget_i = budgets[i] if budgets else None
                 hit = self._cache_first(cache, i, t, budget_i, kind)
                 if hit is not None:
@@ -1038,10 +1044,14 @@ class StreamingTranslator:
         self._batches_spawned = 0
 
     def add_unit(self, text: str, budget: "int | None" = None,
-                 kind: "str | None" = None) -> int:
-        """喂入一个翻译单元；缓存命中即回填，未命中进开批。返回单元序号。"""
+                 kind: "str | None" = None, force: bool = False) -> int:
+        """喂入一个翻译单元；缓存命中即回填，未命中进开批。返回单元序号。
+
+        force=True 绕过缓存（v0.8.5 页级重译命令——页级 actor 在喂入
+        处判定归属页是否被点名，见 pipeline._feed_page）。"""
         i = len(self.paras)
-        hit = self.tc._cache_first(self.cache, i, text, budget, kind)
+        hit = None if force else self.tc._cache_first(
+            self.cache, i, text, budget, kind)
         self.paras.append(text)
         self.budgets.append(budget)
         self.kinds.append(kind)
